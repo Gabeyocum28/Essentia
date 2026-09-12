@@ -25,6 +25,14 @@ MAX_QUEUED = 200          # don't flood the queue; the worker drains ~12 tracks/
 FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"
 _last_crawl = 0.0
 
+# The reachable universe from the 17 charts + 8 snowball roots is ~5k
+# tracks; once every step yields 0 new candidates, idle-time crawling would
+# otherwise poll Deezer forever at a fixed rate. Back off exponentially
+# instead, and reset the moment a step yields something. Module attributes
+# (not locals) so tests can monkeypatch them.
+_crawl_backoff_s = CRAWL_INTERVAL_S
+CRAWL_BACKOFF_MAX_S = 3600.0
+
 
 def download_preview(url: str) -> Path:
     fd, name = tempfile.mkstemp(suffix=".mp3")
@@ -248,12 +256,18 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
 
 
 def _enqueue_new(tracks: list[dict]) -> int:
-    """Store metadata and queue every track we have not analyzed; count queued."""
+    """Store metadata and queue every track we have not analyzed; count queued.
+
+    Skips tracks whose embed job already failed permanently -- otherwise a
+    crawl just keeps re-discovering and re-enqueueing the same broken
+    tracks (dead preview, unsupported codec, ...) forever.
+    """
     ids = [track["track_id"] for track in tracks]
     features = store.get_many_features(ids)
+    failed = store.failed_ids(ids)
     queued = 0
     for track, track_features in zip(tracks, features):
-        if track_features is not None:
+        if track_features is not None or track["track_id"] in failed:
             continue
         store.put_track_meta(track)
         if store.enqueue_embed(track["track_id"]):
@@ -272,27 +286,67 @@ def seed_fixture_if_empty() -> int:
     return n
 
 
-def crawl_step() -> int:
-    """One bounded slice of crawling: a genre chart or one jazz root's neighbours.
+def _grow_roots(roots: list[str], tracks: list[dict]) -> None:
+    """Add up to 5 newly-discovered artist names to the `crawl_roots` state,
+    so the snowball/deep-cuts graph expands from what the corpus actually
+    contains instead of staying pinned to the 8 seed roots forever."""
+    discovered = []
+    for track in tracks:
+        name = track.get("artist")
+        if name and name not in roots and name not in discovered:
+            discovered.append(name)
+        if len(discovered) >= 5:
+            break
+    if not discovered:
+        return
+    state = store.get_state("crawl_roots") or {"names": []}
+    names = list(state.get("names", []))
+    for name in discovered:
+        if name not in names:
+            names.append(name)
+    store.put_state("crawl_roots", {"names": names[:200]})
 
-    Alternates so breadth (charts across genres) and depth (the jazz artist
-    graph the app is about) both keep growing. The cursor lives in Atlas so a
-    restart continues where it left off.
+
+def crawl_step() -> int:
+    """One bounded slice of crawling, rotating over three sources: a genre
+    chart, one root's snowball neighbours, or a root's deep album cuts.
+
+    Breadth (charts across genres), depth (the artist-relatedness graph),
+    and obscurity (album tracks that never show up in a /top or /related
+    call) all keep growing this way. The cursor lives in Atlas so a restart
+    continues where it left off.
+
+    Runs inline in `_tick`, so a slow Deezer response (or backoff) delays
+    job processing by up to a few minutes -- acceptable for a background
+    crawl, not for the embed/attribution queue it shares the loop with.
     """
     if store.corpus_size() >= CORPUS_CAP or store.queued_count() >= MAX_QUEUED:
         return 0
     state = store.get_state("crawl") or {"step": 0}
     step = int(state.get("step", 0))
     genres = list(crawl.GENRES)
-    if step % 2 == 0:
-        genre = genres[(step // 2) % len(genres)]
+    roots_state = store.get_state("crawl_roots")
+    roots = crawl.ROOTS + (roots_state["names"] if roots_state else [])
+    arm = step % 3
+    grow_from = None
+    if arm == 0:
+        genre = genres[(step // 3) % len(genres)]
         tracks = crawl.from_charts([genre], per_genre=100)
         source = f"chart {crawl.GENRES[genre]}"
-    else:
-        root = crawl.ROOTS[(step // 2) % len(crawl.ROOTS)]
-        tracks = crawl.snowball([root], hops=1, per_artist=20)
+        grow_from = tracks
+    elif arm == 1:
+        root = roots[(step // 3) % len(roots)]
+        tracks = crawl.snowball([root], hops=1, per_artist=10)
         source = f"snowball {root}"
+        grow_from = tracks
+    else:
+        root = roots[(step // 3) % len(roots)]
+        ids = crawl.resolve_artists([root])
+        tracks = list(crawl.deep_cuts(ids, albums_per_artist=3))
+        source = f"deep cuts {root}"
     n = _enqueue_new(tracks)
+    if grow_from is not None:
+        _grow_roots(roots, grow_from)
     store.put_state("crawl", {"step": step + 1})
     print(f"[worker] crawl {source}: {len(tracks)} candidates, {n} queued", flush=True)
     return n
@@ -315,11 +369,15 @@ def _tick() -> None:
     try:
         job = store.dequeue_job(timeout=5)
         if not job:
-            global _last_crawl
-            if time.monotonic() - _last_crawl >= CRAWL_INTERVAL_S:
+            global _last_crawl, _crawl_backoff_s
+            if time.monotonic() - _last_crawl >= _crawl_backoff_s:
                 _last_crawl = time.monotonic()
                 try:
-                    crawl_step()
+                    n = crawl_step()
+                    if n > 0:
+                        _crawl_backoff_s = CRAWL_INTERVAL_S
+                    else:
+                        _crawl_backoff_s = min(_crawl_backoff_s * 2, CRAWL_BACKOFF_MAX_S)
                 except Exception as exc:  # noqa: BLE001 - Deezer flakes must not kill the loop
                     print(f"[worker] crawl error {exc}", flush=True)
             return

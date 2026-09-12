@@ -1,4 +1,5 @@
 essentia.gabeyocum.com {
+    redir /api /api/ 308
     handle_path /api/* {
         reverse_proxy essentia-api:8000
     }

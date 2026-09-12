@@ -2,9 +2,10 @@
 //  AppConfig.swift
 //  Hackathon
 //
-//  The single place the server address is configured. Points at the mock
-//  server during development; flip `baseURL` to the tunnel URL at integration
-//  (design spec hour 16). Nothing else in the app needs to change.
+//  The single place the server address is configured. Points at the live
+//  Essentia backend on the Oracle VM, behind Caddy (deploy/). Override
+//  without editing code by setting ESSENTIA_BASE_URL. Nothing else in the
+//  app needs to change.
 //
 
 import Foundation
@@ -21,7 +22,8 @@ enum AppConfig {
         return URL(string: raw)!
     }()
 
-    /// Extra headers applied to every request. (ngrok needed a skip-warning
-    /// header; Cloudflare doesn't — kept as a hook for whatever tunnel is used.)
+    /// Extra headers applied to every request. Empty: the VM is reached
+    /// directly through Caddy over HTTPS, so nothing extra is needed. Kept
+    /// as a hook in case a future backend requires one.
     nonisolated static let extraHeaders: [String: String] = [:]
 }

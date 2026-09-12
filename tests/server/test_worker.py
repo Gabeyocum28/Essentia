@@ -377,7 +377,7 @@ def test_crawl_step_enqueues_unseen_tracks_and_advances_cursor(fake_mongo, monke
     monkeypatch.setattr(worker.crawl, "from_charts",
                         lambda genre_ids, per_genre=100: (calls.append(("charts", genre_ids)), _tracks(["1", "2", "3"]))[1])
     monkeypatch.setattr(worker.crawl, "snowball",
-                        lambda root_names, hops=1, per_artist=20: (calls.append(("snowball", root_names)), _tracks(["3", "4"]))[1])
+                        lambda root_names, hops=1, per_artist=10: (calls.append(("snowball", root_names)), _tracks(["3", "4"]))[1])
     store.put_track(_tracks(["2"])[0], {"embedding": [1.0]})      # already analyzed
     assert worker.crawl_step() == 2                                 # 1 and 3
     assert store.get_state("crawl") == {"step": 1}
@@ -385,6 +385,111 @@ def test_crawl_step_enqueues_unseen_tracks_and_advances_cursor(fake_mongo, monke
     assert store.get_state("crawl") == {"step": 2}
     assert calls[0][0] == "charts" and calls[1][0] == "snowball"
     assert store.get_track("1")["title"] == "t1"                    # meta stored for the queue
+
+
+def test_crawl_step_rotates_three_arms(fake_mongo, monkeypatch):
+    """step % 3 picks the source: charts, snowball, then deep cuts (resolve
+    the root's artist id, then album tracks) -- each indexed by step // 3."""
+    calls = []
+    monkeypatch.setattr(worker.crawl, "from_charts",
+                        lambda genre_ids, per_genre=100:
+                            (calls.append(("charts", genre_ids, per_genre)), _tracks(["c1"]))[1])
+    monkeypatch.setattr(worker.crawl, "snowball",
+                        lambda root_names, hops=1, per_artist=10:
+                            (calls.append(("snowball", root_names, hops, per_artist)), _tracks(["s1"]))[1])
+    monkeypatch.setattr(worker.crawl, "resolve_artists",
+                        lambda names: (calls.append(("resolve", names)), [999])[1])
+    monkeypatch.setattr(worker.crawl, "deep_cuts",
+                        lambda artist_ids, albums_per_artist=6:
+                            (calls.append(("deep_cuts", artist_ids, albums_per_artist)), iter(_tracks(["d1"])))[1])
+
+    assert worker.crawl_step() == 1
+    assert store.get_track("c1") is not None
+    assert worker.crawl_step() == 1
+    assert store.get_track("s1") is not None
+    assert worker.crawl_step() == 1
+    assert store.get_track("d1") is not None
+
+    assert calls[0][0] == "charts"
+    assert calls[1][0] == "snowball"
+    assert calls[2] == ("resolve", [calls[1][1][0]])
+    assert calls[3][0] == "deep_cuts" and calls[3][1] == [999] and calls[3][2] == 3
+    assert store.get_state("crawl") == {"step": 3}
+
+
+def test_crawl_roots_grow_from_discovered_artists(fake_mongo, monkeypatch):
+    """A chart or snowball step's discovered artists (up to 5, deduped
+    against the existing roots) join `crawl_roots` so later snowball/deep-cuts
+    arms explore artists the corpus actually contains, not just the 8 seeds."""
+    discovered = _tracks(["1", "2", "3", "4", "5", "6"])
+    for i, track in enumerate(discovered):
+        track["artist"] = f"Artist {i}"
+    monkeypatch.setattr(worker.crawl, "from_charts",
+                        lambda genre_ids, per_genre=100: discovered)
+
+    worker.crawl_step()
+
+    grown = store.get_state("crawl_roots")
+    assert grown is not None
+    assert grown["names"] == [f"Artist {i}" for i in range(5)]      # capped at 5 new
+
+    # A later snowball arm picks its root from ROOTS + crawl_roots: put the
+    # cursor at an index that only exists once the grown name is appended.
+    combined_len = len(worker.crawl.ROOTS) + len(grown["names"])
+    grown_index = combined_len - 1                    # the newly grown name
+    step = grown_index * 3 + 1                         # arm 1 == snowball
+    store.put_state("crawl", {"step": step})
+    seen_roots = []
+    monkeypatch.setattr(worker.crawl, "snowball",
+                        lambda root_names, hops=1, per_artist=10:
+                            (seen_roots.append(root_names), [])[1] or [])
+    worker.crawl_step()
+    assert seen_roots[0] == [grown["names"][-1]]
+
+
+def test_crawl_roots_cap_at_two_hundred(fake_mongo):
+    store.put_state("crawl_roots", {"names": [f"R{i}" for i in range(198)]})
+    tracks = _tracks(["1", "2", "3", "4", "5"])
+    for i, track in enumerate(tracks):
+        track["artist"] = f"New {i}"
+    worker._grow_roots(list(worker.crawl.ROOTS), tracks)
+    assert len(store.get_state("crawl_roots")["names"]) == 200
+
+
+def test_idle_backoff_doubles_on_empty_crawl_and_resets_on_yield(fake_mongo, monkeypatch):
+    monkeypatch.setattr(worker.store, "requeue_stale", lambda: 0)
+    monkeypatch.setattr(worker.store, "dequeue_job", lambda timeout=5: None)
+    monkeypatch.setattr(worker, "CRAWL_INTERVAL_S", 10)
+    monkeypatch.setattr(worker, "_crawl_backoff_s", 10)
+    monkeypatch.setattr(worker, "CRAWL_BACKOFF_MAX_S", 40)
+
+    steps = iter([0, 0, 0, 5])
+
+    def fake_crawl_step():
+        return next(steps)
+
+    monkeypatch.setattr(worker, "crawl_step", fake_crawl_step)
+
+    worker._last_crawl = 0.0
+    worker._tick()
+    assert worker._crawl_backoff_s == 20
+    worker._last_crawl = 0.0
+    worker._tick()
+    assert worker._crawl_backoff_s == 40
+    worker._last_crawl = 0.0
+    worker._tick()
+    assert worker._crawl_backoff_s == 40             # capped
+    worker._last_crawl = 0.0
+    worker._tick()
+    assert worker._crawl_backoff_s == 10             # reset after a yield
+
+
+def test_enqueue_new_skips_failed_tracks(fake_mongo):
+    store.enqueue_embed("2")
+    store.fail_job("embed:2", "boom")
+    assert worker._enqueue_new(_tracks(["1", "2", "3"])) == 2
+    assert store.queued_count() == 2
+    assert store.get_track("2") is None              # never even wrote metadata
 
 
 def test_crawl_step_respects_corpus_cap_and_queue_depth(fake_mongo, monkeypatch):
@@ -403,6 +508,7 @@ def test_tick_crawls_only_when_idle_and_rate_limited(fake_mongo, monkeypatch):
     monkeypatch.setattr(worker.store, "requeue_stale", lambda: 0)
     monkeypatch.setattr(worker.store, "dequeue_job", lambda timeout=5: None)
     monkeypatch.setattr(worker, "CRAWL_INTERVAL_S", 1000)
+    monkeypatch.setattr(worker, "_crawl_backoff_s", 1000)
     worker._last_crawl = 0.0
     worker._tick()
     worker._tick()

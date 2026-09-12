@@ -9,6 +9,7 @@ zero-padded up to a multiple of 64 and the padding rows are dropped again
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -23,12 +24,12 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 _session = None
 _input = None
 _output = None
+_load_lock = threading.Lock()
 
 
-def _load():
-    global _session, _input, _output
-    if _session is not None:
-        return
+def _build_session():
+    """Build the frozen graph and a session for it. Only ever called with
+    `_load_lock` held."""
     import tensorflow as tf
 
     path = registry.MODELS_DIR / registry.EFFNET_FILE
@@ -41,9 +42,25 @@ def _load():
     graph = tf.Graph()
     with graph.as_default():
         tf.import_graph_def(graph_def, name="")
-    _input = graph.get_tensor_by_name(registry.EFFNET_INPUT + ":0")
-    _output = graph.get_tensor_by_name(registry.EFFNET_OUTPUT)
-    _session = tf.compat.v1.Session(graph=graph)
+    input_ = graph.get_tensor_by_name(registry.EFFNET_INPUT + ":0")
+    output = graph.get_tensor_by_name(registry.EFFNET_OUTPUT)
+    session = tf.compat.v1.Session(graph=graph)
+    return session, input_, output
+
+
+def _load():
+    """Double-checked lazy init: /seed runs analyze_track under a semaphore
+    of 2, so two requests can race in here on a cold process. Without the
+    lock both would build a full TF graph + session concurrently (wasted
+    work, and a `_session`/`_input`/`_output` triple that could end up mixed
+    between the two builds)."""
+    global _session, _input, _output
+    if _session is not None:
+        return
+    with _load_lock:
+        if _session is not None:
+            return
+        _session, _input, _output = _build_session()
 
 
 def embed_patches(patches: np.ndarray) -> np.ndarray:

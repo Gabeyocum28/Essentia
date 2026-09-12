@@ -204,6 +204,13 @@ def search(q: str) -> dict:
         return {"results": hits}
 
 
+# TensorFlow inference is CPU- and memory-heavy; endpoints run on FastAPI's
+# threadpool, so an unbounded burst of /seed calls would run that many
+# analyses at once on a 4 GB container. Cap concurrent analyses instead of
+# concurrent requests -- requests beyond the cap just wait their turn.
+_ANALYZE_SEM = threading.Semaphore(2)
+
+
 @app.post("/seed")
 def seed(req: SeedRequest) -> dict:
     ready = {"track_id": req.track_id, "status": "ready"}
@@ -229,7 +236,8 @@ def seed(req: SeedRequest) -> dict:
         return _seed_via_worker(req.track_id, track)
 
     try:
-        features = _to_plain(analyze_track(mp3))
+        with _ANALYZE_SEM:
+            features = _to_plain(analyze_track(mp3))
         _safe(store.put_track, track, features)
     except (NotImplementedError, ImportError):
         # Analysis can't run on this host (no aarch64 essentia wheels on the

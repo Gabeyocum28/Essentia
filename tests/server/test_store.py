@@ -226,3 +226,14 @@ def test_queued_count_counts_only_queued(fake_mongo):
     store.enqueue_embed("2")
     store.dequeue_embed(timeout=0)
     assert store.queued_count() == 1
+
+
+def test_failed_ids(fake_mongo):
+    store.enqueue_embed("1")
+    store.enqueue_embed("2")
+    store.enqueue_embed("3")
+    store.fail_job("embed:1", "boom")
+    store.fail_job("embed:2", "boom")
+    # "3" stays queued, "4" was never enqueued at all.
+    assert store.failed_ids(["1", "2", "3", "4"]) == {"1", "2"}
+    assert store.failed_ids([]) == set()

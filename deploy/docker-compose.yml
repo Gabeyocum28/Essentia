@@ -4,6 +4,8 @@
 # Nothing here binds a host port: Caddy (~/stacks/caddy) reaches the API by
 # container name over the external `web` network. See deploy/README.md.
 
+name: essentia
+
 services:
   api:
     build:
@@ -18,7 +20,6 @@ services:
     command: >
       uvicorn music_recommendations.server.app:app
       --host 0.0.0.0 --port 8000 --workers 1
-      --proxy-headers --forwarded-allow-ips=*
     expose:
       - "8000"
     networks: [web]

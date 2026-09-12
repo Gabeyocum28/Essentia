@@ -31,10 +31,19 @@ if ! grep -q "^essentia.gabeyocum.com" "$CADDY/Caddyfile"; then
   echo ">> Caddy: added essentia.gabeyocum.com"
 fi
 
-# Reload Caddy on every run (idempotent); -T avoids "input device is not a
-# TTY" when this script runs non-interactively (e.g. piped from curl).
-docker compose -f "$CADDY/docker-compose.yml" exec -T caddy caddy reload --config /etc/caddy/Caddyfile
-echo ">> Caddy: reloaded"
+# Validate before reloading: the Caddyfile is shared with other sites, and a
+# syntax error anywhere in it must not take Caddy down for all of them.
+if ! docker compose -f "$CADDY/docker-compose.yml" exec -T caddy caddy validate --config /etc/caddy/Caddyfile; then
+  echo ">> Caddyfile is invalid (shared config?) — not reloading; fix it and re-run"
+else
+  # Reload Caddy on every run (idempotent); -T avoids "input device is not a
+  # TTY" when this script runs non-interactively (e.g. piped from curl).
+  if docker compose -f "$CADDY/docker-compose.yml" exec -T caddy caddy reload --config /etc/caddy/Caddyfile; then
+    echo ">> Caddy: reloaded"
+  else
+    echo ">> Caddy reload failed; stack still deploying"
+  fi
+fi
 
 # 4. Build and (re)start the stack.
 docker compose -f deploy/docker-compose.yml up -d --build

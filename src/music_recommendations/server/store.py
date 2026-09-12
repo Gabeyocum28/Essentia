@@ -412,3 +412,15 @@ def put_state(key: str, value: dict) -> None:
 def queued_count() -> int:
     """How many jobs are waiting (not running, not failed)."""
     return db().jobs.count_documents({"state": "queued"})
+
+
+def failed_ids(track_ids: list[str]) -> set[str]:
+    """Which of these track ids have a permanently failed embed job, in one
+    query -- so a crawl never re-enqueues a track that already failed."""
+    if not track_ids:
+        return set()
+    docs = db().jobs.find(
+        {"_id": {"$in": [f"embed:{i}" for i in track_ids]}, "state": "failed"},
+        {"_id": 1},
+    )
+    return {d["_id"].split(":", 1)[1] for d in docs}
