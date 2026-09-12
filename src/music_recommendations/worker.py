@@ -19,8 +19,8 @@ from music_recommendations.analysis import analyze_track
 from music_recommendations.corpus import crawl
 from music_recommendations.server import deezer, store, viz
 
-CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "200000"))
-CORPUS_BYTES_CAP = int(os.environ.get("CORPUS_BYTES_CAP", str(200 * 1024 * 1024)))
+CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "300000"))
+CORPUS_BYTES_CAP = int(os.environ.get("CORPUS_BYTES_CAP", str(450 * 1024 * 1024)))
 CRAWL_INTERVAL_S = float(os.environ.get("CRAWL_INTERVAL_S", "60"))
 MAX_QUEUED = 200          # don't flood the queue; the worker drains ~12 tracks/min
 FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"

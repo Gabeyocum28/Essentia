@@ -23,7 +23,8 @@ services:
     expose:
       - "8000"
     networks: [web]
-    mem_limit: 4g
+    # two float32 matrices of ~230k×1280 (~2.4 GB) plus TensorFlow
+    mem_limit: 6g
     cpus: 1.5
 
   worker:
