@@ -18,6 +18,12 @@ EFFNET_URL = (
     + EFFNET_FILE
 )
 EFFNET_OUTPUT = "PartitionedCall:1"  # penultimate layer -> (n_frames, 1280)
+EFFNET_INPUT = "serving_default_melspectrogram"
+
+# Framing inside Essentia's TensorflowPredictEffnetDiscogs (its defaults).
+PATCH_SIZE = 128   # mel frames per inference
+PATCH_HOP = 62     # frames between patch starts (~1 prediction per second)
+BATCH_SIZE = 64    # the graph was frozen with a fixed batch of 64 patches
 
 
 @dataclass(frozen=True)
