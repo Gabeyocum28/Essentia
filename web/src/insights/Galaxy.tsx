@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { applyZoomPan, fitTransform, nearestIndex, toScreen } from "./geometry";
+import { applyZoomPan, fitTransform, nearestIndex, toScreen, zoomAbout } from "./geometry";
 import { Artwork } from "../components/Artwork";
 import { usePlayer } from "../player/usePlayer";
 import type { Track, VizMap } from "../api/types";
@@ -30,6 +30,17 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
   const dragRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null);
   const [callout, setCallout] = useState<CalloutPoint | null>(null);
 
+  // Kept in sync with state so the native (non-passive) wheel listener, which is attached
+  // once, can always read the latest values without re-subscribing.
+  const zoomRef = useRef(zoom);
+  const panRef = useRef(pan);
+  const sizeRef = useRef(size);
+  useEffect(() => {
+    zoomRef.current = zoom;
+    panRef.current = pan;
+    sizeRef.current = size;
+  }, [zoom, pan, size]);
+
   const recById = useMemo(() => new Map(map.recs.map((r) => [r.track_id, r])), [map.recs]);
 
   const allPoints = useMemo(() => {
@@ -49,6 +60,10 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
     const ys = allPoints.map((p) => p.y);
     return fitTransform(xs, ys, size.width || 1, size.height || 1, PAD);
   }, [allPoints, size]);
+  const baseTransformRef = useRef(baseTransform);
+  useEffect(() => {
+    baseTransformRef.current = baseTransform;
+  }, [baseTransform]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -141,11 +156,38 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
     return () => cancelAnimationFrame(raf);
   }, [map, size, zoom, pan, selectedId, baseTransform]);
 
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const delta = -e.deltaY * 0.002;
-    setZoom((z) => Math.min(8, Math.max(1, z * (1 + delta))));
-  };
+  // React's onWheel is a passive listener, so preventDefault() there is silently ignored and
+  // the page scrolls instead of zooming. Attach a native listener with { passive: false } so
+  // preventDefault actually stops the scroll, and anchor the zoom to the cursor position.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const cx = sizeRef.current.width / 2;
+      const cy = sizeRef.current.height / 2;
+      const factor = 1 - e.deltaY * 0.002;
+      const { zoom: nextZoom, pan: nextPan } = zoomAbout(
+        baseTransformRef.current,
+        zoomRef.current,
+        panRef.current,
+        factor,
+        mx,
+        my,
+        cx,
+        cy,
+      );
+      setZoom(nextZoom);
+      setPan(nextPan);
+    };
+
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", onWheel);
+  }, []);
 
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     dragRef.current = { startX: e.clientX, startY: e.clientY, panX: pan.x, panY: pan.y };
@@ -192,7 +234,6 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
     <div className="galaxy" ref={containerRef}>
       <canvas
         ref={canvasRef}
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}

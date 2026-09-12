@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 import { UnionFind } from "./unionfind";
-import { fitTransform, toScreen } from "./geometry";
+import { fitTransform, nearestIndex, toScreen } from "./geometry";
 import type { VizMap, VizMst, VizTour } from "../api/types";
 
 interface Props {
@@ -13,6 +13,7 @@ interface Props {
 type Status = "loading" | "ready" | "error";
 
 const PAD = 24;
+const CLICK_MAX_DIST = 36;
 
 function percentile(sorted: number[], p: number): number {
   if (sorted.length === 0) return 0;
@@ -233,8 +234,19 @@ export function Topology({ map, selectedId, onSelect }: Props) {
 
   return (
     <div className="topology">
-      <div className="galaxy" ref={containerRef} onClick={() => onSelect(null)}>
-        <canvas ref={canvasRef} />
+      <div className="galaxy" ref={containerRef}>
+        <canvas
+          ref={canvasRef}
+          onClick={(e) => {
+            const rect = canvasRef.current?.getBoundingClientRect();
+            if (!rect || size.width === 0 || size.height === 0) return;
+            const px = e.clientX - rect.left;
+            const py = e.clientY - rect.top;
+            const t = fitTransform(xs, ys, size.width, size.height, PAD);
+            const idx = nearestIndex(xs, ys, t, px, py, CLICK_MAX_DIST);
+            if (idx === -1) onSelect(null);
+          }}
+        />
       </div>
       <canvas ref={barcodeRef} className="topology-barcode" />
       <input

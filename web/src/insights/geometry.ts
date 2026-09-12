@@ -74,6 +74,40 @@ export function applyZoomPan(
   return { sx, sy, tx, ty };
 }
 
+export interface Pan {
+  x: number;
+  y: number;
+}
+
+/**
+ * Compute the new zoom and pan that result from zooming by `factor` about a canvas-local
+ * cursor point (mx, my), given the current zoom/pan and the screen-space zoom centre (cx, cy)
+ * used by applyZoomPan. Zoom is clamped to [1, 8]. The pan is derived so that whatever data
+ * point currently sits under the cursor stays under the cursor after the zoom is applied:
+ * screen = cx + zoom * (fit(data) - cx) + pan, so holding (mx - cx - pan) / zoom constant
+ * across the zoom change gives pan' = (mx - cx) - (zoom'/zoom) * ((mx - cx) - pan).
+ *
+ * `t` (the base fit transform) isn't needed for the derivation since it cancels out, but is
+ * accepted for interface symmetry with the other geometry helpers.
+ */
+export function zoomAbout(
+  t: Transform,
+  zoom: number,
+  pan: Pan,
+  factor: number,
+  mx: number,
+  my: number,
+  cx: number,
+  cy: number,
+): { zoom: number; pan: Pan } {
+  void t;
+  const nextZoom = Math.min(8, Math.max(1, zoom * factor));
+  const ratio = nextZoom / zoom;
+  const panX = mx - cx - ratio * (mx - cx - pan.x);
+  const panY = my - cy - ratio * (my - cy - pan.y);
+  return { zoom: nextZoom, pan: { x: panX, y: panY } };
+}
+
 /**
  * Find the index of the nearest point (in screen space, after applying transform t) to
  * (px, py), within maxDist pixels. Returns -1 if none within range or arrays are empty.
