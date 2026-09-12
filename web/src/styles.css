@@ -89,6 +89,26 @@ a { color: var(--accent); }
 .topology-slider { width: 100%; }
 .topology-caption { color: var(--muted); }
 
+.tour { display: flex; flex-direction: column; gap: 8px; }
+.tour-controls { display: flex; align-items: center; gap: 12px; }
+.tour-play { padding: 6px 14px; border-radius: 999px; background: var(--panel); color: var(--text);
+  cursor: pointer; }
+.tour-caption { color: var(--muted); }
+
+.walk { display: flex; flex-direction: column; gap: 8px; }
+.walk-hint { margin: 0; }
+.walk-strip { display: flex; flex-direction: column; gap: 8px; }
+.walk-strip-header { display: flex; gap: 12px; flex-wrap: wrap; }
+.walk-strip-badge { color: var(--seed); }
+.walk-strip-metric { color: var(--muted); }
+.walk-strip-steps { display: flex; gap: 10px; overflow-x: auto; padding: 4px 2px 8px; }
+.walk-strip-item { display: flex; align-items: center; gap: 8px; cursor: pointer; flex-shrink: 0;
+  width: 160px; }
+.walk-strip-info { min-width: 0; text-align: left; }
+.walk-strip-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.walk-strip-artist { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+
 .player-bar { position: fixed; bottom: 0; left: 0; right: 0; background: var(--panel);
   border-top: 1px solid #222; }
 .player-progress { height: 2px; background: var(--accent); }

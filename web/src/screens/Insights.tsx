@@ -5,6 +5,8 @@ import type { VizMap } from "../api/types";
 import { RecStrip } from "../insights/RecStrip";
 import { Galaxy } from "../insights/Galaxy";
 import { Topology } from "../insights/Topology";
+import { Walk } from "../insights/Walk";
+import { Tour } from "../insights/Tour";
 
 type Status = "loading" | "ready" | "unanalyzed" | "error";
 type Mode = "GALAXY" | "SOUND" | "PROOF";
@@ -91,8 +93,8 @@ export function Insights() {
               </div>
 
               {chip === "Explore" && <Galaxy map={map} selectedId={selectedId} onSelect={setSelectedId} />}
-              {chip === "Walk" && <p className="hint">Walk is coming in the next task.</p>}
-              {chip === "Tour" && <p className="hint">Tour is coming in the next task.</p>}
+              {chip === "Walk" && <Walk map={map} selectedId={selectedId} onSelect={setSelectedId} />}
+              {chip === "Tour" && <Tour map={map} selectedId={selectedId} onSelect={setSelectedId} />}
               {chip === "Topo" && <Topology map={map} selectedId={selectedId} onSelect={setSelectedId} />}
             </>
           )}
