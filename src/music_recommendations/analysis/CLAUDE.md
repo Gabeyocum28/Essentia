@@ -1,4 +1,4 @@
-# analysis/ — Person 4
+# analysis/
 
 Pure function: MP3 path in, `{"embedding": (1280,) float32}` out (spec §2.1).
 Knows nothing about HTTP, Deezer, Redis, or the phone.

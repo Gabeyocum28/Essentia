@@ -44,3 +44,6 @@ legacy/ is frozen. Copy from it if useful; never import it, never edit it.
 
 Branch as <topic> off main and open a PR; do not commit directly to main.
 Run `python3 -m pytest` before committing. Commit small changes often.
+Before merging analysis changes, also run
+`PARITY=1 python3 -m pytest tests/analysis/test_parity.py -s` (needs
+Essentia, network).

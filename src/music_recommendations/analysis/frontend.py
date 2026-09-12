@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
+from . import registry
+
 SAMPLE_RATE = 16000
 
 
@@ -35,21 +37,24 @@ def decode(path: Path | str) -> np.ndarray:
         # renormalizes by the number of input channels present, giving the
         # same (L+R)/2 mean Essentia uses (and passing mono through
         # unchanged).
+        # This averages channels 0 and 1 only: Deezer previews are stereo,
+        # so that's all there ever is. Essentia's MonoLoader would average
+        # all channels present, but we never see more than two here.
         "-af", "pan=mono|c0<c0+c1",
         "-ar", str(SAMPLE_RATE),
         "-f", "f32le", "-acodec", "pcm_f32le", "-",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, check=False)
+        proc = subprocess.run(cmd, capture_output=True, check=False, timeout=60)
     except FileNotFoundError as exc:  # ffmpeg binary itself missing
         raise DecodeError("ffmpeg not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DecodeError("ffmpeg timed out after 60 s") from exc
     if proc.returncode != 0 or not proc.stdout:
         raise DecodeError(proc.stderr.decode(errors="replace").strip()
                           or f"ffmpeg produced no audio for {path}")
     return np.frombuffer(proc.stdout, dtype="<f4").astype(np.float32)
 
-
-from . import registry  # noqa: E402
 
 FRAME_SIZE = 512
 HOP_SIZE = 256

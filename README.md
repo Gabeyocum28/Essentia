@@ -1,7 +1,7 @@
 # Jazz Recommender
 
 Audio-based jazz recommendations for iPhone. Pick a track, pick what
-"similar" means (sound / feeling / style / groove / surprise), get 5–10
+"similar" means ("More sounds like this" / "Nothing like this"), get 5–10
 tracks with 30 s previews. Design: `Essencia_design_spec.md`.
 
 ## Setup
@@ -14,10 +14,14 @@ tracks with 30 s previews. Design: `Essencia_design_spec.md`.
 
 ## Layout
 
-    contract/                     frozen HTTP contract + fixture (read-only)
-    src/music_recommendations/    analysis / server / corpus lanes
+    contract/                     HTTP contract + fixture (cross-cutting: change
+                                   server, app, and tests/test_contract.py together)
+    src/music_recommendations/    analysis / server / corpus components
     ios/                          SwiftUI app
     scripts/                      operator entry points
     legacy/                       pre-spec MVP, frozen reference
 
 Tests: `python3 -m pytest`
+Before merging analysis changes, also run
+`PARITY=1 python3 -m pytest tests/analysis/test_parity.py -s` (needs
+Essentia, network).

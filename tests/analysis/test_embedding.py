@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from music_recommendations.analysis import embedding, frontend, registry
-from tests.analysis.conftest import SR, needs_effnet
+from tests.analysis.conftest import needs_effnet
 
 
 @needs_effnet

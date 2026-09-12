@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from music_recommendations.analysis import quantize
+from music_recommendations.analysis import analyze_track, quantize
+from tests.analysis.conftest import needs_effnet
 
 
 def _cos(a, b):
@@ -29,3 +30,10 @@ def test_extremes_survive():
 def test_zero_vector_does_not_divide_by_zero():
     data, scale = quantize.to_int8(np.zeros(4, np.float32))
     assert np.array_equal(quantize.from_int8(data, scale), np.zeros(4, np.float32))
+
+
+@needs_effnet
+def test_round_trip_on_real_embedding(tone_wav):
+    vec = analyze_track(tone_wav)["embedding"]
+    back = quantize.from_int8(*quantize.to_int8(vec))
+    assert _cos(vec, back) > 0.999

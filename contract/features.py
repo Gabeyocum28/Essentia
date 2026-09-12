@@ -20,3 +20,4 @@ AXES = [
 FEATURE_KEYS = {
     "embedding": 1280,   # Discogs-EffNet penultimate layer, patch-mean
 }
+# Arrays are 1-D float lists/ndarrays of the stated length.

@@ -13,8 +13,16 @@ from music_recommendations.analysis import analyze_track
 from tests.analysis.conftest import needs_effnet, needs_essentia, run_essentia
 
 FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"
+BASELINE = Path(__file__).resolve().parent / "parity_baseline.json"
 N_TRACKS = int(os.environ.get("PARITY_TRACKS", "8"))
-pytestmark = [needs_essentia, needs_effnet]
+pytestmark = [
+    needs_essentia,
+    needs_effnet,
+    pytest.mark.skipif(
+        os.environ.get("PARITY") != "1",
+        reason="set PARITY=1 to run the Essentia parity gate (network + ~1 min)",
+    ),
+]
 
 
 def _essentia_embedding(mp3: Path, out: Path) -> np.ndarray:
@@ -42,10 +50,13 @@ def _download(track: dict, dest: Path) -> Path | None:
     try:
         return download.download_preview(track, dest)
     except Exception:  # noqa: BLE001 - signed URL expired; refresh once
-        url = deezer.fresh_preview_url(track["track_id"])
-        if not url:
+        try:
+            url = deezer.fresh_preview_url(track["track_id"])
+            if not url:
+                return None
+            return download.download_preview({**track, "preview_url": url}, dest)
+        except Exception:  # noqa: BLE001 - network flake; skip this track
             return None
-        return download.download_preview({**track, "preview_url": url}, dest)
 
 
 def _cos(a, b):
@@ -61,8 +72,18 @@ def test_fixture_tracks_cosine_above_099(tmp_path):
             continue
         new = analyze_track(mp3)["embedding"]
         old = _essentia_embedding(mp3, tmp_path / f"{track['track_id']}.npy")
-        scores.append((track["title"], _cos(new, old)))
+        track_id = track["track_id"]
+        title = track["title"]
+        scores.append((track_id, _cos(new, old)))
+        print(f"{scores[-1][1]:.4f}  {track_id}  {title}")
     assert len(scores) >= 3, "network: could not fetch enough previews"
+
+    if BASELINE.exists():
+        baseline = json.loads(BASELINE.read_text())
+        for track_id, c in scores:
+            if track_id in baseline:
+                print(f"  delta vs baseline {track_id}: {c - baseline[track_id]:+.4f}")
+
     worst = min(scores, key=lambda s: s[1])
-    print("\n".join(f"{c:.4f}  {t}" for t, c in scores))
     assert worst[1] > 0.99, f"worst parity {worst}"
+    assert float(np.mean([c for _, c in scores])) > 0.985
