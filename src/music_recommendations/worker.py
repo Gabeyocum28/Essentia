@@ -249,9 +249,11 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
 
 def _enqueue_new(tracks: list[dict]) -> int:
     """Store metadata and queue every track we have not analyzed; count queued."""
+    ids = [track["track_id"] for track in tracks]
+    features = store.get_many_features(ids)
     queued = 0
-    for track in tracks:
-        if store.get_features(track["track_id"]) is not None:
+    for track, track_features in zip(tracks, features):
+        if track_features is not None:
             continue
         store.put_track_meta(track)
         if store.enqueue_embed(track["track_id"]):
@@ -260,7 +262,8 @@ def _enqueue_new(tracks: list[dict]) -> int:
 
 
 def seed_fixture_if_empty() -> int:
-    """First boot: queue the 30 fixture tracks so the app has something to rank."""
+    """Empty corpus with nothing queued (first boot, or after every job
+    failed): queue the 30 fixture tracks so the app has something to rank."""
     if store.corpus_size() > 0 or store.queued_count() > 0:
         return 0
     tracks = json.loads(FIXTURE.read_text())["tracks"]

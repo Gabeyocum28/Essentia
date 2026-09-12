@@ -345,6 +345,20 @@ def _tracks(ids):
              "artwork_url": "u", "preview_url": "p"} for i in ids]
 
 
+def test_enqueue_new_reads_features_in_one_batch(fake_mongo, monkeypatch):
+    calls = {"batch": 0, "single": 0}
+    original = store.get_many_features
+    monkeypatch.setattr(worker.store, "get_many_features",
+                        lambda ids: (calls.__setitem__("batch", calls["batch"] + 1), original(ids))[1])
+    monkeypatch.setattr(worker.store, "get_features",
+                        lambda tid: (calls.__setitem__("single", calls["single"] + 1), None)[1])
+
+    assert worker._enqueue_new(_tracks(["1", "2", "3", "4", "5"])) == 5
+
+    assert calls["batch"] == 1
+    assert calls["single"] == 0
+
+
 def test_seed_fixture_if_empty_enqueues_all_thirty_once(fake_mongo):
     assert worker.seed_fixture_if_empty() == 30
     assert store.queued_count() == 30
