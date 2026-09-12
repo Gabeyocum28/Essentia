@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api } from "../api/client";
 import type { VizMap } from "../api/types";
@@ -7,6 +7,10 @@ import { Galaxy } from "../insights/Galaxy";
 import { Topology } from "../insights/Topology";
 import { Walk } from "../insights/Walk";
 import { Tour } from "../insights/Tour";
+import { Proof } from "../insights/Proof";
+import { Extremes } from "../insights/Extremes";
+import { MathPanel } from "../insights/MathPanel";
+import { WhySimilar } from "../insights/WhySimilar";
 
 type Status = "loading" | "ready" | "unanalyzed" | "error";
 type Mode = "GALAXY" | "SOUND" | "PROOF";
@@ -20,6 +24,11 @@ export function Insights() {
   const [mode, setMode] = useState<Mode>("GALAXY");
   const [chip, setChip] = useState<GalaxyChip>("Explore");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  const selectedRec = useMemo(
+    () => map?.recs.find((r) => r.track_id === selectedId) ?? null,
+    [map, selectedId],
+  );
 
   const run = useCallback(async () => {
     setStatus("loading");
@@ -64,6 +73,13 @@ export function Insights() {
         <>
           <RecStrip seed={map.seed} recs={map.recs} selectedId={selectedId} onSelect={setSelectedId} />
 
+          {selectedRec && (
+            <>
+              <MathPanel rec={selectedRec} />
+              <WhySimilar seedId={map.seed.track_id} recId={selectedRec.track_id} />
+            </>
+          )}
+
           <div className="segmented-control">
             {(["GALAXY", "SOUND", "PROOF"] as Mode[]).map((m) => (
               <button
@@ -103,7 +119,12 @@ export function Insights() {
             <p className="hint">Spectrogram, self-similarity and band solo are not in the web app yet.</p>
           )}
 
-          {mode === "PROOF" && <p className="hint">Proof mode arrives in Task 5.</p>}
+          {mode === "PROOF" && (
+            <>
+              <Proof trackId={id} selectedId={selectedId} onSelect={setSelectedId} />
+              <Extremes />
+            </>
+          )}
         </>
       )}
     </div>

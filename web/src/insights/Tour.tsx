@@ -29,6 +29,11 @@ export function Tour({ map, selectedId }: Props) {
     playingRef.current = playing;
   }, [playing]);
 
+  // Tracks the canvas backing-store size actually applied, so the draw loop only touches
+  // canvas.width/height (which clears the canvas and is comparatively expensive) when the
+  // container size or DPR genuinely changed, not on every animation frame.
+  const appliedSizeRef = useRef({ width: 0, height: 0, dpr: 0 });
+
   const run = useCallback(async () => {
     setStatus("loading");
     try {
@@ -86,19 +91,24 @@ export function Tour({ map, selectedId }: Props) {
 
     const draw = (now: number) => {
       if (cancelled) return;
-      const dt = (now - lastTime) / 1000;
+      // Clamp dt so a tab that was backgrounded and resumes doesn't jump the tour forward.
+      const dt = Math.min((now - lastTime) / 1000, 0.1);
       lastTime = now;
       if (playingRef.current) {
         tRef.current += dt;
       }
 
       const dpr = window.devicePixelRatio || 1;
-      canvas.width = size.width * dpr;
-      canvas.height = size.height * dpr;
-      canvas.style.width = `${size.width}px`;
-      canvas.style.height = `${size.height}px`;
+      const applied = appliedSizeRef.current;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
+      if (applied.width !== size.width || applied.height !== size.height || applied.dpr !== dpr) {
+        canvas.width = size.width * dpr;
+        canvas.height = size.height * dpr;
+        canvas.style.width = `${size.width}px`;
+        canvas.style.height = `${size.height}px`;
+        appliedSizeRef.current = { width: size.width, height: size.height, dpr };
+      }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = "#000";
       ctx.fillRect(0, 0, size.width, size.height);
