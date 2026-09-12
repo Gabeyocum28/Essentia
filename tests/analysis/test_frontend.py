@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 
@@ -21,11 +24,22 @@ def test_decode_missing_file_raises(tmp_path):
 
 
 @needs_essentia
-def test_decode_matches_essentia_monoloader(tone_wav):
-    from essentia.standard import MonoLoader
+def test_decode_matches_essentia_monoloader(tone_wav, tmp_path):
+    # Essentia and TensorFlow cannot both be loaded in one process (they
+    # deadlock/abort — verified locally), and this test suite also exercises
+    # embedding.py's TensorFlow graph. Run the essentia reference decode in
+    # a subprocess so the two never share a process.
+    ref_path = tmp_path / "ref.npy"
+    script = (
+        "import numpy as np\n"
+        "from essentia.standard import MonoLoader\n"
+        f"ref = MonoLoader(filename={str(tone_wav)!r}, sampleRate={SR})()\n"
+        f"np.save({str(ref_path)!r}, ref)\n"
+    )
+    subprocess.run([sys.executable, "-c", script], check=True)
+    ref = np.load(ref_path)
 
     ours = frontend.decode(tone_wav)
-    ref = MonoLoader(filename=str(tone_wav), sampleRate=SR)()
     n = min(len(ours), len(ref))
     # Different resamplers; agree on the waveform to well under 1%.
     assert np.abs(ours[:n] - ref[:n]).max() < 0.01
@@ -71,14 +85,34 @@ def test_patches_too_short_is_empty():
 
 
 @needs_essentia
-def test_mel_frames_match_essentia_input_musicnn():
-    from essentia.standard import TensorflowInputMusiCNN
-
+def test_mel_frames_match_essentia_input_musicnn(tmp_path):
+    # See test_decode_matches_essentia_monoloader: essentia and TensorFlow
+    # cannot share a process, so the reference values are computed out of
+    # process and only numpy arrays cross back over.
     rng = np.random.default_rng(1)
     audio = (_tone(1.0) + 0.1 * rng.standard_normal(SR)).astype(np.float32)
     ours = frontend.mel_frames(audio)
-    ref_fn = TensorflowInputMusiCNN()
-    for i in range(0, 40, 7):  # a spread of full frames
-        frame = audio[i * frontend.HOP_SIZE: i * frontend.HOP_SIZE + frontend.FRAME_SIZE]
-        ref = ref_fn(frame)
+
+    audio_path = tmp_path / "audio.npy"
+    ref_path = tmp_path / "ref.npy"
+    np.save(audio_path, audio)
+    indices = list(range(0, 40, 7))
+    script = (
+        "import numpy as np\n"
+        "from essentia.standard import TensorflowInputMusiCNN\n"
+        f"audio = np.load({str(audio_path)!r})\n"
+        f"frame_size = {frontend.FRAME_SIZE}\n"
+        f"hop_size = {frontend.HOP_SIZE}\n"
+        "ref_fn = TensorflowInputMusiCNN()\n"
+        "refs = []\n"
+        f"for i in {indices!r}:\n"
+        "    frame = audio[i * hop_size: i * hop_size + frame_size]\n"
+        "    refs.append(ref_fn(frame))\n"
+        f"np.save({str(ref_path)!r}, np.array(refs))\n"
+    )
+    subprocess.run([sys.executable, "-c", script], check=True)
+    refs = np.load(ref_path)
+
+    for row, i in enumerate(indices):  # a spread of full frames
+        ref = refs[row]
         assert np.abs(ours[i] - ref).max() / np.abs(ref).max() < 1e-4
