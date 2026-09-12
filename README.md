@@ -12,6 +12,19 @@ tracks with 30 s previews. Design: `Essencia_design_spec.md`.
     export MONGODB_URI="mongodb+srv://..."   # Atlas connection string, never committed
     uvicorn music_recommendations.server.app:app --reload
 
+## Deploy
+
+The API and worker run as a Docker Compose stack on the Oracle VM, behind
+the shared Caddy instance, at `https://essentia.gabeyocum.com`. See
+`deploy/README.md` for the full picture; the three commands you need are:
+
+    bash deploy/bootstrap.sh                                    # first-time setup / pick up new commits
+    docker compose -f deploy/docker-compose.yml logs -f worker   # tail the worker's logs
+    docker compose -f deploy/docker-compose.yml up -d --build    # redeploy after pulling new commits
+
+The worker idles until `MONGODB_URI` is set in `~/stacks/essentia/deploy/.env`
+on the VM.
+
 ## Layout
 
     contract/                     HTTP contract + fixture (cross-cutting: change

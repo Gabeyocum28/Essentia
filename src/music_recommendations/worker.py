@@ -1,12 +1,13 @@
-"""Pop embed jobs from the Atlas jobs collection, analyze, write back.
+"""The one background process: embed queued tracks, answer attribution jobs,
+and grow the corpus by crawling Deezer whenever the queue is empty.
 
-    MONGODB_URI=... python3 scripts/embed_worker.py
+    python -m music_recommendations.worker
 
-One process, one job at a time: on-demand taps trickle in and analysis is
-~1 s. Bulk backfill stays analyze_corpus.py's job.
+Runs on the VM next to the API (deploy/docker-compose.yml). Needs MONGODB_URI.
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -15,7 +16,22 @@ import wave
 from pathlib import Path
 
 from music_recommendations.analysis import analyze_track
+from music_recommendations.corpus import crawl
 from music_recommendations.server import deezer, store, viz
+
+CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "100000"))
+CRAWL_INTERVAL_S = float(os.environ.get("CRAWL_INTERVAL_S", "60"))
+MAX_QUEUED = 200          # don't flood the queue; the worker drains ~12 tracks/min
+FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"
+_last_crawl = 0.0
+
+# The reachable universe from the 17 charts + 8 snowball roots is ~5k
+# tracks; once every step yields 0 new candidates, idle-time crawling would
+# otherwise poll Deezer forever at a fixed rate. Back off exponentially
+# instead, and reset the moment a step yields something. Module attributes
+# (not locals) so tests can monkeypatch them.
+_crawl_backoff_s = CRAWL_INTERVAL_S
+CRAWL_BACKOFF_MAX_S = 3600.0
 
 
 def download_preview(url: str) -> Path:
@@ -59,7 +75,7 @@ def process_job(track_id: str) -> bool:
     try:
         track = _fresh_track(track_id)
         if track is None:
-            print(f"[embed_worker] {track_id}: no metadata in the store or on Deezer", flush=True)
+            print(f"[worker] {track_id}: no metadata in the store or on Deezer", flush=True)
             store.fail_job(f"embed:{track_id}", "no metadata in the store or on Deezer")
             return False
         mp3 = download_preview(track["preview_url"])
@@ -69,10 +85,10 @@ def process_job(track_id: str) -> bool:
             mp3.unlink(missing_ok=True)
         store.put_track(track, features)
         store.clear_embed_marker(track_id)
-        print(f"[embed_worker] {track_id}: analyzed  {track['artist']} - {track['title']}", flush=True)
+        print(f"[worker] {track_id}: analyzed  {track['artist']} - {track['title']}", flush=True)
         return True
     except Exception as exc:
-        print(f"[embed_worker] {track_id}: FAILED  {exc}", flush=True)
+        print(f"[worker] {track_id}: FAILED  {exc}", flush=True)
         try:
             store.fail_job(f"embed:{track_id}", f"{type(exc).__name__}: {exc}")
         except Exception:
@@ -202,19 +218,19 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
             delta = reference_similarity - _cosine(occluded, rec_vec)
             bands.append({"lo_hz": round(lo_hz, 1), "hi_hz": round(hi_hz, 1),
                           "delta": float(delta)})
-            print(f"[embed_worker] attr {seed_id}->{rec_id} "
+            print(f"[worker] attr {seed_id}->{rec_id} "
                   f"{lo_hz:.0f}-{hi_hz:.0f}Hz delta={delta:+.4f} "
                   f"({time.monotonic() - started:.1f}s)", flush=True)
 
         store.put_attribution(seed_id, rec_id, {
             "status": "ready", "base": base, "bands": bands,
         })
-        print(f"[embed_worker] attr {seed_id}->{rec_id}: ready "
+        print(f"[worker] attr {seed_id}->{rec_id}: ready "
               f"(base {base:.3f})", flush=True)
         store.clear_attribution_marker(seed_id, rec_id)
         return True
     except Exception as exc:
-        print(f"[embed_worker] attr {seed_id}->{rec_id}: FAILED  {exc}", flush=True)
+        print(f"[worker] attr {seed_id}->{rec_id}: FAILED  {exc}", flush=True)
         try:
             # Cache the failure briefly so the phone stops polling, but let
             # the pair be retried once the TTL lapses.
@@ -239,9 +255,107 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
             mp3.unlink(missing_ok=True)
 
 
+def _enqueue_new(tracks: list[dict]) -> int:
+    """Store metadata and queue every track we have not analyzed; count queued.
+
+    Skips tracks whose embed job already failed permanently -- otherwise a
+    crawl just keeps re-discovering and re-enqueueing the same broken
+    tracks (dead preview, unsupported codec, ...) forever.
+    """
+    ids = [track["track_id"] for track in tracks]
+    features = store.get_many_features(ids)
+    failed = store.failed_ids(ids)
+    queued = 0
+    for track, track_features in zip(tracks, features):
+        if track_features is not None or track["track_id"] in failed:
+            continue
+        store.put_track_meta(track)
+        if store.enqueue_embed(track["track_id"]):
+            queued += 1
+    return queued
+
+
+def seed_fixture_if_empty() -> int:
+    """Empty corpus with nothing queued (first boot, or after every job
+    failed): queue the 30 fixture tracks so the app has something to rank."""
+    if store.corpus_size() > 0 or store.queued_count() > 0:
+        return 0
+    tracks = json.loads(FIXTURE.read_text())["tracks"]
+    n = _enqueue_new(tracks)
+    print(f"[worker] empty corpus: queued {n} fixture tracks", flush=True)
+    return n
+
+
+def _grow_roots(roots: list[str], tracks: list[dict]) -> None:
+    """Add up to 5 newly-discovered artist names to the `crawl_roots` state,
+    so the snowball/deep-cuts graph expands from what the corpus actually
+    contains instead of staying pinned to the 8 seed roots forever."""
+    discovered = []
+    for track in tracks:
+        name = track.get("artist")
+        if name and name not in roots and name not in discovered:
+            discovered.append(name)
+        if len(discovered) >= 5:
+            break
+    if not discovered:
+        return
+    state = store.get_state("crawl_roots") or {"names": []}
+    names = list(state.get("names", []))
+    for name in discovered:
+        if name not in names:
+            names.append(name)
+    store.put_state("crawl_roots", {"names": names[:200]})
+
+
+def crawl_step() -> int:
+    """One bounded slice of crawling, rotating over three sources: a genre
+    chart, one root's snowball neighbours, or a root's deep album cuts.
+
+    Breadth (charts across genres), depth (the artist-relatedness graph),
+    and obscurity (album tracks that never show up in a /top or /related
+    call) all keep growing this way. The cursor lives in Atlas so a restart
+    continues where it left off.
+
+    Runs inline in `_tick`, so a slow Deezer response (or backoff) delays
+    job processing by up to a few minutes -- acceptable for a background
+    crawl, not for the embed/attribution queue it shares the loop with.
+    """
+    if store.corpus_size() >= CORPUS_CAP or store.queued_count() >= MAX_QUEUED:
+        return 0
+    state = store.get_state("crawl") or {"step": 0}
+    step = int(state.get("step", 0))
+    genres = list(crawl.GENRES)
+    roots_state = store.get_state("crawl_roots")
+    roots = crawl.ROOTS + (roots_state["names"] if roots_state else [])
+    arm = step % 3
+    grow_from = None
+    if arm == 0:
+        genre = genres[(step // 3) % len(genres)]
+        tracks = crawl.from_charts([genre], per_genre=100)
+        source = f"chart {crawl.GENRES[genre]}"
+        grow_from = tracks
+    elif arm == 1:
+        root = roots[(step // 3) % len(roots)]
+        tracks = crawl.snowball([root], hops=1, per_artist=10)
+        source = f"snowball {root}"
+        grow_from = tracks
+    else:
+        root = roots[(step // 3) % len(roots)]
+        ids = crawl.resolve_artists([root])
+        tracks = list(crawl.deep_cuts(ids, albums_per_artist=3))
+        source = f"deep cuts {root}"
+    n = _enqueue_new(tracks)
+    if grow_from is not None:
+        _grow_roots(roots, grow_from)
+    store.put_state("crawl", {"step": step + 1})
+    print(f"[worker] crawl {source}: {len(tracks)} candidates, {n} queued", flush=True)
+    return n
+
+
 def _tick() -> None:
     """One loop iteration: sweep stale claims, then dequeue and process a
-    job, if there is one.
+    job, if there is one. When there is none, crawl for more corpus --
+    rate-limited so we don't hammer Deezer while idle.
 
     The process_* helpers never raise, but store.dequeue_job (and
     requeue_stale) can (a transient connection error while polling Atlas)
@@ -251,10 +365,21 @@ def _tick() -> None:
     try:
         store.requeue_stale()
     except Exception as exc:
-        print(f"[embed_worker] requeue_stale error {exc}", flush=True)
+        print(f"[worker] requeue_stale error {exc}", flush=True)
     try:
         job = store.dequeue_job(timeout=5)
         if not job:
+            global _last_crawl, _crawl_backoff_s
+            if time.monotonic() - _last_crawl >= _crawl_backoff_s:
+                _last_crawl = time.monotonic()
+                try:
+                    n = crawl_step()
+                    if n > 0:
+                        _crawl_backoff_s = CRAWL_INTERVAL_S
+                    else:
+                        _crawl_backoff_s = min(_crawl_backoff_s * 2, CRAWL_BACKOFF_MAX_S)
+                except Exception as exc:  # noqa: BLE001 - Deezer flakes must not kill the loop
+                    print(f"[worker] crawl error {exc}", flush=True)
             return
         kind, payload = job
         if kind == "embed":
@@ -264,15 +389,22 @@ def _tick() -> None:
             if seed_id and rec_id:
                 process_attribution(seed_id, rec_id)
             else:
-                print(f"[embed_worker] bad attribution job {payload!r}", flush=True)
+                print(f"[worker] bad attribution job {payload!r}", flush=True)
     except Exception as exc:
-        print(f"[embed_worker] queue error {exc}, retrying in 5s", flush=True)
+        print(f"[worker] queue error {exc}, retrying in 5s", flush=True)
         time.sleep(5)
 
 
 def main() -> None:
-    print("[embed_worker] watching embed:queue + attr:queue (Ctrl-C to stop)",
-          flush=True)
+    if not os.environ.get("MONGODB_URI"):
+        print("[worker] MONGODB_URI is not set; nothing to do", flush=True)
+        while True:
+            time.sleep(60)
+    print("[worker] up: embed + attribution jobs, crawling when idle (Ctrl-C to stop)", flush=True)
+    try:
+        seed_fixture_if_empty()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[worker] seed error {exc}", flush=True)
     while True:
         _tick()
 

@@ -262,7 +262,7 @@ _POLL_S = 0.5
 def _attr_pair(seed_id: str, rec_id: str) -> str:
     """Job/cache key half: colon-joined, matching the cache key format
     (`attr:{seed}:{rec}`). dequeue_job's returned payload is pipe-joined
-    instead -- scripts/embed_worker.py splits it on "|" -- so it is built
+    instead -- worker.py splits it on "|" -- so it is built
     separately there, not through this helper."""
     return f"{seed_id}:{rec_id}"
 
@@ -311,7 +311,7 @@ def dequeue_job(timeout: int = 5) -> tuple[str, str] | None:
             return "embed", job["track_id"]
         job = _claim("attr")
         if job:
-            # Pipe-joined, not _attr_pair's colon: scripts/embed_worker.py
+            # Pipe-joined, not _attr_pair's colon: worker.py
             # splits this payload on "|".
             return "attribution", f"{job['seed_id']}|{job['rec_id']}"
         if time.monotonic() >= deadline:
@@ -397,3 +397,30 @@ def get_cached_preview(track_id: str) -> str | None:
 
 def put_cached_preview(track_id: str, url: str, ttl: int = _PREVIEW_TTL_S) -> None:
     _cache_put(f"preview:{track_id}", url, ttl)
+
+
+# ---- durable state (crawl cursor etc.): cache documents that never expire ----
+
+def get_state(key: str) -> dict | None:
+    return _cache_get(f"state:{key}")
+
+
+def put_state(key: str, value: dict) -> None:
+    _cache_put(f"state:{key}", value, None)
+
+
+def queued_count() -> int:
+    """How many jobs are waiting (not running, not failed)."""
+    return db().jobs.count_documents({"state": "queued"})
+
+
+def failed_ids(track_ids: list[str]) -> set[str]:
+    """Which of these track ids have a permanently failed embed job, in one
+    query -- so a crawl never re-enqueues a track that already failed."""
+    if not track_ids:
+        return set()
+    docs = db().jobs.find(
+        {"_id": {"$in": [f"embed:{i}" for i in track_ids]}, "state": "failed"},
+        {"_id": 1},
+    )
+    return {d["_id"].split(":", 1)[1] for d in docs}

@@ -1,0 +1,10 @@
+essentia.gabeyocum.com {
+    redir /api /api/ 308
+    handle_path /api/* {
+        reverse_proxy essentia-api:8000
+    }
+    handle {
+        # The web app (sub-project 4) is served by the API container too.
+        reverse_proxy essentia-api:8000
+    }
+}

@@ -210,3 +210,30 @@ def test_preview_cache_roundtrip_and_expiry(fake_mongo):
     fake_mongo.cache.update_one({"_id": "preview:42"},
                                 {"$set": {"expires_at": store._now() - timedelta(seconds=1)}})
     assert store.get_cached_preview("42") is None   # expired entries are ignored even before TTL reaps them
+
+
+# ---- durable state + queue depth ----
+
+def test_state_roundtrip_never_expires(fake_mongo):
+    assert store.get_state("crawl") is None
+    store.put_state("crawl", {"genre_index": 3})
+    assert store.get_state("crawl") == {"genre_index": 3}
+    assert fake_mongo.cache.find_one({"_id": "state:crawl"})["expires_at"] is None
+
+
+def test_queued_count_counts_only_queued(fake_mongo):
+    store.enqueue_embed("1")
+    store.enqueue_embed("2")
+    store.dequeue_embed(timeout=0)
+    assert store.queued_count() == 1
+
+
+def test_failed_ids(fake_mongo):
+    store.enqueue_embed("1")
+    store.enqueue_embed("2")
+    store.enqueue_embed("3")
+    store.fail_job("embed:1", "boom")
+    store.fail_job("embed:2", "boom")
+    # "3" stays queued, "4" was never enqueued at all.
+    assert store.failed_ids(["1", "2", "3", "4"]) == {"1", "2"}
+    assert store.failed_ids([]) == set()
