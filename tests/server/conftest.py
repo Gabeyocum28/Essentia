@@ -1,62 +1,8 @@
-"""Shared fakes: an in-memory Redis standing in for the real one."""
+"""Shared fakes: an in-memory MongoDB (mongomock) standing in for Atlas."""
+import mongomock
 import pytest
 
 from music_recommendations.server import store
-
-
-class FakeRedis:
-    def __init__(self):
-        self.kv = {}
-        self.sets = {}
-        self.lists = {}
-        self.mget_calls = []
-
-    def set(self, key, value, ex=None):
-        self.kv[key] = value
-
-    def get(self, key):
-        return self.kv.get(key)
-
-    def mget(self, keys):
-        self.mget_calls.append(keys)
-        return [self.kv.get(k) for k in keys]
-
-    def exists(self, key):
-        return 1 if key in self.kv else 0
-
-    def delete(self, key):
-        self.kv.pop(key, None)
-
-    def sadd(self, key, *values):
-        self.sets.setdefault(key, set()).update(values)
-
-    def srem(self, key, *values):
-        self.sets.get(key, set()).difference_update(values)
-
-    def sismember(self, key, value):
-        return value in self.sets.get(key, set())
-
-    def smembers(self, key):
-        return self.sets.get(key, set())
-
-    def scard(self, key):
-        # store.corpus_ids/corpus_size ask for the cardinality first and skip
-        # shipping 90k members when it has not moved; the fake has to answer
-        # it or every caller of those two raises AttributeError.
-        return len(self.sets.get(key, set()))
-
-    def lpush(self, key, *values):
-        self.lists.setdefault(key, []).extend(values)
-
-    def brpop(self, key, timeout=0):
-        # Real BRPOP takes one key or several and answers from the first
-        # non-empty one in order — that ordering is how the worker gives
-        # embed jobs priority over attribution jobs.
-        for name in ([key] if isinstance(key, str) else list(key)):
-            items = self.lists.get(name)
-            if items:
-                return (name, items.pop(0))
-        return None
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +22,10 @@ def clear_matrix_cache():
 
 
 @pytest.fixture
-def fake_redis(monkeypatch):
-    fake = FakeRedis()
-    monkeypatch.setattr(store, "client", lambda: fake)
-    return fake
+def fake_mongo(monkeypatch):
+    """A fresh in-memory database wired into store.db() for one test."""
+    database = mongomock.MongoClient().get_database("essentia_test")
+    store.reset()
+    monkeypatch.setattr(store, "db", lambda: database)
+    yield database
+    store.reset()
