@@ -1,7 +1,7 @@
-"""Batch loop: download preview -> analyze_track -> write Redis.
+"""Batch loop: download preview -> analyze_track -> write the store.
 
 Same analysis function the server calls on demand; different caller
-(spec §7). Skips tracks already in Redis; one bad track never kills a run.
+(spec §7). Skips tracks already in the store; one bad track never kills a run.
 
 Downloads and analysis are bounded by different things, so they run
 differently: downloads are I/O and go on threads, analysis is a TensorFlow
@@ -14,7 +14,7 @@ being analyzed. Measured on a 10-core run, downloading a batch and analyzing
 it strictly in turn left the CPU idle for most of the wall clock, because a
 preview fetch is network latency and nothing else.
 
-Each mp3 leaves the working cache the moment its features reach Redis. The
+Each mp3 leaves the working cache the moment its features reach the store. The
 features ARE the product; the audio is scratch, and at ~225 KB a preview a
 corpus of tens of thousands would fill the disk for nothing.
 
@@ -144,7 +144,7 @@ def ingest(tracks: list[dict], limit: int = 300, workers: int | None = None,
                 try:
                     store.put_track(track, {**features, VERSION_KEY: FEATURES_VERSION})
                     done += 1
-                except Exception as exc:  # noqa: BLE001 - a Redis blip is not fatal
+                except Exception as exc:  # noqa: BLE001 - a store blip is not fatal
                     if progress:
                         print(f"  store failed {track['track_id']}: {exc}")
             if progress:

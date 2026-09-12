@@ -1,15 +1,9 @@
-"""Analyze crawled candidates into Redis (needs redis-server running).
+"""Analyze crawled candidates into Atlas (needs MONGODB_URI).
 
 Usage:
   python3 scripts/analyze_corpus.py                 up to 300 tracks
   python3 scripts/analyze_corpus.py 1000            up to 1000
   python3 scripts/analyze_corpus.py --workers 9
-
-Two machines:
-  Machine A runs redis-server bound to the LAN and starts normally.
-  Machine B sets REDIS_URL=redis://<A-lan-ip>:6379/0 and runs --shard 1/2,
-  while A runs --shard 0/2. Sharding is by track_id hash, so the two never
-  collide and neither needs to know the other exists.
 
 Resumable: anything already stored at the current FEATURES_VERSION is
 skipped, so re-running after a crash or a sleep picks up where it left off.
@@ -52,7 +46,7 @@ def main() -> None:
     try:
         stored = ingest(tracks, limit=args.limit, workers=args.workers)
     except Exception as exc:
-        sys.exit(f"ingest failed: {exc}\n(is redis-server running?)")
+        sys.exit(f"ingest failed: {exc}\n(is MONGODB_URI set and reachable?)")
 
     elapsed = time.time() - started
     rate = f"{elapsed / stored:.2f}s/track" if stored else "n/a"

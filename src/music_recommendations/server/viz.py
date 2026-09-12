@@ -63,7 +63,7 @@ def shortest_walk(matrix: np.ndarray, start: int, end: int,
     Both the k-NN edges and their weights use cosine distance (1 - cosine),
     matching the numbers shown in the walkthrough. The graph is cached by
     matrix identity and k because embedding matrices are already cache-owned
-    by the server for the lifetime of a corpus snapshot.
+    by the server for the lifetime of one corpus state.
     """
     matrix = np.asarray(matrix, dtype=float)
     n = len(matrix)

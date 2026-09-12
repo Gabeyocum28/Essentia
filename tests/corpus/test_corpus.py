@@ -45,10 +45,10 @@ def test_missing_album_or_artist_does_not_crash():
     assert track["artist"] == "" and track["album"] == ""
 
 
-def test_already_stored_is_false_when_redis_is_unreachable(monkeypatch):
-    """A crawl against a dead Redis should re-do work, not silently skip it."""
+def test_already_stored_is_false_when_the_store_is_unreachable(monkeypatch):
+    """A crawl against a dead store should re-do work, not silently skip it."""
     def boom(_track_id):
-        raise ConnectionError("redis is down")
+        raise ConnectionError("store is down")
 
     monkeypatch.setattr(ingest.store, "get_features", boom)
     assert ingest.already_stored("123") is False
@@ -142,7 +142,7 @@ def test_previews_are_deleted_once_their_features_are_stored(monkeypatch, tmp_pa
     assert not mp3s[1].exists(), "a track that cannot be analyzed is no different"
 
 
-def test_a_track_already_in_redis_has_its_leftover_audio_swept(monkeypatch, tmp_path):
+def test_a_track_already_in_the_store_has_its_leftover_audio_swept(monkeypatch, tmp_path):
     """A run that died between analysis and cleanup should not leak the file."""
     monkeypatch.setattr(ingest, "AUDIO_CACHE", tmp_path)
     monkeypatch.setattr(ingest, "already_stored", lambda _t: True)

@@ -1,7 +1,8 @@
-"""embed_worker.py: pop queued tracks, analyze locally, write back to Redis."""
+"""embed_worker.py: pop queued tracks, analyze locally, write back to the store."""
 import importlib.util
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from music_recommendations.server import store
@@ -19,7 +20,14 @@ TRACK = {
     "artwork_url": "http://x/a.jpg",
     "preview_url": "http://x/p.mp3",
 }
-FEATURES = {"embedding": [0.1, 0.2], "groove": [120.0, 0.9, 3.1, 0.5]}
+FEATURES = {"embedding": [0.1, 0.2]}
+
+
+def assert_features_match(track_id: str, expected: dict) -> None:
+    """Compare through the int8 round trip: exact equality no longer holds."""
+    got = store.get_features(track_id)
+    assert got is not None
+    assert np.allclose(got["embedding"], expected["embedding"], atol=0.01)
 
 
 @pytest.fixture
@@ -30,17 +38,17 @@ def analysis_ok(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "analyze_track", lambda p: dict(FEATURES))
 
 
-def test_process_job_analyzes_stores_and_clears_marker(fake_redis, analysis_ok, monkeypatch):
+def test_process_job_analyzes_stores_and_clears_marker(fake_mongo, analysis_ok, monkeypatch):
     monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
     store.enqueue_embed("42")
 
     assert worker.process_job("42") is True
-    assert store.get_features("42") == FEATURES
+    assert_features_match("42", FEATURES)
     assert "42" in store.corpus_ids()
     assert store.enqueue_embed("42") is True   # marker cleared -> re-enqueueable
 
 
-def test_process_job_prefers_fresh_deezer_preview_url(fake_redis, monkeypatch, tmp_path):
+def test_process_job_prefers_fresh_deezer_preview_url(fake_mongo, monkeypatch, tmp_path):
     """Stored preview URLs expire (~15 min hdnea token): a queued job must
     re-fetch from Deezer rather than download the URL /seed stored."""
     store.put_track_meta({**TRACK, "preview_url": "http://x/stale.mp3"})
@@ -60,20 +68,28 @@ def test_process_job_prefers_fresh_deezer_preview_url(fake_redis, monkeypatch, t
 
     assert worker.process_job("42") is True
     assert downloaded == ["http://x/fresh.mp3"]
-    assert store.get_track("42")["preview_url"] == "http://x/fresh.mp3"
+    # get_track never round-trips preview_url; the fresh-vs-stale distinction
+    # is already pinned by `downloaded` above.
+    assert store.get_track("42")["preview_url"] == ""
 
 
-def test_process_job_falls_back_to_stored_track_when_deezer_down(fake_redis, analysis_ok, monkeypatch):
+def test_process_job_fails_cleanly_when_deezer_down(fake_mongo, analysis_ok, monkeypatch):
+    """store.get_track() never has a usable preview_url (it's always ""), so
+    there's no stored fallback left to fall back to -- a Deezer outage just
+    fails the job."""
     def deezer_down(t):
         raise OSError("no network")
 
     store.put_track_meta(TRACK)
+    store.enqueue_embed("42")
     monkeypatch.setattr(worker.deezer, "get_track", deezer_down)
-    assert worker.process_job("42") is True
-    assert store.get_features("42") == FEATURES
+    assert worker.process_job("42") is False
+    assert store.get_features("42") is None
+    job = fake_mongo.jobs.find_one({"_id": "embed:42"})
+    assert job["state"] == "failed" and job["error"]
 
 
-def test_process_job_failure_logs_clears_marker_never_raises(fake_redis, monkeypatch):
+def test_process_job_failure_logs_records_failed_job_never_raises(fake_mongo, monkeypatch):
     def boom(url):
         raise OSError("download failed")
 
@@ -84,16 +100,33 @@ def test_process_job_failure_logs_clears_marker_never_raises(fake_redis, monkeyp
 
     assert worker.process_job("42") is False
     assert store.get_features("42") is None
-    assert store.enqueue_embed("42") is True   # marker cleared despite failure
+    job = fake_mongo.jobs.find_one({"_id": "embed:42"})
+    assert job["state"] == "failed"
+    assert "OSError" in job["error"] and "download failed" in job["error"]
 
 
-def test_process_job_no_metadata_anywhere_fails_cleanly(fake_redis, monkeypatch):
+def test_process_job_no_metadata_anywhere_fails_cleanly(fake_mongo, monkeypatch):
     monkeypatch.setattr(worker.deezer, "get_track", lambda t: None)
     assert worker.process_job("42") is False
 
 
+def test_tick_sweeps_stale_jobs_before_dequeuing(fake_mongo, monkeypatch):
+    calls = {"n": 0}
+
+    def counting_requeue_stale(*args, **kwargs):
+        calls["n"] += 1
+        return 0
+
+    monkeypatch.setattr(worker.store, "requeue_stale", counting_requeue_stale)
+    monkeypatch.setattr(worker.store, "dequeue_job", lambda timeout=5: None)
+
+    worker._tick()
+
+    assert calls["n"] == 1
+
+
 def test_tick_survives_a_dequeue_connection_error(monkeypatch):
-    """A transient Redis error on the blocking pop must not kill the loop."""
+    """A transient store error on the blocking pop must not kill the loop."""
     calls = {"n": 0}
 
     def flaky_dequeue(timeout=5):
@@ -156,7 +189,7 @@ def embedding_stub(monkeypatch, tmp_path):
     return FakeEmbedding
 
 
-def test_dequeue_job_gives_embed_work_priority_over_attribution(fake_redis):
+def test_dequeue_job_gives_embed_work_priority_over_attribution(fake_mongo):
     store.enqueue_attribution("42", "43")
     store.enqueue_embed("42")
 
@@ -165,7 +198,7 @@ def test_dequeue_job_gives_embed_work_priority_over_attribution(fake_redis):
     assert store.dequeue_job(timeout=0) is None
 
 
-def test_tick_routes_an_attribution_job(fake_redis, monkeypatch):
+def test_tick_routes_an_attribution_job(fake_mongo, monkeypatch):
     seen = []
     monkeypatch.setattr(worker, "process_attribution",
                         lambda seed, rec: seen.append((seed, rec)) or True)
@@ -176,7 +209,7 @@ def test_tick_routes_an_attribution_job(fake_redis, monkeypatch):
     assert seen == [("42", "43")]
 
 
-def test_process_attribution_writes_one_delta_per_band(fake_redis, embedding_stub,
+def test_process_attribution_writes_one_delta_per_band(fake_mongo, embedding_stub,
                                                        monkeypatch):
     monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
     store.put_track(TRACK, {"embedding": [1.0, 0.0]})
@@ -199,7 +232,7 @@ def test_process_attribution_writes_one_delta_per_band(fake_redis, embedding_stu
     assert store.enqueue_attribution("42", "43") is True
 
 
-def test_process_attribution_caches_failure_so_the_phone_stops_polling(fake_redis,
+def test_process_attribution_caches_failure_so_the_phone_stops_polling(fake_mongo,
                                                                        monkeypatch):
     monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
     store.put_track(TRACK, {"embedding": [1.0, 0.0]})   # rec never analyzed
@@ -231,7 +264,7 @@ def test_write_wav_keeps_the_audio_at_its_own_level(tmp_path):
 
 
 def test_attribution_measures_against_an_identically_processed_reference(
-        fake_redis, embedding_stub, monkeypatch):
+        fake_mongo, embedding_stub, monkeypatch):
     """Deltas compare wav-vs-wav. Measuring against the stored mp3 embedding
     would fold the decode difference into all ten bands as a constant."""
     monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
@@ -255,7 +288,7 @@ def test_attribution_measures_against_an_identically_processed_reference(
     assert store.get_attribution("42", "43")["base"] == pytest.approx(1.0)
 
 
-def test_attribution_analyzes_at_the_long_window(fake_redis, embedding_stub,
+def test_attribution_analyzes_at_the_long_window(fake_mongo, embedding_stub,
                                                  monkeypatch):
     """The window is the fix for low-band resolution, so it is pinned here:
     falling back to band_stop's defaults would make neighbouring low bands
@@ -278,7 +311,7 @@ def test_attribution_analyzes_at_the_long_window(fake_redis, embedding_stub,
     assert all(k == {"fft_size": 8192, "hop": 4096} for k in seen)
 
 
-def test_attribution_never_clips_a_hot_counterfactual(fake_redis, embedding_stub,
+def test_attribution_never_clips_a_hot_counterfactual(fake_mongo, embedding_stub,
                                                       monkeypatch):
     """Deleting a band that opposed a peak can push the residual above full
     scale. One shared gain keeps every counterfactual inside the rails —

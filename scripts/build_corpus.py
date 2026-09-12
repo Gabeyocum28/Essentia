@@ -7,7 +7,7 @@ Usage:
   python3 scripts/build_corpus.py --per-genre 50
 
 Writes contract-shaped Track dicts. Crawling only -- no downloads, no
-analysis, no Redis. Run analyze_corpus.py next.
+analysis, no store writes. Run analyze_corpus.py next.
 """
 from __future__ import annotations
 

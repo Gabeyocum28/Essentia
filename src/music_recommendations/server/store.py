@@ -1,243 +1,399 @@
-"""Redis read/write. Keys:
-  track:{id}      -> JSON: contract Track fields
-  features:{id}   -> JSON: {feature_key: [floats] | float}
-  corpus:ids      -> set of analyzed track ids
+"""MongoDB Atlas read/write. Database `essentia`, three collections:
 
-With CORPUS_SNAPSHOT set, the corpus is read from files instead and every
-function here forwards to snapshot.py -- see that module for why. Redis stays
-the path on the Mac, where the crawler and embed worker need somewhere to
-write; the switch exists so the hosted server can run without a Redis at all.
+  tracks  _id=track_id, title, artist, album, artwork_url,
+          embedding (int8 bytes), scale (float), features_version, analyzed_at
+          -- the last four are absent until the track is analyzed.
+  jobs    _id="embed:{id}" | "attr:{seed}:{rec}", kind, state, claimed_at,
+          attempts, error, created_at  (+ track_id or seed_id/rec_id)
+  cache   _id="preview:{id}" | "attr:{seed}:{rec}", value, expires_at (TTL)
+
+Signed preview URLs are never stored on a track (they expire in minutes);
+GET /preview re-signs and caches them in `cache`.
+
+Every function here is the same name app.py, corpus/ingest.py and the
+worker called before this was MongoDB. Only the backend changed.
+
+Timestamps are naive UTC throughout (not timezone-aware): mongomock strips
+tzinfo off datetimes on round-trip, so comparing an aware `_now()` against a
+value read back from mongomock raises. Using naive UTC everywhere avoids the
+mismatch in both the mongomock-backed tests and the real Atlas driver.
+
+The timestamps that drive watermarks and stale detection -- `analyzed_at`,
+`claimed_at`, `created_at` -- are stamped by the MongoDB server itself via
+`$currentDate`, not by the calling process's clock. The API and the embed
+worker are different hosts; if their clocks drifted, a client-stamped
+`analyzed_at` could sort before a watermark that was really taken later,
+silently hiding a row from `tracks_since`/`corpus_ids`. A single server
+clock removes that failure mode. `_now()` remains in use for read-side
+comparisons (e.g. cache expiry, the stale-job cutoff) where both sides of
+the comparison are evaluated in this process.
 """
 from __future__ import annotations
 
-import json
 import os
+import threading
+import time
+from datetime import datetime, timedelta
 
-from music_recommendations.server import snapshot
+import numpy as np
+import pymongo
+from pymongo import ReturnDocument
 
-_client = None
+from music_recommendations.analysis.quantize import from_int8, to_int8
+
+TRACK_FIELDS = ("title", "artist", "album", "artwork_url")
+VERSION_KEY = "_features_version"   # what corpus/ingest.py expects to read back
+
+_client: pymongo.MongoClient | None = None
+_indexes_ready = False
+_lock = threading.Lock()
 
 
-def client() -> "redis.Redis":
-    """Lazily construct and cache the Redis client."""
+def _now() -> datetime:
+    return datetime.utcnow()
+
+
+def db():
+    """Lazily connect using MONGODB_URI / MONGODB_DB; one client per process."""
     global _client
     if _client is None:
-        import redis
+        uri = os.environ.get("MONGODB_URI")
+        if not uri:
+            raise RuntimeError("MONGODB_URI is not set")
+        _client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
+    return _client[os.environ.get("MONGODB_DB", "essentia")]
 
-        _client = redis.Redis.from_url(
-            os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
-            decode_responses=True,
-        )
-    return _client
+
+def reset() -> None:
+    """Forget the client and caches (tests, and after a fork)."""
+    global _client, _indexes_ready, _ids_cache
+    if _client is not None:
+        _client.close()
+    _client = None
+    _indexes_ready = False
+    _ids_cache = None
+
+
+def ensure_indexes() -> None:
+    """Idempotent; called once per process before the first write."""
+    global _indexes_ready
+    if _indexes_ready:
+        return
+    d = db()
+    d.tracks.create_index("analyzed_at")
+    d.jobs.create_index([("state", pymongo.ASCENDING), ("created_at", pymongo.ASCENDING)])
+    d.cache.create_index("expires_at", expireAfterSeconds=0)
+    _indexes_ready = True
+
+
+# ---- tracks ----
+
+def _contract(doc: dict) -> dict:
+    return {"track_id": doc["_id"], **{k: doc.get(k) for k in TRACK_FIELDS},
+            "preview_url": ""}
+
+
+def _meta(track: dict) -> dict:
+    return {k: track.get(k) for k in TRACK_FIELDS}
 
 
 def put_track(track: dict, features: dict) -> None:
-    """Write a track's contract fields and analyzed features into Redis."""
-    if snapshot.active():
-        snapshot.put_track(track, features)
-        return
-    r = client()
-    track_id = track["track_id"]
-    r.set(f"track:{track_id}", json.dumps(track))
-    r.set(f"features:{track_id}", json.dumps(features))
-    r.sadd("corpus:ids", track_id)
-
-
-def get_track(track_id: str) -> dict | None:
-    """Read a track's contract fields, or None if not present."""
-    if snapshot.active():
-        return snapshot.get_track(track_id)
-    raw = client().get(f"track:{track_id}")
-    return json.loads(raw) if raw else None
-
-
-def get_many_tracks(track_ids: list[str]) -> list[dict | None]:
-    """Read many track records in one round trip, preserving input order."""
-    if snapshot.active():
-        return snapshot.get_many_tracks(track_ids)
-    if not track_ids:
-        return []
-    raw = client().mget([f"track:{t}" for t in track_ids])
-    return [json.loads(record) if record else None for record in raw]
-
-
-def get_features(track_id: str) -> dict | None:
-    """Read a track's analyzed features, or None if not present."""
-    if snapshot.active():
-        return snapshot.get_features(track_id)
-    raw = client().get(f"features:{track_id}")
-    return json.loads(raw) if raw else None
-
-
-def corpus_size() -> int:
-    """How many tracks are analyzed, without transferring their ids.
-
-    corpus_ids() ships every id and sorts them; at corpus scale that is real
-    time on a path that runs per request. Tracks are only ever added, so the
-    count alone is a sound signal for "has anything changed".
-    """
-    if snapshot.active():
-        return snapshot.corpus_size()
-    return client().scard("corpus:ids")
-
-
-# corpus_ids ships every id out of Redis and sorts them. On a 90k corpus that
-# is ~1 MB of strings and a full sort, paid on every /recommend. Tracks are only
-# ever ADDED, so the cardinality is a sound "has anything changed" signal, and
-# SCARD is O(1) -- check that first and reuse the last list when it matches.
-_ids_cache: tuple[int, list[str]] | None = None
-
-
-def corpus_ids() -> list[str]:
-    """All track ids currently analyzed and stored, sorted."""
-    if snapshot.active():
-        return snapshot.corpus_ids()
-    global _ids_cache
-    size = client().scard("corpus:ids")
-    if _ids_cache is not None and _ids_cache[0] == size:
-        return _ids_cache[1]
-    ids = sorted(client().smembers("corpus:ids"))
-    _ids_cache = (size, ids)
-    return ids
-
-
-def get_many_features(track_ids: list[str]) -> list[dict | None]:
-    """Read many tracks' features in one round trip, in the order asked for.
-
-    /recommend needs every vector in the corpus. One GET per track is one
-    network round trip per track, which is what the endpoint's cost actually
-    was at corpus scale -- 25 s at 7.8k tracks, and linear from there.
-    """
-    if snapshot.active():
-        return snapshot.get_many_features(track_ids)
-    if not track_ids:
-        return []
-    raw = client().mget([f"features:{t}" for t in track_ids])
-    return [json.loads(r) if r else None for r in raw]
-
-
-# ---- embed work queue (internal; not part of the HTTP contract) ----
-#   embed:queue        -> list of track ids awaiting analysis (LPUSH/BRPOP)
-#   embed:queued       -> set guarding against duplicate enqueues
-#   embed:queued:{id}  -> TTL companion: a set member can't expire on its
-#                         own, so a crashed worker blocks re-enqueue for at
-#                         most this long.
-
-_QUEUED_TTL_S = 300
+    """Upsert contract fields plus the analyzed embedding."""
+    ensure_indexes()
+    data, scale = to_int8(np.asarray(features["embedding"], dtype=np.float32))
+    db().tracks.update_one(
+        {"_id": track["track_id"]},
+        {"$set": {**_meta(track), "embedding": data, "scale": float(scale),
+                  "features_version": int(features.get(VERSION_KEY, 0))},
+         "$currentDate": {"analyzed_at": True}},
+        upsert=True,
+    )
 
 
 def put_track_meta(track: dict) -> None:
-    """Write a track's contract fields only — no features, no corpus entry."""
-    if snapshot.active():
-        snapshot.put_track_meta(track)
-        return
-    client().set(f"track:{track['track_id']}", json.dumps(track))
+    """Upsert contract fields only; leaves any embedding in place."""
+    ensure_indexes()
+    db().tracks.update_one({"_id": track["track_id"]}, {"$set": _meta(track)}, upsert=True)
 
 
-def enqueue_embed(track_id: str) -> bool:
-    """Queue a track for the embed worker. False if already queued.
+def get_track(track_id: str) -> dict | None:
+    doc = db().tracks.find_one({"_id": track_id}, {k: 1 for k in TRACK_FIELDS})
+    return _contract(doc) if doc else None
 
-    The guard-then-push below isn't atomic: two concurrent callers can both
-    pass the check and both LPUSH. Harmless -- the worker's writes are
-    idempotent, so a track processed twice just costs an extra analysis.
+
+def get_many_tracks(track_ids: list[str]) -> list[dict | None]:
+    if not track_ids:
+        return []
+    found = {d["_id"]: _contract(d) for d in
+             db().tracks.find({"_id": {"$in": track_ids}}, {k: 1 for k in TRACK_FIELDS})}
+    return [found.get(t) for t in track_ids]
+
+
+def _features(doc: dict | None) -> dict | None:
+    if not doc or doc.get("embedding") is None:
+        return None
+    return {"embedding": from_int8(doc["embedding"], doc["scale"]).tolist(),
+            VERSION_KEY: doc.get("features_version", 0)}
+
+
+def get_features(track_id: str) -> dict | None:
+    return _features(db().tracks.find_one({"_id": track_id},
+                                          {"embedding": 1, "scale": 1, "features_version": 1}))
+
+
+def get_many_features(track_ids: list[str]) -> list[dict | None]:
+    if not track_ids:
+        return []
+    found = {d["_id"]: _features(d) for d in
+             db().tracks.find({"_id": {"$in": track_ids}},
+                              {"embedding": 1, "scale": 1, "features_version": 1})}
+    return [found.get(t) for t in track_ids]
+
+
+def get_analyzed_at(track_id: str) -> datetime | None:
+    doc = db().tracks.find_one({"_id": track_id}, {"analyzed_at": 1})
+    return doc.get("analyzed_at") if doc else None
+
+
+def tracks_since(stamp: datetime) -> list[tuple[str, np.ndarray]]:
+    """(id, float32 vector) for every track analyzed at or after `stamp`.
+
+    Inclusive, not strict: MongoDB stores datetimes at millisecond
+    resolution and the API and the embed worker are separate processes, so
+    two tracks analyzed within the same millisecond (by the same process or
+    different ones) can legitimately tie on `analyzed_at`. A strict `$gt`
+    would then silently drop whichever of the tied rows a caller already
+    has the watermark for. Using `$gte` means the boundary row (the one
+    exactly at `stamp`) can come back again; callers that page through this
+    by re-using the last-seen `analyzed_at` as the next `stamp` must dedupe
+    by track id.
     """
-    r = client()
-    if r.sismember("embed:queued", track_id) and r.exists(f"embed:queued:{track_id}"):
-        return False
-    r.sadd("embed:queued", track_id)
-    r.set(f"embed:queued:{track_id}", "1", ex=_QUEUED_TTL_S)
-    r.lpush("embed:queue", track_id)
-    return True
+    cursor = db().tracks.find({"analyzed_at": {"$gte": stamp}},
+                              {"embedding": 1, "scale": 1}).sort("analyzed_at", 1)
+    return [(d["_id"], from_int8(d["embedding"], d["scale"])) for d in cursor]
 
 
-def dequeue_embed(timeout: int = 5) -> str | None:
-    """Block up to `timeout` seconds for the next queued track id."""
-    popped = client().brpop("embed:queue", timeout=timeout)
-    return popped[1] if popped else None
+# corpus_ids() is called on every /recommend. Instead of shipping every id
+# each time, remember the ids seen so far and the newest analyzed_at, and ask
+# only for tracks newer than that. Tracks are only ever added.
+_ids_cache: tuple[datetime, list[str]] | None = None
 
 
-def clear_embed_marker(track_id: str) -> None:
-    """Drop the dedup guard so the track can be enqueued again."""
-    r = client()
-    r.srem("embed:queued", track_id)
-    r.delete(f"embed:queued:{track_id}")
+def corpus_ids() -> list[str]:
+    """All analyzed track ids, sorted."""
+    global _ids_cache
+    with _lock:
+        if _ids_cache is None:
+            # analyzed_at, not embedding: only put_track ever sets either
+            # field (together), so the two filters are equivalent -- but
+            # analyzed_at has an index (ensure_indexes) and embedding does
+            # not.
+            docs = list(db().tracks.find({"analyzed_at": {"$exists": True}},
+                                         {"analyzed_at": 1}))
+            newest = max((d["analyzed_at"] for d in docs), default=datetime(1970, 1, 1))
+            _ids_cache = (newest, sorted(d["_id"] for d in docs))
+            return list(_ids_cache[1])
+        newest, ids = _ids_cache
+        # $gte, not $gt: millisecond-resolution timestamps mean a track
+        # analyzed in another process within the same millisecond as the
+        # watermark would otherwise be missed. Re-fetching the watermark
+        # row itself is harmless -- the set union below dedupes it.
+        fresh = list(db().tracks.find({"analyzed_at": {"$gte": newest}}, {"analyzed_at": 1}))
+        if fresh:
+            newest = max(d["analyzed_at"] for d in fresh)
+            ids = sorted(set(ids) | {d["_id"] for d in fresh})
+            _ids_cache = (newest, ids)
+        return list(ids)
 
 
-# ---- attribution work queue + cache (T2.6; internal, like embed above) ----
-#   attr:queue           -> list of "seed|rec" jobs awaiting the worker
-#   attr:queued:{pair}   -> TTL guard against re-enqueueing a pending pair
-#   viz:attr:{seed}:{rec}-> the finished (or failed) result, JSON
+def corpus_size() -> int:
+    return len(corpus_ids())
 
-_ATTR_QUEUED_TTL_S = 300
+
+def base_matrix() -> tuple[list[str], np.ndarray]:
+    """Every analyzed embedding as one float32 matrix, ids in row order.
+
+    Preallocated rather than stacked: a corpus of tens of thousands of
+    tracks means a stack of per-row arrays (and the list holding them)
+    doubles peak memory versus filling one array in place.
+    """
+    # analyzed_at, not embedding: only put_track ever sets either field
+    # (together), so the two filters are equivalent -- but analyzed_at has
+    # an index (ensure_indexes) and embedding does not.
+    n = db().tracks.count_documents({"analyzed_at": {"$exists": True}})
+    if n == 0:
+        return [], np.empty((0, 1), dtype=np.float32)
+
+    cursor = db().tracks.find({"analyzed_at": {"$exists": True}},
+                              {"embedding": 1, "scale": 1}).sort("_id", 1)
+    ids: list[str] = []
+    matrix: np.ndarray | None = None
+    i = 0
+    for d in cursor:
+        vec = from_int8(d["embedding"], d["scale"])
+        if matrix is None:
+            matrix = np.empty((n, vec.shape[0]), dtype=np.float32)
+        if i >= n:
+            # A track landed mid-read, past what count_documents saw:
+            # dropping it (rather than growing the array) keeps this a
+            # single allocation; the next call picks it up.
+            break
+        matrix[i] = vec
+        ids.append(d["_id"])
+        i += 1
+    if matrix is None:
+        return [], np.empty((0, 1), dtype=np.float32)
+    if i < n:
+        # A track vanished mid-read (or the count raced a write the other
+        # way): truncate to the rows actually filled.
+        matrix = matrix[:i]
+    return ids, matrix
+
+
+# ---- jobs (internal; not part of the HTTP contract) ----
+#
+# One document per pending unit of work. `state` moves queued -> running ->
+# (deleted on success | failed). A queued or running document is the dedup
+# guard a set of pending ids used to be; requeue_stale() is the TTL.
+
+_POLL_S = 0.5
 
 
 def _attr_pair(seed_id: str, rec_id: str) -> str:
-    return f"{seed_id}|{rec_id}"
+    """Job/cache key half: colon-joined, matching the cache key format
+    (`attr:{seed}:{rec}`). dequeue_job's returned payload is pipe-joined
+    instead -- scripts/embed_worker.py splits it on "|" -- so it is built
+    separately there, not through this helper."""
+    return f"{seed_id}:{rec_id}"
 
 
-def get_attribution(seed_id: str, rec_id: str) -> dict | None:
-    raw = client().get(f"viz:attr:{seed_id}:{rec_id}")
-    return json.loads(raw) if raw else None
-
-
-def put_attribution(seed_id: str, rec_id: str, payload: dict,
-                    ttl: int | None = None) -> None:
-    """Cache one pair's attribution. A ready result is kept forever (the
-    corpus embedding it describes doesn't change); a failure gets a TTL so
-    the pair is retried instead of being wrong until someone clears Redis."""
-    client().set(f"viz:attr:{seed_id}:{rec_id}", json.dumps(payload), ex=ttl)
-
-
-def enqueue_attribution(seed_id: str, rec_id: str) -> bool:
-    """Queue a pair for the worker. False if this pair is already pending."""
-    r = client()
-    pair = _attr_pair(seed_id, rec_id)
-    if r.exists(f"attr:queued:{pair}"):
+def _enqueue(job_id: str, fields: dict) -> bool:
+    ensure_indexes()
+    existing = db().jobs.find_one({"_id": job_id}, {"state": 1})
+    if existing and existing["state"] in ("queued", "running"):
         return False
-    r.set(f"attr:queued:{pair}", "1", ex=_ATTR_QUEUED_TTL_S)
-    r.lpush("attr:queue", pair)
+    db().jobs.update_one(
+        {"_id": job_id},
+        {"$set": {**fields, "state": "queued", "claimed_at": None,
+                  "attempts": 0, "error": None},
+         "$currentDate": {"created_at": True}},
+        upsert=True,
+    )
     return True
 
 
-def dequeue_job(timeout: int = 5) -> tuple[str, str] | None:
-    """Next job from either queue as (kind, payload).
+def enqueue_embed(track_id: str) -> bool:
+    """Queue a track for analysis. False if already queued or running."""
+    return _enqueue(f"embed:{track_id}", {"kind": "embed", "track_id": track_id})
 
-    One blocking pop over both lists: BRPOP takes the first non-empty key in
-    order, so an embed job (a human waiting on a seed) always wins over an
-    attribution job (a background explanation).
-    """
-    popped = client().brpop(["embed:queue", "attr:queue"], timeout=timeout)
-    if not popped:
-        return None
-    key, value = popped
-    return ("embed" if key.endswith("embed:queue") else "attribution"), value
+
+def enqueue_attribution(seed_id: str, rec_id: str) -> bool:
+    return _enqueue(f"attr:{_attr_pair(seed_id, rec_id)}",
+                    {"kind": "attr", "seed_id": seed_id, "rec_id": rec_id})
+
+
+def _claim(kind: str) -> dict | None:
+    return db().jobs.find_one_and_update(
+        {"kind": kind, "state": "queued"},
+        {"$set": {"state": "running"}, "$inc": {"attempts": 1},
+         "$currentDate": {"claimed_at": True}},
+        sort=[("created_at", pymongo.ASCENDING)],
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+def dequeue_job(timeout: int = 5) -> tuple[str, str] | None:
+    """Next job as (kind, payload), embed jobs first; polls up to `timeout` s."""
+    deadline = time.monotonic() + timeout
+    while True:
+        job = _claim("embed")
+        if job:
+            return "embed", job["track_id"]
+        job = _claim("attr")
+        if job:
+            # Pipe-joined, not _attr_pair's colon: scripts/embed_worker.py
+            # splits this payload on "|".
+            return "attribution", f"{job['seed_id']}|{job['rec_id']}"
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_POLL_S)
+
+
+def dequeue_embed(timeout: int = 5) -> str | None:
+    deadline = time.monotonic() + timeout
+    while True:
+        job = _claim("embed")
+        if job:
+            return job["track_id"]
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_POLL_S)
+
+
+def clear_embed_marker(track_id: str) -> None:
+    """The job finished (or the caller gave up): drop it so it can be requeued."""
+    db().jobs.delete_one({"_id": f"embed:{track_id}"})
 
 
 def clear_attribution_marker(seed_id: str, rec_id: str) -> None:
-    client().delete(f"attr:queued:{_attr_pair(seed_id, rec_id)}")
+    db().jobs.delete_one({"_id": f"attr:{_attr_pair(seed_id, rec_id)}"})
 
 
-# ---- signed preview URL cache (internal; see GET /preview) ----
-#   preview:{id} -> the last freshly signed Deezer preview URL
-#
-# Deezer's signature lives ~15 minutes. Caching for 10 leaves a margin wide
-# enough that a URL handed out at the end of the window still plays, while
-# collapsing repeat plays of the same track onto one API call instead of one
-# per tap -- Deezer throttles, and /preview is on the play path.
+def fail_job(job_id: str, error: str) -> None:
+    db().jobs.update_one({"_id": job_id},
+                         {"$set": {"state": "failed", "error": error[:500]}})
+
+
+def requeue_stale(max_age_s: int = 600, max_attempts: int = 3) -> int:
+    """Return jobs stuck in `running` to `queued`, or fail them past the cap.
+
+    `attempts` is incremented by `_claim()` on every dequeue, so the cap
+    counts total claims (including the one currently stuck), not retries.
+    """
+    cutoff = _now() - timedelta(seconds=max_age_s)
+    stale = list(db().jobs.find({"state": "running", "claimed_at": {"$lt": cutoff}}))
+    for job in stale:
+        if job["attempts"] >= max_attempts:
+            fail_job(job["_id"], f"gave up after {job['attempts']} attempts")
+        else:
+            db().jobs.update_one({"_id": job["_id"]},
+                                 {"$set": {"state": "queued", "claimed_at": None}})
+    return len(stale)
+
+
+# ---- cache: attribution results and signed preview URLs ----
 
 _PREVIEW_TTL_S = 600
 
 
+def _cache_get(key: str):
+    doc = db().cache.find_one({"_id": key})
+    if not doc:
+        return None
+    if doc.get("expires_at") is not None and doc["expires_at"] <= _now():
+        return None
+    return doc["value"]
+
+
+def _cache_put(key: str, value, ttl: int | None) -> None:
+    ensure_indexes()
+    expires = _now() + timedelta(seconds=ttl) if ttl else None
+    db().cache.replace_one({"_id": key}, {"_id": key, "value": value, "expires_at": expires},
+                           upsert=True)
+
+
+def get_attribution(seed_id: str, rec_id: str) -> dict | None:
+    return _cache_get(f"attr:{seed_id}:{rec_id}")
+
+
+def put_attribution(seed_id: str, rec_id: str, payload: dict, ttl: int | None = None) -> None:
+    """A ready result is kept forever; a failure gets a TTL so it is retried."""
+    _cache_put(f"attr:{seed_id}:{rec_id}", payload, ttl)
+
+
 def get_cached_preview(track_id: str) -> str | None:
-    """The cached signed URL for a track, or None if absent or aged out."""
-    if snapshot.active():
-        return snapshot.get_cached_preview(track_id)
-    return client().get(f"preview:{track_id}")
+    return _cache_get(f"preview:{track_id}")
 
 
 def put_cached_preview(track_id: str, url: str, ttl: int = _PREVIEW_TTL_S) -> None:
-    """Cache one freshly signed URL, expiring well inside its signature."""
-    if snapshot.active():
-        snapshot.put_cached_preview(track_id, url, ttl)
-        return
-    client().set(f"preview:{track_id}", url, ex=ttl)
+    _cache_put(f"preview:{track_id}", url, ttl)

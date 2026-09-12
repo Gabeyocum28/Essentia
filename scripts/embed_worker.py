@@ -1,13 +1,9 @@
-"""Pop embed jobs off the VM's Redis, run Essentia locally, write back.
+"""Pop embed jobs from the Atlas jobs collection, analyze, write back.
 
-The ARM VM can't import essentia, so /seed queues cold tracks instead of
-analyzing them; this worker is the other half. Run it on a machine where
-essentia imports (the Mac), pointed at the VM's Redis:
-
-    REDIS_URL=redis://<vm-ip>:6379/0 python3 scripts/embed_worker.py
+    MONGODB_URI=... python3 scripts/embed_worker.py
 
 One process, one job at a time: on-demand taps trickle in and analysis is
-~1 s. Bulk backfill stays push_tracks.py's job.
+~1 s. Bulk backfill stays analyze_corpus.py's job.
 """
 from __future__ import annotations
 
@@ -38,23 +34,33 @@ def _to_plain(features: dict) -> dict:
 
 
 def _fresh_track(track_id: str) -> dict | None:
-    """Prefer a fresh Deezer fetch over the stored record: preview URLs
-    expire in ~15 min (hdnea token), so a job that waited in the queue
-    would 403 on download if we trusted the URL /seed stored."""
+    """Fetch straight from Deezer: preview URLs expire in ~15 min (hdnea
+    token), so a job that waited in the queue would 403 on download if we
+    trusted a stored URL. There is no usable fallback to the store's own
+    record -- store.get_track() always answers "" for preview_url (it is
+    never persisted) -- so a Deezer failure here fails the job outright."""
     try:
-        track = deezer.get_track(track_id)
+        return deezer.get_track(track_id)
     except Exception:
-        track = None
-    return track or store.get_track(track_id)
+        return None
 
 
 def process_job(track_id: str) -> bool:
     """Analyze one queued track. True on success; logs and swallows failures
-    so one bad track never kills the loop."""
+    so one bad track never kills the loop.
+
+    A failure marks the job document `state="failed"` with an `error`
+    string (store.fail_job) instead of clearing it: a cleared marker looked
+    the same as a job that never ran, so a track with a permanently broken
+    preview would just get silently re-queued and fail forever. Success
+    still clears the marker (clear_embed_marker) so the track can be
+    re-analyzed later (e.g. a features-version bump).
+    """
     try:
         track = _fresh_track(track_id)
         if track is None:
-            print(f"[embed_worker] {track_id}: no metadata in Redis or on Deezer", flush=True)
+            print(f"[embed_worker] {track_id}: no metadata in the store or on Deezer", flush=True)
+            store.fail_job(f"embed:{track_id}", "no metadata in the store or on Deezer")
             return False
         mp3 = download_preview(track["preview_url"])
         try:
@@ -62,18 +68,16 @@ def process_job(track_id: str) -> bool:
         finally:
             mp3.unlink(missing_ok=True)
         store.put_track(track, features)
+        store.clear_embed_marker(track_id)
         print(f"[embed_worker] {track_id}: analyzed  {track['artist']} - {track['title']}", flush=True)
         return True
     except Exception as exc:
         print(f"[embed_worker] {track_id}: FAILED  {exc}", flush=True)
-        return False
-    finally:
-        # Always drop the dedup guard: a failed job should be re-enqueueable
-        # by the next tap, not stuck behind a stale marker.
         try:
-            store.clear_embed_marker(track_id)
+            store.fail_job(f"embed:{track_id}", f"{type(exc).__name__}: {exc}")
         except Exception:
             pass
+        return False
 
 
 def _write_wav(samples: "np.ndarray", sample_rate: int) -> Path:
@@ -160,7 +164,7 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
 
         track = _fresh_track(seed_id)
         if track is None:
-            raise ValueError("no seed metadata in Redis or on Deezer")
+            raise ValueError("no seed metadata in the store or on Deezer")
         mp3 = download_preview(track["preview_url"])
         audio = embed_mod.load_audio(mp3)          # mono, 16 kHz — model rate
 
@@ -207,6 +211,7 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
         })
         print(f"[embed_worker] attr {seed_id}->{rec_id}: ready "
               f"(base {base:.3f})", flush=True)
+        store.clear_attribution_marker(seed_id, rec_id)
         return True
     except Exception as exc:
         print(f"[embed_worker] attr {seed_id}->{rec_id}: FAILED  {exc}", flush=True)
@@ -217,23 +222,36 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
                                   {"status": "failed", "error": str(exc)}, ttl=60)
         except Exception:
             pass
+        try:
+            # Record the failure on the job document itself (state="failed"
+            # + error) instead of clearing the marker: a cleared marker is
+            # indistinguishable from a job that never ran, so a pair that
+            # is permanently broken would just get silently re-queued
+            # forever. Colon-joined -- matches the job _id enqueue_attribution
+            # actually wrote (attr:{seed}:{rec}); dequeue_job's pipe-joined
+            # payload is a different string used only for routing.
+            store.fail_job(f"attr:{seed_id}:{rec_id}", f"{type(exc).__name__}: {exc}")
+        except Exception:
+            pass
         return False
     finally:
         if mp3 is not None:
             mp3.unlink(missing_ok=True)
-        try:
-            store.clear_attribution_marker(seed_id, rec_id)
-        except Exception:
-            pass
 
 
 def _tick() -> None:
-    """One loop iteration: dequeue and process a job, if there is one.
+    """One loop iteration: sweep stale claims, then dequeue and process a
+    job, if there is one.
 
-    The process_* helpers never raise, but store.dequeue_job can (a transient
-    Redis ConnectionError on the blocking pop) -- guard it here so main()'s
-    loop survives a Redis blip instead of dying.
+    The process_* helpers never raise, but store.dequeue_job (and
+    requeue_stale) can (a transient connection error while polling Atlas)
+    -- guard each here so main()'s loop survives a connection blip instead
+    of dying.
     """
+    try:
+        store.requeue_stale()
+    except Exception as exc:
+        print(f"[embed_worker] requeue_stale error {exc}", flush=True)
     try:
         job = store.dequeue_job(timeout=5)
         if not job:
