@@ -4,14 +4,7 @@ import { Player } from "./player/Player";
 import { Search } from "./screens/Search";
 import { Seed } from "./screens/Seed";
 import { Recommendations } from "./screens/Recommendations";
-
-function Insights() {
-  return (
-    <div className="screen">
-      <p className="hint">Insights coming next</p>
-    </div>
-  );
-}
+import { Insights } from "./screens/Insights";
 
 function TopBar() {
   const location = useLocation();
