@@ -26,7 +26,17 @@ def decode(path: Path | str) -> np.ndarray:
     cmd = [
         "ffmpeg", "-v", "error", "-nostdin",
         "-i", str(path),
-        "-ac", "1", "-ar", str(SAMPLE_RATE),
+        # NOT "-ac", "1": ffmpeg's built-in downmix applies a sqrt(2) gain
+        # (identical L/R at peak 0.5 comes out at peak ~0.707), unlike
+        # Essentia's MonoLoader, which is a plain (L+R)/2 average (peak
+        # stays 0.5). The mel front-end's log10(1 + 10000x) is not
+        # gain-invariant, so that mismatch alone was enough to knock some
+        # fixture tracks below 0.99 cosine parity. `pan=mono|c0<c0+c1`
+        # renormalizes by the number of input channels present, giving the
+        # same (L+R)/2 mean Essentia uses (and passing mono through
+        # unchanged).
+        "-af", "pan=mono|c0<c0+c1",
+        "-ar", str(SAMPLE_RATE),
         "-f", "f32le", "-acodec", "pcm_f32le", "-",
     ]
     try:

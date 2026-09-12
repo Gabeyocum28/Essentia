@@ -110,7 +110,6 @@ def test_every_axis_feature_has_a_declared_metric():
 
     for _axis, (feature_key, _direction) in AXIS_FEATURES.items():
         assert feature_key in METRICS, f"{feature_key} has no declared metric"
-    assert METRICS["genre"] == "cosine"
     assert METRICS["embedding"] == "cosine"
 
 

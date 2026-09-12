@@ -49,6 +49,26 @@ def tone_wav(tmp_path: Path) -> Path:
     return write_tone_wav(tmp_path / "tone.wav")
 
 
+def write_stereo_tone_wav(path: Path, seconds: float = 3.0, hz: float = 440.0,
+                          sr: int = 44100) -> Path:
+    """The same 440 Hz sine on both channels — identical L/R, so a correct
+    downmix must reproduce the mono version's peak exactly."""
+    t = np.arange(int(seconds * sr)) / sr
+    ch = (0.5 * np.sin(2 * np.pi * hz * t) * 32767).astype("<i2")
+    pcm = np.repeat(ch[:, None], 2, axis=1)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.tobytes())
+    return path
+
+
+@pytest.fixture
+def stereo_tone_wav(tmp_path: Path) -> Path:
+    return write_stereo_tone_wav(tmp_path / "stereo_tone.wav")
+
+
 HAVE_ESSENTIA = importlib.util.find_spec("essentia") is not None
 needs_essentia = pytest.mark.skipif(
     not HAVE_ESSENTIA, reason="parity tests need essentia (Mac only)"

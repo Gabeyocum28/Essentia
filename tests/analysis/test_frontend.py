@@ -20,6 +20,20 @@ def test_decode_missing_file_raises(tmp_path):
         frontend.decode(tmp_path / "nope.mp3")
 
 
+def test_decode_downmix_matches_essentias_average_not_ffmpegs_default(
+    tone_wav, stereo_tone_wav
+):
+    # Essentia's MonoLoader downmixes stereo as a plain (L+R)/2 average, so
+    # identical L/R channels at peak 0.5 stay at peak 0.5. ffmpeg's default
+    # "-ac 1" downmix instead applies a sqrt(2) gain (peak ~0.707) — wrong,
+    # and the mel front-end's log10(1 + 10000x) is not gain-invariant, so
+    # this alone was enough to break parity on some tracks.
+    mono = frontend.decode(tone_wav)
+    stereo = frontend.decode(stereo_tone_wav)
+    assert abs(np.abs(mono).max() - np.abs(stereo).max()) < 0.01
+    assert 0.4 < np.abs(stereo).max() < 0.6
+
+
 @needs_essentia
 def test_decode_matches_essentia_monoloader(tone_wav, tmp_path):
     # See conftest.run_essentia: essentia and TensorFlow cannot share a
