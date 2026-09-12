@@ -215,3 +215,140 @@ def base_matrix() -> tuple[list[str], np.ndarray]:
     if not rows:
         return [], np.empty((0, 1), dtype=np.float32)
     return ids, np.stack(rows).astype(np.float32)
+
+
+# ---- jobs (internal; not part of the HTTP contract) ----
+#
+# One document per pending unit of work. `state` moves queued -> running ->
+# (deleted on success | failed). A queued or running document is the dedup
+# guard the Redis sets used to be; requeue_stale() is the TTL.
+
+_POLL_S = 0.5
+
+
+def _attr_pair(seed_id: str, rec_id: str) -> str:
+    return f"{seed_id}|{rec_id}"
+
+
+def _enqueue(job_id: str, fields: dict) -> bool:
+    ensure_indexes()
+    existing = db().jobs.find_one({"_id": job_id}, {"state": 1})
+    if existing and existing["state"] in ("queued", "running"):
+        return False
+    db().jobs.replace_one(
+        {"_id": job_id},
+        {"_id": job_id, **fields, "state": "queued", "claimed_at": None,
+         "attempts": 0, "error": None, "created_at": _now()},
+        upsert=True,
+    )
+    return True
+
+
+def enqueue_embed(track_id: str) -> bool:
+    """Queue a track for analysis. False if already queued or running."""
+    return _enqueue(f"embed:{track_id}", {"kind": "embed", "track_id": track_id})
+
+
+def enqueue_attribution(seed_id: str, rec_id: str) -> bool:
+    return _enqueue(f"attr:{_attr_pair(seed_id, rec_id)}",
+                    {"kind": "attr", "seed_id": seed_id, "rec_id": rec_id})
+
+
+def _claim(kind: str) -> dict | None:
+    return db().jobs.find_one_and_update(
+        {"kind": kind, "state": "queued"},
+        {"$set": {"state": "running", "claimed_at": _now()}, "$inc": {"attempts": 1}},
+        sort=[("created_at", pymongo.ASCENDING)],
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+def dequeue_job(timeout: int = 5) -> tuple[str, str] | None:
+    """Next job as (kind, payload), embed jobs first; polls up to `timeout` s."""
+    deadline = time.monotonic() + timeout
+    while True:
+        job = _claim("embed")
+        if job:
+            return "embed", job["track_id"]
+        job = _claim("attr")
+        if job:
+            return "attribution", _attr_pair(job["seed_id"], job["rec_id"])
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_POLL_S)
+
+
+def dequeue_embed(timeout: int = 5) -> str | None:
+    deadline = time.monotonic() + timeout
+    while True:
+        job = _claim("embed")
+        if job:
+            return job["track_id"]
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_POLL_S)
+
+
+def clear_embed_marker(track_id: str) -> None:
+    """The job finished (or the caller gave up): drop it so it can be requeued."""
+    db().jobs.delete_one({"_id": f"embed:{track_id}"})
+
+
+def clear_attribution_marker(seed_id: str, rec_id: str) -> None:
+    db().jobs.delete_one({"_id": f"attr:{_attr_pair(seed_id, rec_id)}"})
+
+
+def fail_job(job_id: str, error: str) -> None:
+    db().jobs.update_one({"_id": job_id},
+                         {"$set": {"state": "failed", "error": error[:500]}})
+
+
+def requeue_stale(max_age_s: int = 600, max_attempts: int = 3) -> int:
+    """Return jobs stuck in `running` to `queued`, or fail them past the cap."""
+    cutoff = _now() - timedelta(seconds=max_age_s)
+    stale = list(db().jobs.find({"state": "running", "claimed_at": {"$lt": cutoff}}))
+    for job in stale:
+        if job["attempts"] >= max_attempts:
+            fail_job(job["_id"], f"gave up after {job['attempts']} attempts")
+        else:
+            db().jobs.update_one({"_id": job["_id"]},
+                                 {"$set": {"state": "queued", "claimed_at": None}})
+    return len(stale)
+
+
+# ---- cache: attribution results and signed preview URLs ----
+
+_PREVIEW_TTL_S = 600
+
+
+def _cache_get(key: str):
+    doc = db().cache.find_one({"_id": key})
+    if not doc:
+        return None
+    if doc.get("expires_at") is not None and doc["expires_at"] <= _now():
+        return None
+    return doc["value"]
+
+
+def _cache_put(key: str, value, ttl: int | None) -> None:
+    ensure_indexes()
+    expires = _now() + timedelta(seconds=ttl) if ttl else None
+    db().cache.replace_one({"_id": key}, {"_id": key, "value": value, "expires_at": expires},
+                           upsert=True)
+
+
+def get_attribution(seed_id: str, rec_id: str) -> dict | None:
+    return _cache_get(f"attr:{seed_id}:{rec_id}")
+
+
+def put_attribution(seed_id: str, rec_id: str, payload: dict, ttl: int | None = None) -> None:
+    """A ready result is kept forever; a failure gets a TTL so it is retried."""
+    _cache_put(f"attr:{seed_id}:{rec_id}", payload, ttl)
+
+
+def get_cached_preview(track_id: str) -> str | None:
+    return _cache_get(f"preview:{track_id}")
+
+
+def put_cached_preview(track_id: str, url: str, ttl: int = _PREVIEW_TTL_S) -> None:
+    _cache_put(f"preview:{track_id}", url, ttl)

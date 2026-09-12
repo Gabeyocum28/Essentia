@@ -112,3 +112,90 @@ def test_tracks_since_returns_only_newer(fake_mongo):
     assert [tid for tid, _ in got] == ["new"]
     assert store.tracks_since(datetime.now(timezone.utc)) == []
 
+
+
+# ---- jobs ----
+
+def test_enqueue_embed_creates_queued_job_and_guards(fake_mongo):
+    assert store.enqueue_embed("9") is True
+    assert store.enqueue_embed("9") is False
+    job = fake_mongo.jobs.find_one({"_id": "embed:9"})
+    assert job["kind"] == "embed" and job["state"] == "queued" and job["track_id"] == "9"
+    assert job["attempts"] == 0 and job["claimed_at"] is None
+
+
+def test_dequeue_embed_claims_oldest_then_none(fake_mongo):
+    store.enqueue_embed("1")
+    store.enqueue_embed("2")
+    assert store.dequeue_embed(timeout=0) == "1"
+    assert fake_mongo.jobs.find_one({"_id": "embed:1"})["state"] == "running"
+    assert store.dequeue_embed(timeout=0) == "2"
+    assert store.dequeue_embed(timeout=0) is None
+
+
+def test_clear_embed_marker_deletes_job_so_it_can_requeue(fake_mongo):
+    store.enqueue_embed("9")
+    store.dequeue_embed(timeout=0)
+    store.clear_embed_marker("9")
+    assert fake_mongo.jobs.find_one({"_id": "embed:9"}) is None
+    assert store.enqueue_embed("9") is True
+
+
+def test_dequeue_job_prefers_embed_over_attribution(fake_mongo):
+    store.enqueue_attribution("s", "r")
+    store.enqueue_embed("9")
+    assert store.dequeue_job(timeout=0) == ("embed", "9")
+    assert store.dequeue_job(timeout=0) == ("attribution", "s|r")
+    assert store.dequeue_job(timeout=0) is None
+
+
+def test_enqueue_attribution_guards_pending_pair(fake_mongo):
+    assert store.enqueue_attribution("s", "r") is True
+    assert store.enqueue_attribution("s", "r") is False
+    store.dequeue_job(timeout=0)
+    store.clear_attribution_marker("s", "r")
+    assert store.enqueue_attribution("s", "r") is True
+
+
+def test_fail_job_records_error_and_blocks_requeue_until_cleared(fake_mongo):
+    store.enqueue_embed("9")
+    store.dequeue_embed(timeout=0)
+    store.fail_job("embed:9", "boom")
+    job = fake_mongo.jobs.find_one({"_id": "embed:9"})
+    assert job["state"] == "failed" and job["error"] == "boom"
+    assert store.dequeue_embed(timeout=0) is None
+
+
+def test_requeue_stale_returns_running_jobs_to_queue_then_fails_them(fake_mongo):
+    from datetime import timedelta
+    store.enqueue_embed("9")
+    store.dequeue_embed(timeout=0)
+    old = store._now() - timedelta(seconds=700)
+    fake_mongo.jobs.update_one({"_id": "embed:9"}, {"$set": {"claimed_at": old, "attempts": 2}})
+    assert store.requeue_stale(max_age_s=600, max_attempts=3) == 1
+    assert fake_mongo.jobs.find_one({"_id": "embed:9"})["state"] == "queued"
+    store.dequeue_embed(timeout=0)
+    fake_mongo.jobs.update_one({"_id": "embed:9"}, {"$set": {"claimed_at": old}})
+    assert store.requeue_stale(max_age_s=600, max_attempts=3) == 1
+    assert fake_mongo.jobs.find_one({"_id": "embed:9"})["state"] == "failed"
+
+
+# ---- cache ----
+
+def test_attribution_cache_roundtrip_and_ttl_field(fake_mongo):
+    assert store.get_attribution("s", "r") is None
+    store.put_attribution("s", "r", {"status": "ready", "bands": [1, 2]})
+    assert store.get_attribution("s", "r") == {"status": "ready", "bands": [1, 2]}
+    assert fake_mongo.cache.find_one({"_id": "attr:s:r"})["expires_at"] is None
+    store.put_attribution("s", "r", {"status": "failed"}, ttl=60)
+    assert fake_mongo.cache.find_one({"_id": "attr:s:r"})["expires_at"] is not None
+
+
+def test_preview_cache_roundtrip_and_expiry(fake_mongo):
+    from datetime import timedelta
+    assert store.get_cached_preview("42") is None
+    store.put_cached_preview("42", "http://signed", ttl=600)
+    assert store.get_cached_preview("42") == "http://signed"
+    fake_mongo.cache.update_one({"_id": "preview:42"},
+                                {"$set": {"expires_at": store._now() - timedelta(seconds=1)}})
+    assert store.get_cached_preview("42") is None   # expired entries are ignored even before TTL reaps them
