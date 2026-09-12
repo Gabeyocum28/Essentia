@@ -12,6 +12,15 @@ tracks with 30 s previews. Design: `Essencia_design_spec.md`.
     export MONGODB_URI="mongodb+srv://..."   # Atlas connection string, never committed
     uvicorn music_recommendations.server.app:app --reload
 
+## Web app
+
+    cd web && npm install && npm run dev   # proxies /api to the live server
+    npm test
+    npm run build
+
+Production is built into the API image by `deploy/Dockerfile` and served
+at `/` by the FastAPI app (`web/dist`).
+
 ## Deploy
 
 The API and worker run as a Docker Compose stack on the Oracle VM, behind

@@ -11,3 +11,5 @@ __pycache__
 *.pyc
 deploy/.env
 tests
+web/node_modules
+web/dist
