@@ -57,17 +57,23 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const play = useCallback((track: Track) => {
     const el = getAudio();
+    const trackId = track.track_id;
     nowPlayingRef.current = track;
     setNowPlaying(track);
     setErrorMessage(null);
     setProgress(0);
-    el.src = previewUrl(track.track_id);
+    el.src = previewUrl(trackId);
     el.play().then(
       () => {
+        if (nowPlayingRef.current?.track_id !== trackId) return; // superseded by a newer play()
         isPlayingRef.current = true;
         setIsPlaying(true);
       },
-      () => {
+      (err) => {
+        // A play() call superseded by another play() (or a stop()) rejects with an
+        // AbortError; that's expected and shouldn't surface as a playback error.
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (nowPlayingRef.current?.track_id !== trackId) return;
         isPlayingRef.current = false;
         setErrorMessage("Preview unavailable");
       },

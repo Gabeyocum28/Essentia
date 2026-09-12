@@ -65,6 +65,11 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
     baseTransformRef.current = baseTransform;
   }, [baseTransform]);
 
+  // Tracks the canvas backing-store size actually applied, so the draw loop only touches
+  // canvas.width/height (which clears the canvas and is comparatively expensive) when the
+  // container size or DPR genuinely changed, not on every frame.
+  const appliedSizeRef = useRef({ width: 0, height: 0, dpr: 0 });
+
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -85,10 +90,14 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
     let raf = 0;
     const draw = () => {
       const dpr = window.devicePixelRatio || 1;
-      canvas.width = size.width * dpr;
-      canvas.height = size.height * dpr;
-      canvas.style.width = `${size.width}px`;
-      canvas.style.height = `${size.height}px`;
+      const applied = appliedSizeRef.current;
+      if (applied.width !== size.width || applied.height !== size.height || applied.dpr !== dpr) {
+        canvas.width = size.width * dpr;
+        canvas.height = size.height * dpr;
+        canvas.style.width = `${size.width}px`;
+        canvas.style.height = `${size.height}px`;
+        appliedSizeRef.current = { width: size.width, height: size.height, dpr };
+      }
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -189,18 +198,19 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
     return () => canvas.removeEventListener("wheel", onWheel);
   }, []);
 
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     dragRef.current = { startX: e.clientX, startY: e.clientY, panX: pan.x, panY: pan.y };
+    canvasRef.current?.setPointerCapture(e.pointerId);
   };
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!dragRef.current) return;
     const dx = e.clientX - dragRef.current.startX;
     const dy = e.clientY - dragRef.current.startY;
     setPan({ x: dragRef.current.panX + dx, y: dragRef.current.panY + dy });
   };
 
-  const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const drag = dragRef.current;
     dragRef.current = null;
     if (!drag) return;
@@ -234,10 +244,10 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
     <div className="galaxy" ref={containerRef}>
       <canvas
         ref={canvasRef}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={() => (dragRef.current = null)}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={() => (dragRef.current = null)}
       />
       {callout && (
         <div className="galaxy-callout">

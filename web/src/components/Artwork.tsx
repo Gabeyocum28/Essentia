@@ -1,5 +1,5 @@
 interface Props {
-  url: string | undefined;
+  url: string | null | undefined;
   size: number;
 }
 

@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { fireEvent } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { Insights } from "./Insights";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import { PlayerProvider } from "../player/usePlayer";
 import type { VizMap } from "../api/types";
 
@@ -32,8 +32,8 @@ function makeMap(): VizMap {
     },
     seed: { ...track("seed", "Seed Track"), x: 0, y: 0 },
     recs: [
-      { ...track("rec1", "Rec One"), x: 1, y: 1, score: 0.9, math: { metric: "cosine", dot: 0.9, seed_norm: 1, rec_norm: 1 } },
-      { ...track("rec2", "Rec Two"), x: 2, y: 2, score: 0.8, math: { metric: "cosine", dot: 0.8, seed_norm: 1, rec_norm: 1 } },
+      { ...track("rec1", "Rec One"), x: 1, y: 1, score: 0.9, math: { metric: "cosine", dot: 0.9, seed_norm: 1, rec_norm: 1, centrality: null, distance: null } },
+      { ...track("rec2", "Rec Two"), x: 2, y: 2, score: 0.8, math: { metric: "cosine", dot: 0.8, seed_norm: 1, rec_norm: 1, centrality: null, distance: null } },
     ],
     axis: { id: "energy", metric: "cosine", direction: 1 },
   };
@@ -58,6 +58,16 @@ beforeEach(() => {
 
 test("shows the unanalyzed message when seed is not ready", async () => {
   vi.mocked(api.seed).mockResolvedValue({ track_id: "seed", status: "unanalyzed" });
+  renderInsights();
+
+  await waitFor(() =>
+    expect(screen.getByText("This track is not analyzed on the server yet.")).toBeInTheDocument(),
+  );
+});
+
+test("shows the not-analyzed message when vizMap 404s", async () => {
+  vi.mocked(api.seed).mockResolvedValue({ track_id: "seed", status: "ready" });
+  vi.mocked(api.vizMap).mockRejectedValue(new ApiError(404, "not found"));
   renderInsights();
 
   await waitFor(() =>

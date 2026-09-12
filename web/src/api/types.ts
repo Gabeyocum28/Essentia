@@ -1,10 +1,10 @@
 export interface Track { track_id: string; title: string; artist: string; album: string;
-  artwork_url: string; preview_url: string; score?: number; }
+  artwork_url: string | null; preview_url: string | null; score?: number; }
 export interface Axis { id: string; label: string; }
 export interface SeedResponse { track_id: string; status: "ready" | "unanalyzed"; }
 export interface RecommendResponse { seed_track_id: string; axis: string; results: Track[]; }
 export interface ScoreMath { metric: string; dot: number; seed_norm: number; rec_norm: number;
-  distance?: number; centrality?: number; }
+  distance?: number | null; centrality?: number | null; }
 export interface VizPoint extends Track { x: number; y: number; }
 export interface VizRec extends VizPoint { score: number; math: ScoreMath; }
 export interface VizMap { points: { ids: string[]; x: number[]; y: number[]; tracks: Track[] };

@@ -43,6 +43,11 @@ export function Walk({ map, selectedId, onSelect }: Props) {
 
   const byId = useMemo(() => new Map(allPoints.map((p) => [p.track.track_id, p])), [allPoints]);
 
+  // Tracks the canvas backing-store size actually applied, so the draw loop only touches
+  // canvas.width/height (which clears the canvas and is comparatively expensive) when the
+  // container size or DPR genuinely changed, not on every frame.
+  const appliedSizeRef = useRef({ width: 0, height: 0, dpr: 0 });
+
   const transform = useMemo(() => {
     const xs = allPoints.map((p) => p.x);
     const ys = allPoints.map((p) => p.y);
@@ -68,14 +73,19 @@ export function Walk({ map, selectedId, onSelect }: Props) {
     setWalk(null);
   }, [map.seed.track_id]);
 
+  const walkGenerationRef = useRef(0);
+
   const runWalk = useCallback(async (from: string, to: string) => {
+    const generation = ++walkGenerationRef.current;
     setWalkError(false);
     setWalk(null);
     setRevealCount(0);
     try {
       const result = await api.vizWalk(from, to, 8);
+      if (generation !== walkGenerationRef.current) return; // superseded by a newer walk
       setWalk(result);
     } catch {
+      if (generation !== walkGenerationRef.current) return;
       setWalkError(true);
     }
   }, []);
@@ -114,10 +124,14 @@ export function Walk({ map, selectedId, onSelect }: Props) {
     let raf = 0;
     const draw = () => {
       const dpr = window.devicePixelRatio || 1;
-      canvas.width = size.width * dpr;
-      canvas.height = size.height * dpr;
-      canvas.style.width = `${size.width}px`;
-      canvas.style.height = `${size.height}px`;
+      const applied = appliedSizeRef.current;
+      if (applied.width !== size.width || applied.height !== size.height || applied.dpr !== dpr) {
+        canvas.width = size.width * dpr;
+        canvas.height = size.height * dpr;
+        canvas.style.width = `${size.width}px`;
+        canvas.style.height = `${size.height}px`;
+        appliedSizeRef.current = { width: size.width, height: size.height, dpr };
+      }
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);

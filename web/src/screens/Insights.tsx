@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import type { VizMap } from "../api/types";
 import { RecStrip } from "../insights/RecStrip";
 import { Galaxy } from "../insights/Galaxy";
@@ -41,8 +41,12 @@ export function Insights() {
       const mapResult = await api.vizMap(id, axis);
       setMap(mapResult);
       setStatus("ready");
-    } catch {
-      setStatus("error");
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        setStatus("unanalyzed");
+      } else {
+        setStatus("error");
+      }
     }
   }, [id, axis]);
 
@@ -57,6 +61,9 @@ export function Insights() {
       {status === "unanalyzed" && (
         <div className="error-box">
           <p>This track is not analyzed on the server yet.</p>
+          <button type="button" onClick={() => void run()}>
+            Try again
+          </button>
         </div>
       )}
 
@@ -88,6 +95,7 @@ export function Insights() {
                 key={m}
                 type="button"
                 className={`segmented-control-item${mode === m ? " segmented-control-item-active" : ""}`}
+                aria-pressed={mode === m}
                 onClick={() => setMode(m)}
               >
                 {m}
@@ -103,6 +111,7 @@ export function Insights() {
                     key={c}
                     type="button"
                     className={`chip${chip === c ? " chip-active" : ""}`}
+                    aria-pressed={chip === c}
                     onClick={() => setChip(c)}
                   >
                     {c}

@@ -22,7 +22,13 @@ function track(id: string, title: string) {
 }
 
 function rec(id: string, title: string, score: number) {
-  return { ...track(id, title), x: 0, y: 0, score, math: { metric: "cosine", dot: score, seed_norm: 1, rec_norm: 1 } };
+  return {
+    ...track(id, title),
+    x: 0,
+    y: 0,
+    score,
+    math: { metric: "cosine", dot: score, seed_norm: 1, rec_norm: 1, centrality: null, distance: null },
+  };
 }
 
 function makeHistogram(): VizHistogram {

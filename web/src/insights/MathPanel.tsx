@@ -17,11 +17,11 @@ export function MathPanel({ rec }: Props) {
           {cos.toFixed(4)}
         </p>
       ) : (
-        math.distance !== undefined && (
+        math.distance != null && (
           <p className="mono math-panel-line">distance = {math.distance.toFixed(4)}</p>
         )
       )}
-      {math.centrality !== undefined && (
+      {math.centrality != null && (
         <p className="mono math-panel-line">centrality = {math.centrality.toFixed(4)}</p>
       )}
     </div>

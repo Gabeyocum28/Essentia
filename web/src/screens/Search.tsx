@@ -52,7 +52,8 @@ export function Search() {
           </button>
         </div>
       )}
-      {status === "ready" && (
+      {status === "ready" && results.length === 0 && <p className="hint">No tracks found.</p>}
+      {status === "ready" && results.length > 0 && (
         <div className="track-list">
           {results.map((t) => (
             <TrackRow

@@ -244,7 +244,7 @@ export function Topology({ map, selectedId, onSelect }: Props) {
             const py = e.clientY - rect.top;
             const t = fitTransform(xs, ys, size.width, size.height, PAD);
             const idx = nearestIndex(xs, ys, t, px, py, CLICK_MAX_DIST);
-            if (idx === -1) onSelect(null);
+            onSelect(idx === -1 ? null : mst.ids[idx]);
           }}
         />
       </div>
@@ -257,6 +257,7 @@ export function Topology({ map, selectedId, onSelect }: Props) {
         value={threshold}
         onChange={(e) => setThreshold(Number(e.target.value))}
         className="topology-slider"
+        aria-label="MST distance threshold"
       />
       <p className="mono topology-caption">
         {componentCount} components at threshold {threshold.toFixed(3)}

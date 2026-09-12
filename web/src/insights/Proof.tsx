@@ -231,6 +231,7 @@ export function Proof({ trackId }: Props) {
       </div>
       <p className="mono proof-caption">seed&apos;s recs sit at the {percentile}th percentile</p>
 
+      <p className="mono">Nothing like this · raw vs corrected scores</p>
       <div className="proof-corrected-list">
         <div className="proof-corrected-header mono">
           <span className="proof-corrected-header-title" />
