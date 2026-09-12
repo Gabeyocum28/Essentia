@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 
 import numpy as np
+import pymongo
 
 from music_recommendations.analysis import FEATURES_VERSION
 from music_recommendations.server import store
@@ -244,6 +245,56 @@ def test_data_size_bytes_falls_back_when_dbstats_is_unsupported(fake_mongo):
     assert store.data_size_bytes() >= 1
 
 
-def test_data_size_bytes_uses_dbstats_when_available(fake_mongo, monkeypatch):
+def test_data_size_bytes_uses_own_dbstats_when_the_cluster_cannot_be_listed(
+        fake_mongo, monkeypatch):
+    """mongomock lists no databases, so this exercises the middle fallback:
+    dbStats on the database we are connected to."""
     monkeypatch.setattr(fake_mongo, "command", lambda name: {"dataSize": 1000, "indexSize": 24})
     assert store.data_size_bytes() == 1024
+
+
+class _FakeDatabase:
+    def __init__(self, stats):
+        self._stats = stats
+
+    def command(self, name):
+        assert name == "dbStats"
+        return self._stats
+
+
+class _FakeClient:
+    def __init__(self, databases):
+        self._databases = databases
+
+    def list_database_names(self):
+        return list(self._databases)
+
+    def __getitem__(self, name):
+        return self._databases[name]
+
+
+def test_data_size_bytes_sums_every_user_database(monkeypatch):
+    """Atlas bills the cluster, not one database: a leftover database beside
+    `essentia` eats the same 512 MB, so the cap has to see it."""
+    databases = {
+        "essentia": _FakeDatabase({"dataSize": 1000, "indexSize": 24}),
+        "leftover": _FakeDatabase({"dataSize": 500, "indexSize": 0}),
+        "admin": _FakeDatabase({"dataSize": 10 ** 9, "indexSize": 10 ** 9}),
+        "local": _FakeDatabase({"dataSize": 10 ** 9, "indexSize": 0}),
+        "config": _FakeDatabase({"dataSize": 10 ** 9, "indexSize": 0}),
+    }
+    own = databases["essentia"]
+    own.client = _FakeClient(databases)
+    monkeypatch.setattr(store, "db", lambda: own)
+    assert store.data_size_bytes() == 1524
+
+
+def test_data_size_bytes_falls_back_when_the_cluster_listing_fails(monkeypatch):
+    class _AngryClient:
+        def list_database_names(self):
+            raise pymongo.errors.OperationFailure("not authorized")
+
+    own = _FakeDatabase({"dataSize": 7, "indexSize": 1})
+    own.client = _AngryClient()
+    monkeypatch.setattr(store, "db", lambda: own)
+    assert store.data_size_bytes() == 8

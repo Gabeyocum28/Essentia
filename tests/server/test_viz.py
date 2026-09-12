@@ -795,3 +795,94 @@ def test_map_subset_includes_surprise_recs(client, fake_mongo, monkeypatch):
     body = client.get("/viz/map?track_id=a&axis=surprise&limit=1&correction=off").json()
     rec_ids = {r["track_id"] for r in body["recs"]}
     assert rec_ids <= set(body["points"]["ids"])   # far recs are still drawn
+
+
+def test_viz_tour_includes_requested_recs_even_when_far(client, fake_mongo,
+                                                        monkeypatch):
+    """The global endpoints take the same recs /viz/map drew, so a `surprise`
+    rec outside the seed's nearest ring still has a row to highlight."""
+    from music_recommendations.server import app as app_mod
+    monkeypatch.setattr(app_mod, "VIZ_MAX", 2)
+    for tid, v in {"a": [1, 0], "b": [0.99, 0.01], "c": [0.98, 0.02],
+                   "d": [0, 1]}.items():
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+
+    plain = client.get("/viz/tour", params={"track_id": "a"}).json()
+    assert "d" not in plain["ids"]
+
+    for route in ("/viz/tour", "/viz/mst", "/viz/hubs", "/viz/extremes"):
+        body = client.get(route, params={"track_id": "a", "recs": "d"}).json()
+        ids = (body["ids"] if "ids" in body
+               else [row["track_id"] for row in body["all_counts"]]
+               if "all_counts" in body
+               else [t["track_id"] for t in body["low"] + body["high"]])
+        assert "d" in ids, route
+
+
+def test_viz_tour_ignores_unknown_and_overlong_rec_lists(client, fake_mongo,
+                                                         monkeypatch):
+    from music_recommendations.server import app as app_mod
+    monkeypatch.setattr(app_mod, "VIZ_MAX", 2)
+    for tid, v in {"a": [1, 0], "b": [0.99, 0.01], "d": [0, 1]}.items():
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+    body = client.get("/viz/tour",
+                      params={"track_id": "a", "recs": "nope, ,d"}).json()
+    assert "d" in body["ids"] and "nope" not in body["ids"]
+    # Past the cap the tail is dropped rather than widening the subset.
+    assert app_mod._rec_ids(",".join(str(i) for i in range(80))) == tuple(
+        str(i) for i in range(50)
+    )
+
+
+def test_viz_walk_from_equals_to_is_a_single_step(client, seeded_corpus):
+    """Degenerate but reachable from the UI (tap the seed as destination):
+    one step, zero length, and a detour of 1.0 rather than a divide by zero."""
+    tid = seeded_corpus[0]["track_id"]
+    response = client.get("/viz/walk", params={"from": tid, "to": tid, "k": 3})
+    assert response.status_code == 200
+    body = response.json()
+    assert [step["track_id"] for step in body["path"]] == [tid]
+    assert body["geodesic"] == 0.0 and body["ambient"] == 0.0
+    assert body["detour"] == 1.0
+
+
+def test_unit_cache_holds_the_matrix_not_a_bare_id(fake_mongo):
+    """A bare id() key let the array it named be freed and its address
+    reused, serving a unit matrix built from a different corpus."""
+    from music_recommendations.server import app as app_mod
+    app_mod._UNIT_CACHE.clear()
+    first = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    seed = np.array([1.0, 0.0])
+    app_mod._similarity("embedding", first, seed, "cosine")
+    assert app_mod._UNIT_CACHE["embedding"][0] is first   # the matrix itself
+
+    second = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+    got = app_mod._similarity("embedding", second, seed, "cosine")
+    assert app_mod._UNIT_CACHE["embedding"][0] is second  # recomputed, not reused
+    assert list(got) == [0.0, 1.0]
+    app_mod._UNIT_CACHE.clear()
+
+
+def test_viz_subset_miss_purges_a_superseded_full_matrix(client, fake_mongo,
+                                                         monkeypatch):
+    """A stale subset entry holds a strong reference to the full matrix it
+    was sliced from, so one of them pins a whole corpus matrix that
+    _MATRIX_CACHE has already replaced. Every miss purges them."""
+    from music_recommendations.server import app as app_mod
+    monkeypatch.setattr(app_mod, "VIZ_MAX", 10)
+    for tid, v in {"a": [1, 0], "b": [0.9, 0.1]}.items():
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+    app_mod._viz_subset("a")
+    app_mod._viz_subset("b")
+    old_matrix = app_mod._MATRIX_CACHE["embedding"].matrix
+    assert len(app_mod._SUBSET_CACHE) == 2
+
+    store.put_track({**TRACK, "track_id": "c"}, {"embedding": [0.5, 0.5]})
+    client.get("/viz/hubs", params={"track_id": "a"})      # grows the matrix
+
+    assert all(value[0] is not old_matrix
+               for value in app_mod._SUBSET_CACHE.values())
+    live = [value[2] for value in app_mod._SUBSET_CACHE.values()]
+    for cache in (app_mod._TOP8_CACHE, app_mod._MST_CACHE):
+        assert all(any(value[0] is subset for subset in live)
+                   for value in cache.values())

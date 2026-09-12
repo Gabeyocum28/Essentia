@@ -33,8 +33,11 @@ def scores(seed: np.ndarray, matrix: np.ndarray, metric: str = "cosine") -> np.n
     "euclidean" -> (0, 1], 1/(1+distance), so it is still a similarity and
                    sorts the same direction as cosine.
     """
-    matrix = np.asarray(matrix, dtype=float)
-    seed = np.asarray(seed, dtype=float)
+    # float32, not float64: the full corpus matrix is stored float32, and
+    # promoting it here doubled every temporary — ~900 MB of allocation per
+    # cosine call at 90k tracks, for precision no similarity score needs.
+    matrix = np.asarray(matrix, dtype=np.float32)
+    seed = np.asarray(seed, dtype=np.float32)
     if metric == "euclidean":
         return 1.0 / (1.0 + np.linalg.norm(matrix - seed, axis=-1))
     if metric != "cosine":
@@ -54,7 +57,7 @@ def centrality(matrix: np.ndarray, metric: str = "cosine") -> np.ndarray:
     O(n*d) rather than the O(n^2) full similarity matrix. That matters: at
     10,000 tracks the naive matrix is 0.4 GB, this is 40 KB.
     """
-    matrix = np.asarray(matrix, dtype=float)
+    matrix = np.asarray(matrix, dtype=np.float32)
     if metric == "cosine":
         unit = _normalize(matrix)
         return unit @ unit.mean(axis=0)
