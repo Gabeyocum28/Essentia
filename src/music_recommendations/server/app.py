@@ -28,9 +28,9 @@ from starlette.requests import Request
 from typing import Literal, NamedTuple
 
 from contract.features import AXES
-from music_recommendations.analysis import analyze_track
+from music_recommendations.analysis import analyze_track, frontend
 from music_recommendations.analysis.schema import METRICS
-from music_recommendations.server import deezer, snapshot, store, viz
+from music_recommendations.server import deezer, store, viz
 from music_recommendations.server.axes import AXIS_FEATURES, BLENDED_AXES
 
 app = FastAPI(title="Essencia")
@@ -80,11 +80,11 @@ def _playable(track: dict | None) -> dict | None:
     """Give a track this server's stable preview URL.
 
     Keyed on track_id alone, NOT on the track already having a preview_url:
-    the snapshot ships without preview_url (a 15-minute signature is not worth
-    freezing), so requiring one meant every corpus track went out with no way
-    to play it. Callers that synthesize placeholder rows for unknown ids pass
-    None here and fall through to their own literal, which keeps preview_url
-    null rather than promising audio that would 404.
+    the store never round-trips one (a 15-minute signature is not worth
+    persisting), so requiring one meant every corpus track went out with no
+    way to play it. Callers that synthesize placeholder rows for unknown ids
+    pass None here and fall through to their own literal, which keeps
+    preview_url null rather than promising audio that would 404.
     """
     if not track or not track.get("track_id"):
         return track
@@ -145,7 +145,7 @@ def _download_preview(url: str) -> Path:
 
 
 def _safe(fn, *args, default=None):
-    """store call, but a down Redis means mock-first fallback, not a 500."""
+    """store call, but a down store means mock-first fallback, not a 500."""
     try:
         return fn(*args)
     except Exception:
@@ -212,7 +212,7 @@ def seed(req: SeedRequest) -> dict:
     if mp3 is None:
         # Deezer preview fetch failed -- flake, timeout, 404, or a signature
         # that could not be renewed. Don't 500 on a transient failure; hand
-        # the job to the Mac embed worker.
+        # the job to the worker.
         return _seed_via_worker(req.track_id, track)
 
     try:
@@ -220,8 +220,12 @@ def seed(req: SeedRequest) -> dict:
         _safe(store.put_track, track, features)
     except (NotImplementedError, ImportError):
         # Analysis can't run on this host (no aarch64 essentia wheels on the
-        # ARM VM). Hand the job to the Mac embed worker via Redis and wait.
+        # ARM VM). Hand the job to the worker and wait.
         return _seed_via_worker(req.track_id, track)
+    except (frontend.DecodeError, ValueError) as exc:
+        # The preview itself is bad (undecodable, too short). Not transient,
+        # so do not queue it; tell the client (spec §8).
+        raise HTTPException(502, "analysis failed") from exc
     finally:
         mp3.unlink(missing_ok=True)
     return ready
@@ -232,9 +236,9 @@ def _fetch_preview_audio(track_id: str, track: dict) -> "Path | None":
 
     Tries the URL already in hand, then re-signs once. A track that came from
     /search carries a live signature and downloads first try; one read back
-    from Redis carries a dead one, so the 403 is expected rather than a flake.
-    corpus/download.py takes the same try-then-re-sign shape for the same
-    reason. urllib raises OSError subclasses (URLError, socket.timeout).
+    from the store carries a dead one, so the 403 is expected rather than a
+    flake. corpus/download.py takes the same try-then-re-sign shape for the
+    same reason. urllib raises OSError subclasses (URLError, socket.timeout).
     """
     # Lazily: re-signing costs a Deezer call, so it must not happen when the
     # URL already in hand works.
@@ -260,7 +264,7 @@ def _seed_via_worker(track_id: str, track: dict) -> dict:
     _safe(store.put_track_meta, track)
     queued = _safe(store.enqueue_embed, track_id)
     if queued is None:
-        # Redis is down: there is no queue to hand to and no features to
+        # The store is down: there is no queue to hand to and no features to
         # await. Mock-first as before -- "ready", fixture-fallback recs.
         return {"track_id": track_id, "status": "ready"}
     status = "ready" if _await_features(track_id) else "unanalyzed"
@@ -279,7 +283,7 @@ def _await_features(track_id: str) -> bool:
 
 
 class _CorpusMatrix(NamedTuple):
-    corpus: tuple[str, ...]        # the corpus:ids snapshot this was built from
+    corpus: tuple[str, ...]        # the corpus:ids state this was built from
     ids: list[str]                 # the rows actually present, in row order
     matrix: np.ndarray
     correction: np.ndarray | None  # centrality, computed only if an axis wants it
@@ -313,15 +317,14 @@ def _cold_matrix(corpus: tuple[str, ...],
                  feature_key: str) -> tuple[list[str], np.ndarray]:
     """Every row, for a cache that has nothing yet.
 
-    With a snapshot the matrix is already a matrix -- it is read off disk in
-    one piece rather than rebuilt from 90k per-track lookups, which is the
-    whole reason the file exists. Anything seeded since boot lives in the
-    overlay and is appended the same way the Redis path appends new tracks.
+    The store hands back the whole embedding matrix in one query instead of
+    one fetch per track. Anything in `corpus` that the matrix does not yet
+    contain (analyzed between the two reads) is appended the usual way.
     """
-    if snapshot.active() and feature_key == snapshot.KEY:
-        ids, matrix = snapshot.base_matrix()
-        # Hoisted: as a comprehension condition this rebuilt the whole 90k set
-        # once per candidate, which measured 178 s on a cold /recommend.
+    if feature_key == "embedding":
+        ids, matrix = store.base_matrix()
+        # Hoisted: as a comprehension condition this rebuilt the whole set
+        # once per candidate.
         known_rows = set(ids)
         extra = [t for t in corpus if t not in known_rows]
         if extra:
@@ -347,7 +350,7 @@ def _build(corpus: tuple[str, ...], feature_key: str, metric: str,
     known = set(cached.ids) if cached else set()
 
     # Tracks only ever get added, so the common case is a short tail of new ids.
-    # A track disappearing means someone cleared Redis: drop it all and rebuild.
+    # A track disappearing means someone cleared the store: drop it all and rebuild.
     if cached is not None and not known.issubset(corpus):
         cached, known = None, set()
 

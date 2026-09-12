@@ -153,30 +153,23 @@ def fake_features(i: int, n: int) -> dict:
     v[0] = 1.0
     v[1] = i / max(n - 1, 1)
     v[2] = float(i % 3)
-    g = [0.0] * 400
-    g[i % 4] = 1.0
-    g[4] = i / max(n - 1, 1)
-    return {
-        "embedding": v,
-        "genre": g,
-        "groove": [120.0 + i, 0.9, 3.0, 0.5 + 0.01 * i],
-    }
+    return {"embedding": v}
 
 
 @pytest.fixture
-def client(fake_redis):
+def client(fake_mongo):
     return TestClient(app_module.app)
 
 
 @pytest.fixture
-def seeded_corpus(fake_redis):
+def seeded_corpus(fake_mongo):
     tracks = FIXTURE[:8]
     for i, t in enumerate(tracks):
         store.put_track(t, fake_features(i, len(tracks)))
     return tracks
 
 
-def test_viz_map_404_when_seed_unanalyzed(client, fake_redis):
+def test_viz_map_404_when_seed_unanalyzed(client, fake_mongo):
     resp = client.get("/viz/map", params={"track_id": "nope", "axis": "sounds_like"})
     assert resp.status_code == 404
 
@@ -211,17 +204,22 @@ def test_viz_map_point_metadata_stays_aligned_with_coordinates(client, seeded_co
 
 
 def test_viz_map_reads_all_point_metadata_in_one_bulk_request(
-    client, seeded_corpus, fake_redis
+    client, seeded_corpus, monkeypatch
 ):
     tid = seeded_corpus[0]["track_id"]
+    calls = []
+    real = store.get_many_tracks
+    monkeypatch.setattr(store, "get_many_tracks",
+                        lambda ids, _f=real: (calls.append(list(ids)), _f(ids))[1])
     client.get("/viz/map", params={"track_id": tid, "axis": "sounds_like"})
 
-    track_reads = [keys for keys in fake_redis.mget_calls if keys[0].startswith("track:")]
-    assert len(track_reads) == 1
-    assert len(track_reads[0]) == len(seeded_corpus)
+    assert len(calls) == 1
+    assert len(calls[0]) == len(seeded_corpus)
 
 
 def test_viz_map_seed_has_position_and_groove(client, seeded_corpus):
+    """Groove was cut from the feature contract (embedding-only now); the
+    store never returns it, so this only pins the position math that's left."""
     tid = seeded_corpus[0]["track_id"]
     body = client.get(
         "/viz/map", params={"track_id": tid, "axis": "sounds_like"}
@@ -230,7 +228,7 @@ def test_viz_map_seed_has_position_and_groove(client, seeded_corpus):
     assert seed["track_id"] == tid
     assert seed["title"] == seeded_corpus[0]["title"]
     assert isinstance(seed["x"], float) and isinstance(seed["y"], float)
-    assert len(seed["groove"]) == 4
+    assert seed["groove"] is None
 
 
 def test_viz_map_recs_match_recommend_scores(client, seeded_corpus):
@@ -259,7 +257,7 @@ def test_viz_map_rec_math_reconstructs_cosine(client, seeded_corpus):
         cosine = math["dot"] / (math["seed_norm"] * math["rec_norm"])
         assert cosine == pytest.approx(rec["score"])
         assert math["centrality"] is None
-        assert len(rec["groove"]) == 4
+        assert rec["groove"] is None
 
 
 def test_viz_map_surprise_includes_centrality(client, seeded_corpus):
@@ -317,9 +315,12 @@ def test_viz_map_serves_blended_axis(client, seeded_corpus, blended_axis):
     assert scores == sorted(scores, reverse=True)
     assert all(0.0 <= s <= 1.0 for s in scores)
     for rec in body["recs"]:
-        # ... and every weighted key reports its own percentile, so the panel
-        # can show the blend rather than a formula that isn't the score.
-        assert set(rec["math"]["parts"]) == {"embedding", "genre"}
+        # ... and every weighted key that actually produced data reports its
+        # own percentile, so the panel can show the blend rather than a
+        # formula that isn't the score. "genre" is no longer a feature the
+        # store round-trips (embedding-only contract), so it contributes no
+        # rows and is silently absent from parts rather than blowing up.
+        assert set(rec["math"]["parts"]) == {"embedding"}
 
 
 def test_viz_map_blended_axis_matches_recommend_order(client, seeded_corpus,
@@ -468,7 +469,7 @@ def test_viz_tour_is_deterministic_across_calls(client, seeded_corpus):
     assert first == second
 
 
-def test_viz_tour_404_when_corpus_empty(client, fake_redis):
+def test_viz_tour_404_when_corpus_empty(client, fake_mongo):
     resp = client.get("/viz/tour")
     assert resp.status_code == 404
     assert resp.json()["detail"] == "needs at least two tracks"
@@ -508,7 +509,7 @@ def test_viz_mst_is_deterministic_across_calls(client, seeded_corpus):
     assert first == second
 
 
-def test_viz_mst_404_when_corpus_empty(client, fake_redis):
+def test_viz_mst_404_when_corpus_empty(client, fake_mongo):
     resp = client.get("/viz/mst")
     assert resp.status_code == 404
     assert resp.json()["detail"] == "needs at least two tracks"
@@ -559,7 +560,7 @@ def test_viz_extremes_422_on_limit_out_of_range(client, seeded_corpus):
     assert client.get("/viz/extremes", params={"limit": 11}).status_code == 422
 
 
-def test_viz_extremes_404_when_corpus_empty(client, fake_redis):
+def test_viz_extremes_404_when_corpus_empty(client, fake_mongo):
     resp = client.get("/viz/extremes")
     assert resp.status_code == 404
     assert resp.json()["detail"] == "needs at least two tracks"
@@ -630,19 +631,19 @@ def test_band_stop_removes_only_the_selected_band():
     assert kept_after == pytest.approx(kept_before, rel=0.02)
 
 
-def test_viz_attribute_queues_the_pair_once_and_reports_pending(client, seeded_corpus, fake_redis):
+def test_viz_attribute_queues_the_pair_once_and_reports_pending(client, seeded_corpus, fake_mongo):
     seed, rec = seeded_corpus[0]["track_id"], seeded_corpus[1]["track_id"]
 
     first = client.get("/viz/attribute", params={"seed": seed, "rec": rec})
     assert first.status_code == 200
     assert first.json() == {"status": "pending"}
-    assert fake_redis.lists["attr:queue"] == [f"{seed}|{rec}"]
+    assert fake_mongo.jobs.find_one({"_id": f"attr:{seed}|{rec}"})["state"] == "queued"
 
     # Polling must not pile the same job up behind itself.
     assert client.get("/viz/attribute", params={"seed": seed, "rec": rec}).json() == {
         "status": "pending"
     }
-    assert fake_redis.lists["attr:queue"] == [f"{seed}|{rec}"]
+    assert fake_mongo.jobs.find_one({"_id": f"attr:{seed}|{rec}"})["state"] == "queued"
 
 
 def test_viz_attribute_serves_the_cached_result_when_the_worker_is_done(client, seeded_corpus):

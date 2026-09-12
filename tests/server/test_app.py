@@ -1,4 +1,4 @@
-"""app.py: the four contract routes, mock-first with Redis + analysis real path."""
+"""app.py: the four contract routes, mock-first with the store + analysis real path."""
 import json
 from pathlib import Path
 
@@ -31,12 +31,12 @@ def fake_features(seed_val: float) -> dict:
 
 
 @pytest.fixture
-def client(fake_redis):
+def client(fake_mongo):
     return TestClient(app_module.app)
 
 
 @pytest.fixture
-def seeded_corpus(fake_redis):
+def seeded_corpus(fake_mongo):
     """Five analyzed tracks in the fake store, spread across feature space."""
     for i, t in enumerate(FIXTURE[:5]):
         store.put_track(t, fake_features(i / 4.0))
@@ -88,7 +88,7 @@ def test_seed_warm_track_is_instant_and_never_analyzes(client, seeded_corpus, mo
     assert body == {"track_id": tid, "status": "ready"}
 
 
-def test_seed_cold_track_downloads_analyzes_and_stores(client, fake_redis, monkeypatch):
+def test_seed_cold_track_downloads_analyzes_and_stores(client, fake_mongo, monkeypatch):
     track = dict(FIXTURE[7])
     tid = track["track_id"]
     monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
@@ -98,7 +98,8 @@ def test_seed_cold_track_downloads_analyzes_and_stores(client, fake_redis, monke
     body = client.post("/seed", json={"track_id": tid}).json()
     assert body == {"track_id": tid, "status": "ready"}
     assert store.get_features(tid) is not None
-    assert store.get_track(tid) == track
+    # get_track never round-trips preview_url (a signed URL is never stored).
+    assert store.get_track(tid) == {**track, "preview_url": ""}
 
 
 @pytest.fixture
@@ -114,7 +115,7 @@ def analysis_unavailable(monkeypatch):
 
 
 def test_seed_enqueues_and_reports_unanalyzed_on_timeout(
-        client, fake_redis, analysis_unavailable, monkeypatch):
+        client, fake_mongo, analysis_unavailable, monkeypatch):
     track = dict(FIXTURE[0])
     tid = track["track_id"]
     monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
@@ -123,13 +124,13 @@ def test_seed_enqueues_and_reports_unanalyzed_on_timeout(
     assert body.status_code == 200
     assert body.json() == {"track_id": tid, "status": "unanalyzed"}
     # metadata stored for the worker, job queued, but corpus untouched
-    assert store.get_track(tid) == track
-    assert fake_redis.lists["embed:queue"] == [tid]
+    assert store.get_track(tid) == {**track, "preview_url": ""}
+    assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"})["state"] == "queued"
     assert tid not in store.corpus_ids()
 
 
 def test_seed_ready_when_worker_delivers_features(
-        client, fake_redis, analysis_unavailable, monkeypatch):
+        client, fake_mongo, analysis_unavailable, monkeypatch):
     track = dict(FIXTURE[1])
     tid = track["track_id"]
     monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
@@ -152,21 +153,21 @@ def test_seed_ready_when_worker_delivers_features(
 
 
 def test_seed_double_tap_enqueues_once(
-        client, fake_redis, analysis_unavailable, monkeypatch):
+        client, fake_mongo, analysis_unavailable, monkeypatch):
     track = dict(FIXTURE[2])
     tid = track["track_id"]
     monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
     client.post("/seed", json={"track_id": tid})
     client.post("/seed", json={"track_id": tid})
-    assert fake_redis.lists["embed:queue"] == [tid]
+    assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"})["state"] == "queued"
 
 
-def test_seed_redis_down_degrades_to_ready(client, monkeypatch):
-    """No fake_redis fixture: store.client() raises -> legacy mock-first path."""
-    def no_redis():
-        raise ConnectionError("redis down")
+def test_seed_store_down_degrades_to_ready(client, monkeypatch):
+    """No fake_mongo fixture: store.db() raises -> legacy mock-first path."""
+    def store_down():
+        raise ConnectionError("store down")
 
-    monkeypatch.setattr(store, "client", no_redis)
+    monkeypatch.setattr(store, "db", store_down)
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
     monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[3]))
     monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
@@ -180,7 +181,7 @@ def test_seed_redis_down_degrades_to_ready(client, monkeypatch):
     assert body == {"track_id": tid, "status": "ready"}
 
 
-def test_seed_download_failure_queues_instead_of_500(client, fake_redis, monkeypatch):
+def test_seed_download_failure_queues_instead_of_500(client, fake_mongo, monkeypatch):
     """A Deezer preview fetch failure (timeout, flake) must queue for the
     embed worker like a missing-essentia host does, not 500."""
     def boom(url):
@@ -195,11 +196,11 @@ def test_seed_download_failure_queues_instead_of_500(client, fake_redis, monkeyp
     body = client.post("/seed", json={"track_id": tid})
     assert body.status_code == 200
     assert body.json() == {"track_id": tid, "status": "unanalyzed"}
-    assert fake_redis.lists["embed:queue"] == [tid]
+    assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"})["state"] == "queued"
     assert tid not in store.corpus_ids()
 
 
-def test_seed_unknown_track_404(client, fake_redis, monkeypatch):
+def test_seed_unknown_track_404(client, fake_mongo, monkeypatch):
     monkeypatch.setattr(app_module.deezer, "get_track", lambda t: None)
     assert client.post("/seed", json={"track_id": "doesnotexist"}).status_code == 404
 
@@ -249,7 +250,7 @@ def test_recommend_unknown_axis_400(client, seeded_corpus):
     assert r.status_code == 400
 
 
-def test_recommend_unseeded_track_falls_back_to_fixture(client, fake_redis):
+def test_recommend_unseeded_track_falls_back_to_fixture(client, fake_mongo):
     """Mock-first: empty corpus -> fixture tracks with dummy descending scores."""
     body = client.get(
         "/recommend", params={"track_id": FIXTURE[0]["track_id"], "axis": "sounds_like"}
@@ -261,32 +262,32 @@ def test_recommend_unseeded_track_falls_back_to_fixture(client, fake_redis):
     assert scores == sorted(scores, reverse=True)
 
 
-# ---- no Redis at all (mock-first before anything lands) ----
+# ---- no store at all (mock-first before anything lands) ----
 
 @pytest.fixture
-def no_redis(monkeypatch):
+def no_store(monkeypatch):
     class Down:
         def __getattr__(self, name):
-            raise ConnectionError("redis is down")
+            raise ConnectionError("store is down")
 
-    monkeypatch.setattr(store, "client", lambda: Down())
+    monkeypatch.setattr(store, "db", lambda: Down())
 
 
-def test_seed_works_without_redis(no_redis, monkeypatch):
+def test_seed_works_without_store(no_store, monkeypatch):
     client = TestClient(app_module.app)
     tid = FIXTURE[0]["track_id"]
     monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-    # This test is about Redis being down, not about analysis. Stub the analyzer
-    # out: it used to be a NotImplementedError stub that app.py swallowed, but
-    # now that the lane has landed it raises FileNotFoundError for a path that
-    # does not exist, which app.py should NOT swallow.
+    # This test is about the store being down, not about analysis. Stub the
+    # analyzer out: it used to be a NotImplementedError stub that app.py
+    # swallowed, but now that the lane has landed it raises FileNotFoundError
+    # for a path that does not exist, which app.py should NOT swallow.
     monkeypatch.setattr(app_module, "analyze_track", lambda path: {})
     body = client.post("/seed", json={"track_id": tid})
     assert body.status_code == 200
     assert body.json()["status"] == "ready"
 
 
-def test_recommend_works_without_redis(no_redis):
+def test_recommend_works_without_store(no_store):
     client = TestClient(app_module.app)
     body = client.get(
         "/recommend", params={"track_id": FIXTURE[0]["track_id"], "axis": "sounds_like"}
@@ -322,7 +323,17 @@ def test_a_track_analyzed_after_the_first_request_still_appears(client, seeded_c
 
 
 def test_repeat_requests_do_not_re_read_the_whole_corpus(client, seeded_corpus, monkeypatch):
-    """Re-parsing every feature blob per request is what made /recommend 25s."""
+    """Re-parsing every feature blob per request is what made /recommend 25s.
+
+    The cold embedding matrix now comes from one store.base_matrix() query
+    instead of a per-track store.get_many_features() fetch, so the first
+    request's "whole matrix" read shows up there; get_many_features is only
+    hit for tracks analyzed after that base read.
+    """
+    base_reads = []
+    real_base = store.base_matrix
+    monkeypatch.setattr(store, "base_matrix",
+                        lambda: (base_reads.append(1), real_base())[1])
     reads = []
     real = store.get_many_features
     monkeypatch.setattr(store, "get_many_features",
@@ -331,11 +342,13 @@ def test_repeat_requests_do_not_re_read_the_whole_corpus(client, seeded_corpus, 
     seed = seeded_corpus[0]["track_id"]
     params = {"track_id": seed, "axis": "sounds_like", "limit": 10}
     client.get("/recommend", params=params)
-    assert len(reads[0]) == 5, "the first request builds the whole matrix"
+    assert len(base_reads) == 1, "the first request builds the whole matrix in one query"
+    assert reads == [], "no per-track fetches when the base matrix covers everyone"
 
+    base_reads.clear()
     reads.clear()
     client.get("/recommend", params=params)
-    assert reads == [], "an unchanged corpus should be read zero times"
+    assert base_reads == [] and reads == [], "an unchanged corpus should be read zero times"
 
     store.put_track(FIXTURE[5], fake_features(0.5))
     reads.clear()
@@ -353,7 +366,7 @@ def test_seed_is_never_recommended_to_itself(client, seeded_corpus):
         assert len(results) == 4
 
 
-def test_seed_falls_back_when_essentia_unavailable(client, fake_redis, monkeypatch):
+def test_seed_falls_back_when_essentia_unavailable(client, fake_mongo, monkeypatch):
     """ARM VM: essentia has no aarch64 wheels, so analyze_track raises
     ImportError there. Seed must queue for the worker, not 500, and reports
     unanalyzed rather than the old silent-ready fixture fallback."""
@@ -455,12 +468,12 @@ def test_preview_404s_when_deezer_has_no_preview(client, monkeypatch):
     assert client.get("/preview/nope", follow_redirects=False).status_code == 404
 
 
-def test_preview_survives_redis_being_down(monkeypatch, deezer_previews):
+def test_preview_survives_store_being_down(monkeypatch, deezer_previews):
     """No cache is a slower /preview, not a broken one."""
     def boom():
-        raise RuntimeError("redis down")
+        raise RuntimeError("store down")
 
-    monkeypatch.setattr(store, "client", boom)
+    monkeypatch.setattr(store, "db", boom)
     r = TestClient(app_module.app).get("/preview/721063", follow_redirects=False)
     assert r.status_code == 302
 
@@ -505,10 +518,10 @@ def test_public_base_url_overrides_the_request_host(client, seeded_corpus,
 
 
 def test_playable_needs_no_stored_preview_url(monkeypatch):
-    """The snapshot ships without preview_url, so the rewrite cannot require one.
+    """The store never round-trips preview_url, so the rewrite cannot require one.
 
-    Guarding on preview_url being present meant every corpus track served from
-    a snapshot went out with no way to play it.
+    Guarding on preview_url being present meant every corpus track went out
+    with no way to play it.
     """
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://host.example")
     assert app_module._playable({"track_id": "x"})["preview_url"] == (
@@ -524,8 +537,8 @@ def test_playable_leaves_placeholder_rows_alone(monkeypatch):
     assert app_module._playable(None) is None
 
 
-def test_recommend_serves_previews_for_snapshot_tracks(client, fake_redis,
-                                                       monkeypatch):
+def test_recommend_serves_previews_for_corpus_tracks(client, fake_mongo,
+                                                     monkeypatch):
     """End to end: a track with no stored preview still gets a playable URL."""
     for i, t in enumerate(FIXTURE[:4]):
         stripped = {k: v for k, v in t.items() if k != "preview_url"}
@@ -540,7 +553,7 @@ def test_recommend_serves_previews_for_snapshot_tracks(client, fake_redis,
         )
 
 
-def test_seed_resigns_when_the_stored_url_is_expired(client, fake_redis,
+def test_seed_resigns_when_the_stored_url_is_expired(client, fake_mongo,
                                                      monkeypatch):
     """The 403 on a stored URL is the norm, not a flake -- re-sign, don't punt."""
     track = dict(FIXTURE[7])
@@ -564,7 +577,7 @@ def test_seed_resigns_when_the_stored_url_is_expired(client, fake_redis,
     assert len(downloaded) == 2, "should try stored, then the re-signed URL"
 
 
-def test_seed_does_not_resign_when_the_stored_url_works(client, fake_redis,
+def test_seed_does_not_resign_when_the_stored_url_works(client, fake_mongo,
                                                         monkeypatch):
     """Re-signing costs a Deezer call; a working URL must not trigger one."""
     track = dict(FIXTURE[7])
@@ -575,3 +588,34 @@ def test_seed_does_not_resign_when_the_stored_url_works(client, fake_redis,
         AssertionError("must not re-sign when the stored URL downloads")))
 
     client.post("/seed", json={"track_id": track["track_id"]})
+
+
+# ---- _cold_matrix / 502 on bad previews ----
+
+def test_cold_matrix_uses_base_matrix(fake_mongo, monkeypatch):
+    for tid, vec in (("a", [1.0, 0.0]), ("b", [0.0, 1.0])):
+        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec})
+    calls = []
+    real = store.get_many_features
+    monkeypatch.setattr(store, "get_many_features",
+                        lambda ids: (calls.append(ids), real(ids))[1])
+    ids, matrix = app_module._cold_matrix(("a", "b"), "embedding")
+    assert ids == ["a", "b"] and matrix.shape == (2, 2)
+    assert calls == []          # one matrix read, no per-track fetches
+
+
+def test_seed_returns_502_when_analysis_fails(client, fake_mongo, monkeypatch, tmp_path):
+    from music_recommendations.analysis import frontend
+
+    mp3 = tmp_path / "p.mp3"
+    mp3.write_bytes(b"x")
+    monkeypatch.setattr(app_module, "_fetch_preview_audio", lambda tid, t: mp3)
+    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[0]))
+
+    def boom(path):
+        raise frontend.DecodeError("ffmpeg: bad file")
+
+    monkeypatch.setattr(app_module, "analyze_track", boom)
+    r = client.post("/seed", json={"track_id": "42"})
+    assert r.status_code == 502
+    assert r.json()["detail"] == "analysis failed"
