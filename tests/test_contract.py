@@ -34,6 +34,11 @@ def test_track_fields():
     }
 
 
+def test_feature_keys_embedding_only():
+    f = _features()
+    assert f.FEATURE_KEYS == {"embedding": 1280}
+
+
 def test_fixture_thirty_contract_tracks():
     f = _features()
     data = json.loads((CONTRACT / "fixture.json").read_text())

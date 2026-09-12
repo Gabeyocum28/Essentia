@@ -1,0 +1,11 @@
+.git
+ios
+legacy
+notebooks
+docs
+audio_cache
+corpus_snapshot
+models
+.venv
+__pycache__
+*.pyc

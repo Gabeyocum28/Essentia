@@ -1,6 +1,6 @@
 """The shared shapes: Track fields, axis list, and what analyze_track returns.
 
-This file is data, not logic. It is read-only (see CLAUDE.md).
+This file is data, not logic. Changing it is cross-cutting (see CLAUDE.md).
 """
 from __future__ import annotations
 
@@ -17,8 +17,7 @@ AXES = [
 ]
 
 # analyze_track(mp3_path) -> dict with exactly these keys.
-# Arrays are 1-D float lists/ndarrays of the stated length; scalars are float.
 FEATURE_KEYS = {
-    "embedding": 1280,   # EffNet penultimate, frame-mean
-    "genre": 400,        # Discogs400 style probabilities, from that embedding
+    "embedding": 1280,   # Discogs-EffNet penultimate layer, patch-mean
 }
+# Arrays are 1-D float lists/ndarrays of the stated length.

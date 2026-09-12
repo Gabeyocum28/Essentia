@@ -1,51 +1,49 @@
 # Working agreement
 
-This is a 4-person, 24-hour sprint. Four people are running coding agents
-against this repo at the same time. The full design is
-`Essencia_design_spec.md` — read the section for your lane before coding.
+Essentia is a jazz recommender: Deezer previews, Essentia audio analysis,
+and axis-based ranking, served to an iPhone app. It began as a 4-person,
+24-hour hackathon and is now a solo project. One person owns everything,
+so there are no ownership lanes; edit whatever the task needs.
 
-## Ownership
+The design is in `Essencia_design_spec.md`. Read the relevant section
+before changing behavior.
 
-You own exactly ONE of these folders. It was named in your task.
+## Layout
 
-  ios/                                  — the iPhone app
+  ios/                                  — the iPhone app (SwiftUI)
   src/music_recommendations/server/     — the FastAPI backend
   src/music_recommendations/corpus/     — the Deezer crawler
   src/music_recommendations/analysis/   — the Essentia pipeline
+  contract/                             — HTTP contract, feature axes, fixture
+  scripts/                              — corpus build, seed, push, export tools
+  tests/                                — pytest, mirrors src/ by folder
+  legacy/                               — the pre-spec MVP, frozen
 
-You also own the matching folder under tests/ and any script in scripts/
-that drives your lane.
+## contract/
 
-Do not create, edit, or delete files outside the folder you own. This
-includes pyproject.toml: if you need a dependency added, ask.
-
-## contract/ is read-only
-
-Everything in contract/ is shared by four people. Do not edit it.
-
-If the contract appears wrong, incomplete, or blocking, STOP and tell the
-human. Do not work around it. Do not add a field. Do not rename anything.
-A contract change requires all four people to agree, and routing around a
-mismatch silently breaks three other people's work.
+contract/ defines the HTTP shapes and feature axes that the server and the
+iOS app both depend on. It is no longer frozen, but a change there is a
+cross-cutting change: update the server, the app, and tests/test_contract.py
+in the same PR so nothing drifts.
 
 ## Test data
 
 contract/fixture.json holds 30 real jazz tracks with real Deezer preview
-URLs. Use it for all testing. Do not invent your own test tracks.
+URLs. Use it for testing. Do not invent test tracks.
 
 ## Scope
 
-This is a 24-hour sprint. Build what is asked, nothing more. No profile
-screens, no explanation text, no accounts, no persistence beyond Redis,
-no deployment config. If you think something extra is needed, ask.
+Build what is asked, nothing more. If something extra seems needed, say so
+and ask before adding it. Dependencies go in pyproject.toml via `uv`.
 
-## legacy/ is frozen
+## legacy/
 
-legacy/ holds the pre-spec MVP. Copy from it if useful; never import it,
-never edit it.
+legacy/ is frozen. Copy from it if useful; never import it, never edit it.
 
-## Merging
+## Git
 
-Commit and push small changes often. Do not sit on large diffs. Never
-commit directly to main; branch as <name>/<topic> and open a PR. Run
-`python3 -m pytest` before committing.
+Branch as <topic> off main and open a PR; do not commit directly to main.
+Run `python3 -m pytest` before committing. Commit small changes often.
+Before merging analysis changes, also run
+`PARITY=1 python3 -m pytest tests/analysis/test_parity.py -s` (needs
+Essentia, network).

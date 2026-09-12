@@ -1,4 +1,4 @@
-"""Download EffNet + every head in analysis/registry.py into models/.
+"""Download the Discogs-EffNet graph into models/.
 
 One command from checkout to working analysis. Skips files already present.
 Usage: python3 scripts/fetch_models.py
@@ -24,12 +24,6 @@ def fetch(url: str, dest: Path) -> None:
 def main() -> None:
     registry.MODELS_DIR.mkdir(exist_ok=True)
     fetch(registry.EFFNET_URL, registry.MODELS_DIR / registry.EFFNET_FILE)
-    for head in registry.HEADS.values():
-        fetch(registry.model_url(head.filename), registry.MODELS_DIR / head.filename)
-        # The .json carries the class labels. Binary heads disagree on which
-        # index is positive (see heads.py), so it is required, not optional.
-        meta = head.filename.replace(".pb", ".json")
-        fetch(registry.model_url(meta), registry.MODELS_DIR / meta)
     print("models ready")
 
 

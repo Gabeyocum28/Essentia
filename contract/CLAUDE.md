@@ -1,5 +1,5 @@
-# contract/ — READ-ONLY
+# contract/
 
-Everything here is shared by all four people. Changing anything requires
-all four to agree. If it looks wrong, STOP and ask a human — do not edit,
-extend, rename, or work around it.
+Shared HTTP and feature contract between the server and the iOS app.
+Changing it is allowed but cross-cutting: update the server, the app,
+and tests/test_contract.py together in the same PR. See ../AGENTS.md.

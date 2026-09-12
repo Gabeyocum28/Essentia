@@ -24,11 +24,15 @@ from __future__ import annotations
 # other silently, which looks like "the recommendations got worse" and is
 # almost impossible to trace back. The pre-spec MVP hit this and solved it the
 # same way (legacy/mvp/analyzer.py CACHE_VERSION).
+# 3: Essentia replaced by ffmpeg + numpy mel + TensorFlow (Linux ARM has no
+#    Essentia wheels). Same model, same maths, but not bit-identical: cosine
+#    with v2 vectors is >0.99, yet a corpus must not mix the two. Genre head
+#    and groove dropped.
 # 2: groove stopped folding tempo into an octave and its four dimensions were
 #    rescaled to their measured ranges so each contributes comparably. Vectors
 #    written under v1 are NOT comparable with v2 and must be re-analyzed.
 # 1: initial.
-FEATURES_VERSION = 2
+FEATURES_VERSION = 3
 
 # Which distance is correct for each feature key.
 #
@@ -38,17 +42,8 @@ FEATURES_VERSION = 2
 #
 #   embedding -- 1280-d EffNet activations, direction carries the meaning and
 #                magnitude mostly reflects loudness. Cosine.
-#   groove    -- 4 hand-normalized, all-positive values. Every such vector
-#                points into the same orthant, so cosine scores everything
-#                0.98-1.00 and the ordering is noise. Measured on a 150-track
-#                pool: cosine gave a 0.98-1.00 spread, euclidean 0.60-0.96.
-#   genre     -- 400 Discogs style probabilities. Sparse and non-negative, but
-#                unlike groove it is high-dimensional, so tracks do NOT all
-#                collapse into one orthant: direction is what carries "which
-#                styles, in what proportion". Cosine.
 METRICS = {
     "embedding": "cosine",
-    "genre": "cosine",
 }
 
 # A note for whoever implements ranking, not a value to import:
