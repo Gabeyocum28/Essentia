@@ -7,6 +7,7 @@ import type { VizMap, VizMst, VizTour } from "../api/types";
 interface Props {
   map: VizMap;
   seedId: string;
+  recIds: string[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
 }
@@ -22,7 +23,7 @@ function percentile(sorted: number[], p: number): number {
   return sorted[idx];
 }
 
-export function Topology({ map, seedId, selectedId, onSelect }: Props) {
+export function Topology({ map, seedId, recIds, selectedId, onSelect }: Props) {
   const [status, setStatus] = useState<Status>("loading");
   const [mst, setMst] = useState<VizMst | null>(null);
   const [tour, setTour] = useState<VizTour | null>(null);
@@ -36,7 +37,7 @@ export function Topology({ map, seedId, selectedId, onSelect }: Props) {
   const run = useCallback(async () => {
     setStatus("loading");
     try {
-      const [mstResult, tourResult] = await Promise.all([api.vizMst(seedId), api.vizTour(seedId)]);
+      const [mstResult, tourResult] = await Promise.all([api.vizMst(seedId, recIds), api.vizTour(seedId, recIds)]);
       if (mstResult.ids.length !== tourResult.ids.length) {
         setStatus("error");
         return;
@@ -49,7 +50,7 @@ export function Topology({ map, seedId, selectedId, onSelect }: Props) {
     } catch {
       setStatus("error");
     }
-  }, [seedId]);
+  }, [seedId, recIds]);
 
   useEffect(() => {
     void run();
@@ -103,7 +104,9 @@ export function Topology({ map, seedId, selectedId, onSelect }: Props) {
   }, [mst]);
 
   const seedIdx = mst ? idIndex.get(map.seed.track_id) : undefined;
-  const recIds = useMemo(() => new Set(map.recs.map((r) => r.track_id)), [map.recs]);
+  // The highlight set for drawing, distinct from the `recIds` prop, which is
+  // the list sent to the server so those tracks are in the subset at all.
+  const recSet = useMemo(() => new Set(map.recs.map((r) => r.track_id)), [map.recs]);
 
   useEffect(() => {
     if (!mst || !tour || size.width === 0 || size.height === 0) return;
@@ -149,7 +152,7 @@ export function Topology({ map, seedId, selectedId, onSelect }: Props) {
 
       // Recs and seed on top
       for (let i = 0; i < mst.ids.length; i++) {
-        if (!recIds.has(mst.ids[i])) continue;
+        if (!recSet.has(mst.ids[i])) continue;
         const [sx, sy] = toScreen(t, xs[i], ys[i]);
         if (selectedId === mst.ids[i]) {
           ctx.fillStyle = "rgba(10,132,255,.35)";
@@ -182,7 +185,7 @@ export function Topology({ map, seedId, selectedId, onSelect }: Props) {
 
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [mst, tour, size, xs, ys, activeEdges, ranks, seedIdx, recIds, selectedId]);
+  }, [mst, tour, size, xs, ys, activeEdges, ranks, seedIdx, recSet, selectedId]);
 
   useEffect(() => {
     if (!mst) return;

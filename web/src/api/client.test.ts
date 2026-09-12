@@ -77,3 +77,32 @@ test("vizExtremes adds track_id when given, omits it otherwise", async () => {
   await api.vizExtremes(1, 4);
   expect(fetch).toHaveBeenCalledWith("/api/viz/extremes?pc=1&limit=4", expect.anything());
 });
+
+test("the global viz endpoints send the rec ids as one comma-separated param", async () => {
+  // A `surprise` rec can sit outside the seed's subset; the server only keeps
+  // a row for it if it is named here.
+  mockFetch(200, { hubs: [], central: [], isolated: [], expected_k: 8 });
+  await api.vizHubs("42", ["a", "b"]);
+  expect(fetch).toHaveBeenCalledWith("/api/viz/hubs?track_id=42&recs=a%2Cb", expect.anything());
+
+  mockFetch(200, { ids: [], coords8: "", variance: [] });
+  await api.vizTour("42", ["a", "b"]);
+  expect(fetch).toHaveBeenCalledWith("/api/viz/tour?track_id=42&recs=a%2Cb", expect.anything());
+
+  mockFetch(200, { ids: [], edges: [] });
+  await api.vizMst("42", ["a"]);
+  expect(fetch).toHaveBeenCalledWith("/api/viz/mst?track_id=42&recs=a", expect.anything());
+
+  mockFetch(200, { pc: 1, variance_pct: 10, low: [], high: [] });
+  await api.vizExtremes(1, 4, "42", ["a"]);
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/viz/extremes?pc=1&limit=4&track_id=42&recs=a",
+    expect.anything(),
+  );
+});
+
+test("an empty rec list omits the param rather than sending recs=", async () => {
+  mockFetch(200, { ids: [], edges: [] });
+  await api.vizMst("42", []);
+  expect(fetch).toHaveBeenCalledWith("/api/viz/mst?track_id=42", expect.anything());
+});

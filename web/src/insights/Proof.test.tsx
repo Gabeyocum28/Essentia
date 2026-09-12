@@ -58,7 +58,7 @@ function makeMap(recs: ReturnType<typeof rec>[]): VizMap {
 function renderProof() {
   return render(
     <PlayerProvider>
-      <Proof seedId="seed" />
+      <Proof seedId="seed" recIds={["rec1"]} />
     </PlayerProvider>,
   );
 }
@@ -87,7 +87,7 @@ test("fetches raw and corrected maps in parallel, exactly once each", async () =
   expect(api.vizMap).toHaveBeenCalledTimes(2);
   expect(api.vizMap).toHaveBeenCalledWith("seed", "surprise", 10, "off");
   expect(api.vizMap).toHaveBeenCalledWith("seed", "surprise", 10, "on");
-  expect(api.vizHubs).toHaveBeenCalledWith("seed");
+  expect(api.vizHubs).toHaveBeenCalledWith("seed", ["rec1"]);
 });
 
 test("renders both score columns for a shared track and a dash for a one-sided track", async () => {
