@@ -11,7 +11,7 @@ Signed preview URLs are never stored on a track (they expire in minutes);
 GET /preview re-signs and caches them in `cache`.
 
 Every function here is the same name app.py, corpus/ingest.py and the
-worker called when this was Redis. Only the backend changed.
+worker called before this was MongoDB. Only the backend changed.
 
 Timestamps are naive UTC throughout (not timezone-aware): mongomock strips
 tzinfo off datetimes on round-trip, so comparing an aware `_now()` against a
@@ -210,7 +210,7 @@ def base_matrix() -> tuple[list[str], np.ndarray]:
 #
 # One document per pending unit of work. `state` moves queued -> running ->
 # (deleted on success | failed). A queued or running document is the dedup
-# guard the Redis sets used to be; requeue_stale() is the TTL.
+# guard a set of pending ids used to be; requeue_stale() is the TTL.
 
 _POLL_S = 0.5
 

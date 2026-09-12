@@ -2,7 +2,7 @@
 
 Snowball crawler over Deezer /artist/{id}/related from 8 jazz roots
 (spec §2.3), preview downloads into audio_cache/, batch ingest that calls
-music_recommendations.analysis.analyze_track and writes Redis.
+music_recommendations.analysis.analyze_track and writes the store.
 
 Rules:
 - No Essentia imports; call analysis.analyze_track only (from ingest.py).

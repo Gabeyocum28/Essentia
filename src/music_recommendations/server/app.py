@@ -603,7 +603,6 @@ def viz_map(track_id: str, axis: str,
         if rec_id == track_id or rec_id not in position:
             continue
         track = _safe(store.get_track, rec_id)
-        features = _safe(store.get_features, rec_id, default={})
         pos = position[rec_id]
         if blended_weights is not None:
             row = emb_at.get(rec_id)
@@ -627,7 +626,6 @@ def viz_map(track_id: str, axis: str,
             "score": score,
             "x": float(xy[pos, 0]),
             "y": float(xy[pos, 1]),
-            "groove": (features or {}).get("groove"),
             "math": math,
         })
         if len(recs) == limit:
@@ -639,7 +637,6 @@ def viz_map(track_id: str, axis: str,
         **seed_track,
         "x": float(xy[seed_pos, 0]),
         "y": float(xy[seed_pos, 1]),
-        "groove": seed_features.get("groove"),
     }
     point_tracks = []
     for point_id, track in zip(emb_ids, _safe(store.get_many_tracks, emb_ids,

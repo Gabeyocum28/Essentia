@@ -217,9 +217,8 @@ def test_viz_map_reads_all_point_metadata_in_one_bulk_request(
     assert len(calls[0]) == len(seeded_corpus)
 
 
-def test_viz_map_seed_has_position_and_groove(client, seeded_corpus):
-    """Groove was cut from the feature contract (embedding-only now); the
-    store never returns it, so this only pins the position math that's left."""
+def test_viz_map_seed_has_position(client, seeded_corpus):
+    """Pins the position math on the seed entry."""
     tid = seeded_corpus[0]["track_id"]
     body = client.get(
         "/viz/map", params={"track_id": tid, "axis": "sounds_like"}
@@ -228,7 +227,6 @@ def test_viz_map_seed_has_position_and_groove(client, seeded_corpus):
     assert seed["track_id"] == tid
     assert seed["title"] == seeded_corpus[0]["title"]
     assert isinstance(seed["x"], float) and isinstance(seed["y"], float)
-    assert seed["groove"] is None
 
 
 def test_viz_map_recs_match_recommend_scores(client, seeded_corpus):
@@ -257,7 +255,6 @@ def test_viz_map_rec_math_reconstructs_cosine(client, seeded_corpus):
         cosine = math["dot"] / (math["seed_norm"] * math["rec_norm"])
         assert cosine == pytest.approx(rec["score"])
         assert math["centrality"] is None
-        assert rec["groove"] is None
 
 
 def test_viz_map_surprise_includes_centrality(client, seeded_corpus):

@@ -1,7 +1,7 @@
 # analysis/
 
 Pure function: MP3 path in, `{"embedding": (1280,) float32}` out (spec §2.1).
-Knows nothing about HTTP, Deezer, Redis, or the phone.
+Knows nothing about HTTP, Deezer, the store, or the phone.
 
 - Decoding is the ffmpeg CLI (`frontend.decode`), 16 kHz mono via an
   explicit `pan=mono|c0<c0+c1` downmix — NOT `-ac 1`, which applies a

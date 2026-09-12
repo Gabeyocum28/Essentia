@@ -1,13 +1,9 @@
-"""Pop embed jobs off the VM's Redis, run Essentia locally, write back.
+"""Pop embed jobs from the Atlas jobs collection, analyze, write back.
 
-The ARM VM can't import essentia, so /seed queues cold tracks instead of
-analyzing them; this worker is the other half. Run it on a machine where
-essentia imports (the Mac), pointed at the VM's Redis:
-
-    REDIS_URL=redis://<vm-ip>:6379/0 python3 scripts/embed_worker.py
+    MONGODB_URI=... python3 scripts/embed_worker.py
 
 One process, one job at a time: on-demand taps trickle in and analysis is
-~1 s. Bulk backfill stays push_tracks.py's job.
+~1 s. Bulk backfill stays analyze_corpus.py's job.
 """
 from __future__ import annotations
 
@@ -54,7 +50,7 @@ def process_job(track_id: str) -> bool:
     try:
         track = _fresh_track(track_id)
         if track is None:
-            print(f"[embed_worker] {track_id}: no metadata in Redis or on Deezer", flush=True)
+            print(f"[embed_worker] {track_id}: no metadata in the store or on Deezer", flush=True)
             return False
         mp3 = download_preview(track["preview_url"])
         try:
@@ -160,7 +156,7 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
 
         track = _fresh_track(seed_id)
         if track is None:
-            raise ValueError("no seed metadata in Redis or on Deezer")
+            raise ValueError("no seed metadata in the store or on Deezer")
         mp3 = download_preview(track["preview_url"])
         audio = embed_mod.load_audio(mp3)          # mono, 16 kHz — model rate
 
@@ -231,8 +227,8 @@ def _tick() -> None:
     """One loop iteration: dequeue and process a job, if there is one.
 
     The process_* helpers never raise, but store.dequeue_job can (a transient
-    Redis ConnectionError on the blocking pop) -- guard it here so main()'s
-    loop survives a Redis blip instead of dying.
+    connection error while polling Atlas) -- guard it here so main()'s
+    loop survives a connection blip instead of dying.
     """
     try:
         job = store.dequeue_job(timeout=5)

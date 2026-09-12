@@ -9,14 +9,15 @@ tracks with 30 s previews. Design: `Essencia_design_spec.md`.
     python3 -m pip install -e ".[dev,analysis]"   # analysis extra = tensorflow
     brew install ffmpeg                            # or apt install ffmpeg
     python3 scripts/fetch_models.py                # downloads EffNet into models/
-    redis-server &                          # storage
+    export MONGODB_URI="mongodb+srv://..."   # Atlas connection string, never committed
     uvicorn music_recommendations.server.app:app --reload
 
 ## Layout
 
     contract/                     HTTP contract + fixture (cross-cutting: change
                                    server, app, and tests/test_contract.py together)
-    src/music_recommendations/    analysis / server / corpus components
+    src/music_recommendations/    analysis / server (FastAPI backend on MongoDB
+                                   Atlas) / corpus components
     ios/                          SwiftUI app
     scripts/                      operator entry points
     legacy/                       pre-spec MVP, frozen reference

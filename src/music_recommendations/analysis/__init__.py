@@ -1,6 +1,6 @@
 """analyze_track: MP3 path in, dict of named feature vectors out (spec §2.1).
 
-Pure — no cache, no HTTP, no Redis. Callers (server, corpus/ingest)
+Pure — no cache, no HTTP, no store access. Callers (server, corpus/ingest)
 decide when to run it and where results live. Returned dict keys must
 match contract/features.py FEATURE_KEYS.
 

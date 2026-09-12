@@ -19,15 +19,6 @@ legacy/samples/
 legacy/graph.json
 legacy/sound_connections.html
 
-# Redis snapshot from ad-hoc local redis-server
-dump.rdb
-
-# Exported corpus snapshot (scripts/export_snapshot.py). A build artifact,
-# regenerable from Redis in one command, and already deployed to Cloud Run.
 # embedding.npy alone is ~442 MB -- past GitHub's hard 100 MB per-file limit,
 # so committing it does not merely bloat the repo, the push is rejected.
-corpus_snapshot/
 *.npy
-
-# Stray redis dumps from ad-hoc local servers ("dump 2.rdb", etc.)
-dump*.rdb

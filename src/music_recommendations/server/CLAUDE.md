@@ -14,4 +14,7 @@ Rules:
   reweighting axes.
 - POST /seed is one blocking HTTP request -- no polling state machine in the
   contract. Internally, a cold seed on a host without Essentia enqueues the
-  track and polls Redis for the Mac embed worker to finish before responding.
+  track and polls the store for the Mac embed worker to finish before
+  responding.
+- Storage is MongoDB Atlas; see store.py's docstring for the three
+  collections. Set MONGODB_URI (and optionally MONGODB_DB) to run.
