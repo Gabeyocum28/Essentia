@@ -1,19 +1,17 @@
 # analysis/ — Person 4
 
-Pure function: MP3 path in, dict of feature vectors out (spec §2.1).
-Knows nothing about HTTP, Deezer, Redis, or the phone. No caching here —
-Person 2 owns *when* analysis happens; you own *how*.
+Pure function: MP3 path in, `{"embedding": (1280,) float32}` out (spec §2.1).
+Knows nothing about HTTP, Deezer, Redis, or the phone.
 
-Rules:
-- Only this lane may import essentia.
-- One EffNet pass feeds every classification head. Never instantiate
-  EffNet twice per track (genre is a head on the embedding, NOT
-  PartitionedCall:0 on a second pass).
-- Two MonoLoader decodes are correct: 16 kHz for EffNet, 44.1 kHz for
-  rhythm DSP. Don't "optimize" that away.
-- Head node names vary per head and bite silently. Every head lives in
-  registry.py with verified input/output node names. Never assume the
-  TensorflowPredict2D defaults.
-- Output keys must match contract/features.py FEATURE_KEYS exactly.
-- Groove extractor choices (swing, tempo folding) are open — yours to
-  change freely; they live entirely inside groove.py.
+- Decoding is the ffmpeg CLI (`frontend.decode`), 16 kHz mono via an
+  explicit `pan=mono|c0<c0+c1` downmix — NOT `-ac 1`, which applies a
+  sqrt(2) gain and breaks parity with Essentia's plain (L+R)/2 average.
+- `frontend.py` reproduces Essentia's TensorflowInputMusiCNN mel front-end
+  in numpy; the parameters were measured against Essentia and are recorded
+  in docs/superpowers/plans/2026-09-11-analysis-on-arm.md.
+- `embedding.py` runs Discogs-EffNet through TensorFlow directly (the graph
+  was frozen with a fixed batch of 64 patches). No Essentia import anywhere
+  under src/ — Linux aarch64 has no Essentia wheels.
+- Parity tests against Essentia live in tests/analysis (test_parity.py) and
+  run only where Essentia is installed, in a subprocess.
+- Bump FEATURES_VERSION in schema.py whenever the numbers change.
