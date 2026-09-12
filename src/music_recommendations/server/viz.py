@@ -35,7 +35,7 @@ def clear_geometry_cache() -> None:
 
 
 def normalized_rows(matrix: np.ndarray) -> np.ndarray:
-    matrix = np.asarray(matrix, dtype=float)
+    matrix = np.asarray(matrix, dtype=np.float32)
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     return matrix / np.where(norms == 0.0, 1.0, norms)
 

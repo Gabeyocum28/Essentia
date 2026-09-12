@@ -237,3 +237,13 @@ def test_failed_ids(fake_mongo):
     # "3" stays queued, "4" was never enqueued at all.
     assert store.failed_ids(["1", "2", "3", "4"]) == {"1", "2"}
     assert store.failed_ids([]) == set()
+
+
+def test_data_size_bytes_falls_back_when_dbstats_is_unsupported(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    assert store.data_size_bytes() >= 1
+
+
+def test_data_size_bytes_uses_dbstats_when_available(fake_mongo, monkeypatch):
+    monkeypatch.setattr(fake_mongo, "command", lambda name: {"dataSize": 1000, "indexSize": 24})
+    assert store.data_size_bytes() == 1024

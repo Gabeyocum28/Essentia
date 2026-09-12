@@ -19,7 +19,8 @@ from music_recommendations.analysis import analyze_track
 from music_recommendations.corpus import crawl
 from music_recommendations.server import deezer, store, viz
 
-CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "100000"))
+CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "200000"))
+CORPUS_BYTES_CAP = int(os.environ.get("CORPUS_BYTES_CAP", str(200 * 1024 * 1024)))
 CRAWL_INTERVAL_S = float(os.environ.get("CRAWL_INTERVAL_S", "60"))
 MAX_QUEUED = 200          # don't flood the queue; the worker drains ~12 tracks/min
 FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"
@@ -320,7 +321,11 @@ def crawl_step() -> int:
     job processing by up to a few minutes -- acceptable for a background
     crawl, not for the embed/attribution queue it shares the loop with.
     """
-    if store.corpus_size() >= CORPUS_CAP or store.queued_count() >= MAX_QUEUED:
+    size = store.data_size_bytes()
+    if size >= CORPUS_BYTES_CAP or store.corpus_size() >= CORPUS_CAP \
+            or store.queued_count() >= MAX_QUEUED:
+        if size >= CORPUS_BYTES_CAP:
+            print(f"[worker] byte cap reached: {size/1e6:.1f} MB of {CORPUS_BYTES_CAP/1e6:.0f} MB", flush=True)
         return 0
     state = store.get_state("crawl") or {"step": 0}
     step = int(state.get("step", 0))
@@ -348,7 +353,8 @@ def crawl_step() -> int:
     if grow_from is not None:
         _grow_roots(roots, grow_from)
     store.put_state("crawl", {"step": step + 1})
-    print(f"[worker] crawl {source}: {len(tracks)} candidates, {n} queued", flush=True)
+    print(f"[worker] crawl {source}: {len(tracks)} candidates, {n} queued"
+          f"  db {size/1e6:.1f} MB", flush=True)
     return n
 
 

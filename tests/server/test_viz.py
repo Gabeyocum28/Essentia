@@ -19,6 +19,14 @@ FIXTURE = json.loads(
     (Path(__file__).parents[2] / "contract" / "fixture.json").read_text()
 )["tracks"]
 
+TRACK = {
+    "track_id": "x",
+    "title": "Track",
+    "artist": "Artist",
+    "album": "Album",
+    "artwork_url": None,
+}
+
 
 # ---- project_2d (pure math) ----
 
@@ -713,3 +721,52 @@ def test_stop_mask_taper_width_does_not_depend_on_band_width():
 
     assert np.count_nonzero((wide > 0) & (wide < 1)) == 8
     assert np.count_nonzero((narrow > 0) & (narrow < 1)) == 8
+
+
+# ---- T3: seed-anchored viz subset ----
+
+def test_viz_subset_is_seed_nearest_and_bounded(fake_mongo, monkeypatch):
+    from music_recommendations.server import app as app_mod
+    monkeypatch.setattr(app_mod, "VIZ_MAX", 3)
+    # five tracks on a line; seed "c" in the middle
+    vecs = {"a": [1, 0], "b": [0.9, 0.1], "c": [0.7, 0.3], "d": [0.5, 0.5], "e": [0, 1]}
+    for tid, v in vecs.items():
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+    ids, matrix = app_mod._viz_subset("c")
+    assert "c" in ids and len(ids) == 3
+    assert set(ids) == {"b", "c", "d"}            # the two nearest plus the seed
+    assert matrix.shape == (3, 2)
+    assert ids == sorted(ids)                      # stable order
+    ids2, _ = app_mod._viz_subset("c", extra_ids=["e"])
+    assert set(ids2) == {"b", "c", "d", "e"}       # extras appended even when far
+
+
+def test_viz_subset_without_seed_is_the_first_rows(fake_mongo, monkeypatch):
+    from music_recommendations.server import app as app_mod
+    monkeypatch.setattr(app_mod, "VIZ_MAX", 2)
+    for tid in ("a", "b", "c"):
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": [1.0, 0.0]})
+    ids, matrix = app_mod._viz_subset(None)
+    assert ids == ["a", "b"] and matrix.shape == (2, 2)
+
+
+def test_tour_and_mst_share_the_subset_for_a_seed(client, fake_mongo, monkeypatch):
+    from music_recommendations.server import app as app_mod
+    monkeypatch.setattr(app_mod, "VIZ_MAX", 3)
+    for tid, v in {"a": [1, 0], "b": [0.9, 0.1], "c": [0.7, 0.3], "d": [0, 1]}.items():
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+    tour = client.get("/viz/tour?track_id=a").json()
+    mst = client.get("/viz/mst?track_id=a").json()
+    assert tour["ids"] == mst["ids"] and len(tour["ids"]) == 3 and "d" not in tour["ids"]
+    hubs = client.get("/viz/hubs?track_id=a").json()
+    assert {h["track_id"] for h in hubs["all_counts"]} == set(tour["ids"])
+
+
+def test_map_subset_includes_surprise_recs(client, fake_mongo, monkeypatch):
+    from music_recommendations.server import app as app_mod
+    monkeypatch.setattr(app_mod, "VIZ_MAX", 2)
+    for tid, v in {"a": [1, 0], "b": [0.99, 0.01], "c": [0.98, 0.02], "d": [0, 1]}.items():
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+    body = client.get("/viz/map?track_id=a&axis=surprise&limit=1&correction=off").json()
+    rec_ids = {r["track_id"] for r in body["recs"]}
+    assert rec_ids <= set(body["points"]["ids"])   # far recs are still drawn

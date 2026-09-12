@@ -414,6 +414,17 @@ def queued_count() -> int:
     return db().jobs.count_documents({"state": "queued"})
 
 
+def data_size_bytes() -> int:
+    """Data plus index bytes for the database (what Atlas counts against the
+    free tier). mongomock has no dbStats; estimate from document counts."""
+    try:
+        stats = db().command("dbStats")
+        return int(stats.get("dataSize", 0)) + int(stats.get("indexSize", 0))
+    except (NotImplementedError, TypeError):
+        n = db().tracks.count_documents({})
+        return n * 2048
+
+
 def failed_ids(track_ids: list[str]) -> set[str]:
     """Which of these track ids have a permanently failed embed job, in one
     query -- so a crawl never re-enqueues a track that already failed."""
