@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let the corpus grow until the Atlas database holds 200 MB, while the insights endpoints keep working by computing over a bounded, seed-anchored subset of tracks.
+**Goal:** Let the corpus grow until the Atlas database holds 450 MB, while the insights endpoints keep working by computing over a bounded, seed-anchored subset of tracks.
 
-**Architecture:** The crawler stops when `dataSize + indexSize` of the database reaches `CORPUS_BYTES_CAP` (default 200 MB), read from `dbStats`; the track cap becomes a distant backstop. Recommendations and the histogram keep using the full corpus (one matrix-vector product). Every other insights endpoint runs on a "viz subset": the `VIZ_MAX` (default 8000) tracks most similar to a seed, plus the seed and, for `/viz/map`, that axis's recommendations. `/viz/tour`, `/viz/mst`, `/viz/hubs`, `/viz/extremes` gain an optional `track_id` query parameter selecting that subset; without it they use the first `VIZ_MAX` rows of the corpus matrix (a stable fallback for old clients). Subsets are cached per seed (small LRU) and the existing identity-pinned caches (top-8 PCA, MST, pairwise) key on the subset matrix, so nothing else changes. Memory is trimmed: the unit-normalized full matrix and the pairwise matrix become float32.
+**Architecture:** The crawler stops when `dataSize + indexSize` of the database reaches `CORPUS_BYTES_CAP` (default 450 MB), read from `dbStats`; the track cap becomes a distant backstop. Recommendations and the histogram keep using the full corpus (one matrix-vector product). Every other insights endpoint runs on a "viz subset": the `VIZ_MAX` (default 8000) tracks most similar to a seed, plus the seed and, for `/viz/map`, that axis's recommendations. `/viz/tour`, `/viz/mst`, `/viz/hubs`, `/viz/extremes` gain an optional `track_id` query parameter selecting that subset; without it they use the first `VIZ_MAX` rows of the corpus matrix (a stable fallback for old clients). Subsets are cached per seed (small LRU) and the existing identity-pinned caches (top-8 PCA, MST, pairwise) key on the subset matrix, so nothing else changes. Memory is trimmed: the unit-normalized full matrix and the pairwise matrix become float32.
 
 **Tech Stack:** FastAPI, numpy, pymongo, mongomock; React client.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Public HTTP contract unchanged; the four global viz endpoints only gain an optional `track_id`.
-- Env: `CORPUS_BYTES_CAP` (bytes, default `209715200`), `VIZ_MAX` (default `8000`), `CORPUS_CAP` (default `200000`, backstop).
+- Env: `CORPUS_BYTES_CAP` (bytes, default `471859200` = 450 MB), `VIZ_MAX` (default `8000`), `CORPUS_CAP` (default `300000`, backstop).
 - Memory budget at 100k tracks inside the 4 GB API container: base matrix float32 512 MB; unit matrix float32 512 MB; up to 2 cached subsets × (8000×1280 float32 = 41 MB); pairwise float32 per subset 256 MB, at most 2 held. Total under 1.7 GB plus TensorFlow.
 - Branch `viz-subset` off `main`. `python3 -m pytest -q` green before each commit; web: `npm test && npm run build`.
 
