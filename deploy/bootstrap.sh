@@ -28,9 +28,13 @@ if ! grep -q "^essentia.gabeyocum.com" "$CADDY/Caddyfile"; then
   cp "$CADDY/Caddyfile" "$CADDY/Caddyfile.bak.$(date +%s)"
   printf '\n' >> "$CADDY/Caddyfile"
   cat deploy/Caddyfile.essentia >> "$CADDY/Caddyfile"
-  docker compose -f "$CADDY/docker-compose.yml" exec caddy caddy reload --config /etc/caddy/Caddyfile
-  echo ">> Caddy: added essentia.gabeyocum.com and reloaded"
+  echo ">> Caddy: added essentia.gabeyocum.com"
 fi
+
+# Reload Caddy on every run (idempotent); -T avoids "input device is not a
+# TTY" when this script runs non-interactively (e.g. piped from curl).
+docker compose -f "$CADDY/docker-compose.yml" exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+echo ">> Caddy: reloaded"
 
 # 4. Build and (re)start the stack.
 docker compose -f deploy/docker-compose.yml up -d --build

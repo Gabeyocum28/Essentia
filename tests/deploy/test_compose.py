@@ -31,4 +31,5 @@ def test_bootstrap_backs_up_caddyfile_before_editing():
     text = (DEPLOY / "bootstrap.sh").read_text()
     assert "Caddyfile.bak." in text
     assert "caddy reload" in text
+    assert "exec -T caddy caddy reload" in text
     assert "set -euo pipefail" in text
