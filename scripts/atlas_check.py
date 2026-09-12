@@ -19,19 +19,37 @@ TRACK = {"track_id": "atlas-check", "title": "check", "artist": "check",
          "album": "check", "artwork_url": "", "preview_url": ""}
 
 
+def _cleanup() -> None:
+    """Best-effort: never let a cleanup failure hide the original error."""
+    try:
+        store.clear_embed_marker("atlas-check")
+    except Exception as exc:  # noqa: BLE001 - report, don't mask
+        print(f"atlas check cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        store.db().tracks.delete_one({"_id": "atlas-check"})
+    except Exception as exc:  # noqa: BLE001 - report, don't mask
+        print(f"atlas check cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def run() -> int:
     try:
         store.ensure_indexes()
         before = store.corpus_size()
-        vec = np.linspace(-1, 1, 1280, dtype=np.float32)
-        store.put_track(TRACK, {"embedding": vec, "_features_version": 3})
-        got = store.get_features("atlas-check")
-        assert got and np.allclose(got["embedding"], vec, atol=0.01), "embedding mismatch"
-        assert store.enqueue_embed("atlas-check") and store.dequeue_embed(timeout=0) == "atlas-check"
+        # A prior failed run can leave "embed:atlas-check" queued, which would
+        # make enqueue_embed below return False through no fault of this run.
         store.clear_embed_marker("atlas-check")
-        store.db().tracks.delete_one({"_id": "atlas-check"})
+        try:
+            vec = np.linspace(-1, 1, 1280, dtype=np.float32)
+            store.put_track(TRACK, {"embedding": vec, "_features_version": 3})
+            got = store.get_features("atlas-check")
+            assert got and np.allclose(got["embedding"], vec, atol=0.01), "embedding mismatch"
+            assert (store.enqueue_embed("atlas-check")
+                    and store.dequeue_embed(timeout=0) == "atlas-check")
+        finally:
+            _cleanup()
+        jobs = store.db().jobs.count_documents({})  # read before reset() drops the client
         store.reset()
-        print(f"tracks: {before}  jobs: {store.db().jobs.count_documents({})}  round-trip ok")
+        print(f"tracks: {before}  jobs: {jobs}  round-trip ok")
         return 0
     except Exception as exc:  # noqa: BLE001 - this script's job is to report any failure
         print(f"atlas check failed: {type(exc).__name__}: {exc}", file=sys.stderr)
