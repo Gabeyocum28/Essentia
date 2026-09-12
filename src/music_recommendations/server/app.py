@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 from contextvars import ContextVar
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from starlette.requests import Request
 from typing import Literal, NamedTuple
@@ -167,21 +167,6 @@ def _safe(fn, *args, default=None):
 
 class SeedRequest(BaseModel):
     track_id: str
-
-
-@app.get("/")
-def root() -> dict:
-    """Signpost only — not part of the contract."""
-    return {
-        "service": "Essencia",
-        "routes": [
-            "GET /search?q=<query>",
-            "POST /seed {track_id}",
-            "GET /axes",
-            "GET /recommend?track_id=<id>&axis=<axis>&limit=<n>",
-            "GET /preview/<id>",
-        ],
-    }
 
 
 @app.get("/axes")
@@ -937,3 +922,39 @@ def _to_plain(features: dict) -> dict:
     return {
         k: v.tolist() if hasattr(v, "tolist") else v for k, v in features.items()
     }
+
+
+# ---- the web app: web/dist built into the image, served at / ----
+# Declared last so every API route above wins; unknown GET paths without a
+# file extension fall back to index.html for client-side routing.
+#
+# WEB_DIST is read lazily (at request time, not import time) so tests can
+# monkeypatch the env var per-test without reloading this module.
+
+
+def _web_dist() -> Path:
+    return Path(os.environ.get(
+        "WEB_DIST", str(Path(__file__).resolve().parents[3] / "web" / "dist")
+    ))
+
+
+def _spa_index() -> FileResponse:
+    index = _web_dist() / "index.html"
+    if not index.exists():
+        raise HTTPException(404, "web app not built")
+    return FileResponse(index)
+
+
+@app.get("/", include_in_schema=False)
+def spa_root() -> FileResponse:
+    return _spa_index()
+
+
+@app.get("/{path:path}", include_in_schema=False)
+def spa_fallback(path: str) -> FileResponse:
+    if "." in path.rsplit("/", 1)[-1]:
+        file = _web_dist() / path
+        if file.is_file():
+            return FileResponse(file)
+        raise HTTPException(404)
+    return _spa_index()

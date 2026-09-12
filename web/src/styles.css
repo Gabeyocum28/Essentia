@@ -1,0 +1,7 @@
+:root { color-scheme: dark; --bg:#000; --panel:#141414; --text:#f2f2f2; --muted:#9a9a9a;
+  --accent:#0A84FF; --seed:#FFD60A; --cyan:#64D2FF; --error:#FF453A; --radius:8px; }
+html, body, #root { height: 100%; margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.4 -apple-system, "SF Pro Text", system-ui, sans-serif; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.art { border-radius: var(--radius); object-fit: cover; background: #222; }
+button { font: inherit; }

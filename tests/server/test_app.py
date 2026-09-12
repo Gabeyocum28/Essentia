@@ -296,14 +296,6 @@ def test_recommend_works_without_store(no_store):
     assert len(body.json()["results"]) == 10
 
 
-# ---- / signpost ----
-
-def test_root_lists_routes(client):
-    body = client.get("/").json()
-    assert "/axes" in str(body)
-    assert "/recommend" in str(body)
-
-
 # ---- /recommend corpus matrix cache ----
 
 def test_a_track_analyzed_after_the_first_request_still_appears(client, seeded_corpus):
@@ -630,3 +622,25 @@ def test_startup_creates_indexes_for_a_read_only_api_process(fake_mongo):
     with TestClient(app_module.app):
         pass
     assert "expires_at_1" in fake_mongo.cache.index_information()
+
+
+# ---- serving the web build ----
+
+def test_spa_is_served_at_root_and_unknown_paths(monkeypatch, tmp_path, fake_mongo):
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<html><body>spa</body></html>")
+    (dist / "assets" / "a.js").write_text("console.log(1)")
+    monkeypatch.setenv("WEB_DIST", str(dist))
+    with TestClient(app_module.app) as c:
+        assert c.get("/").text.endswith("spa</body></html>")
+        assert c.get("/insights/123").text.endswith("spa</body></html>")
+        assert c.get("/assets/a.js").text == "console.log(1)"
+        assert c.get("/axes").json()["axes"]                        # API routes still win
+        assert c.get("/search?q=x").status_code in (200, 502)
+
+
+def test_root_is_404_without_a_build(monkeypatch, tmp_path, fake_mongo):
+    monkeypatch.setenv("WEB_DIST", str(tmp_path / "missing"))
+    with TestClient(app_module.app) as c:
+        assert c.get("/").status_code == 404

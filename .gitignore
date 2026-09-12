@@ -23,3 +23,7 @@ legacy/sound_connections.html
 # embedding.npy alone is ~442 MB -- past GitHub's hard 100 MB per-file limit,
 # so committing it does not merely bloat the repo, the push is rejected.
 *.npy
+
+# web app build artifacts
+web/node_modules/
+web/dist/
