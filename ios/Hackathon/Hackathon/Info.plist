@@ -5,21 +5,14 @@
 	<key>CFBundleDisplayName</key>
 	<string>BestRec</string>
 	<!-- Allow cleartext HTTP to localhost/local domains so the app can reach the
-	     dev mock server at http://localhost:8000, plus a single exception for
-	     the team server on the Oracle VM. Does not permit arbitrary insecure
-	     loads to the public internet. -->
+	     dev mock server at http://localhost:8000 from the simulator. The team
+	     server is reached over HTTPS at essentia.gabeyocum.com, so no ATS
+	     exception for it is needed. Does not permit arbitrary insecure loads
+	     to the public internet. -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
-		<key>NSExceptionDomains</key>
-		<dict>
-			<key>163.192.48.114</key>
-			<dict>
-				<key>NSExceptionAllowsInsecureHTTPLoads</key>
-				<true/>
-			</dict>
-		</dict>
 	</dict>
 </dict>
 </plist>

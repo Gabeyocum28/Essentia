@@ -28,7 +28,7 @@ These were considered and deliberately cut. Do not build them.
 - **No instrumentation axis.** It was proposed to make explanations legible; with no explanations, it earns nothing.
 - **No accounts, no saving, no history, no playlists.**
 - **No Android, no web client.**
-- **No hosting.** Backend runs on a laptop behind a tunnel.
+- **No hosting.** Backend runs on a laptop behind a tunnel — superseded by `docs/superpowers/specs/2026-09-11-oracle-atlas-migration-design.md`.
 
 ---
 
@@ -343,7 +343,7 @@ URLs. Use it for all testing. Do not invent your own test tracks.
 
 This is a 24-hour sprint. Build what is asked, nothing more. No profile
 screens, no explanation text, no accounts, no persistence beyond Redis,
-no deployment config. If you think something extra is needed, ask.
+no deployment config — superseded by `docs/superpowers/specs/2026-09-11-oracle-atlas-migration-design.md`. If you think something extra is needed, ask.
 
 ## Merging
 

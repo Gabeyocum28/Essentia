@@ -10,14 +10,14 @@
 import Foundation
 
 enum AppConfig {
-    /// Live Essencia server: Cloud Run, holding the 90,491-track corpus.
-    /// Unlike the Cloudflare quick tunnel this replaced, the hostname is
-    /// stable and the server does not depend on anyone's laptop being awake,
-    /// so this default should no longer churn. Override it without editing
-    /// code by setting ESSENTIA_BASE_URL.
+    /// Live Essencia server: the Oracle VM, reached through the shared Caddy
+    /// instance that terminates TLS for essentia.gabeyocum.com. Caddy strips
+    /// the `/api` prefix before proxying to the container, so every request
+    /// this app makes must include it. Override without editing code by
+    /// setting ESSENTIA_BASE_URL.
     nonisolated static let baseURL: URL = {
         let env = ProcessInfo.processInfo.environment["ESSENTIA_BASE_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let raw = (env?.isEmpty == false ? env : nil) ?? "https://essentia-server-438428032266.us-central1.run.app"
+        let raw = (env?.isEmpty == false ? env : nil) ?? "https://essentia.gabeyocum.com/api"
         return URL(string: raw)!
     }()
 
