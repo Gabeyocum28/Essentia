@@ -44,12 +44,15 @@ export const api = {
     request<T.VizMap>(`/viz/map${q({ track_id, axis, limit, correction })}`),
   vizWalk: (from: string, to: string, k = 8) => request<T.VizWalk>(`/viz/walk${q({ from, to, k })}`),
   vizHistogram: (track_id: string) => request<T.VizHistogram>(`/viz/histogram${q({ track_id })}`),
-  vizHubs: () => request<T.VizHubs>("/viz/hubs"),
-  vizTour: async (): Promise<T.VizTour> => {
-    const raw = await request<{ ids: string[]; coords8: string; variance: number[] }>("/viz/tour");
+  vizHubs: (track_id?: string) => request<T.VizHubs>(`/viz/hubs${q({ track_id })}`),
+  vizTour: async (track_id?: string): Promise<T.VizTour> => {
+    const raw = await request<{ ids: string[]; coords8: string; variance: number[] }>(
+      `/viz/tour${q({ track_id })}`,
+    );
     return { ids: raw.ids, coords: decodeCoords8(raw.coords8, raw.ids.length), variance: raw.variance };
   },
-  vizMst: () => request<T.VizMst>("/viz/mst"),
-  vizExtremes: (pc: number, limit = 4) => request<T.VizExtremes>(`/viz/extremes${q({ pc, limit })}`),
+  vizMst: (track_id?: string) => request<T.VizMst>(`/viz/mst${q({ track_id })}`),
+  vizExtremes: (pc: number, limit = 4, track_id?: string) =>
+    request<T.VizExtremes>(`/viz/extremes${q({ pc, limit, track_id })}`),
   vizAttribute: (seed: string, rec: string) => request<T.VizAttribution>(`/viz/attribute${q({ seed, rec })}`),
 };

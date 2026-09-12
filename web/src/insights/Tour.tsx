@@ -6,6 +6,7 @@ import type { VizMap, VizTour } from "../api/types";
 
 interface Props {
   map: VizMap;
+  seedId: string;
   selectedId: string | null;
   onSelect: (id: string | null) => void;
 }
@@ -14,7 +15,7 @@ type Status = "loading" | "ready" | "error";
 
 const PAD = 24;
 
-export function Tour({ map, selectedId }: Props) {
+export function Tour({ map, seedId, selectedId }: Props) {
   const [status, setStatus] = useState<Status>("loading");
   const [tour, setTour] = useState<VizTour | null>(null);
   const [playing, setPlaying] = useState(true);
@@ -37,13 +38,13 @@ export function Tour({ map, selectedId }: Props) {
   const run = useCallback(async () => {
     setStatus("loading");
     try {
-      const result = await api.vizTour();
+      const result = await api.vizTour(seedId);
       setTour(result);
       setStatus("ready");
     } catch {
       setStatus("error");
     }
-  }, []);
+  }, [seedId]);
 
   useEffect(() => {
     void run();

@@ -6,6 +6,7 @@ import type { VizMap, VizMst, VizTour } from "../api/types";
 
 interface Props {
   map: VizMap;
+  seedId: string;
   selectedId: string | null;
   onSelect: (id: string | null) => void;
 }
@@ -21,7 +22,7 @@ function percentile(sorted: number[], p: number): number {
   return sorted[idx];
 }
 
-export function Topology({ map, selectedId, onSelect }: Props) {
+export function Topology({ map, seedId, selectedId, onSelect }: Props) {
   const [status, setStatus] = useState<Status>("loading");
   const [mst, setMst] = useState<VizMst | null>(null);
   const [tour, setTour] = useState<VizTour | null>(null);
@@ -35,7 +36,7 @@ export function Topology({ map, selectedId, onSelect }: Props) {
   const run = useCallback(async () => {
     setStatus("loading");
     try {
-      const [mstResult, tourResult] = await Promise.all([api.vizMst(), api.vizTour()]);
+      const [mstResult, tourResult] = await Promise.all([api.vizMst(seedId), api.vizTour(seedId)]);
       if (mstResult.ids.length !== tourResult.ids.length) {
         setStatus("error");
         return;
@@ -48,7 +49,7 @@ export function Topology({ map, selectedId, onSelect }: Props) {
     } catch {
       setStatus("error");
     }
-  }, []);
+  }, [seedId]);
 
   useEffect(() => {
     void run();

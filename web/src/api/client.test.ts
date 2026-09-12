@@ -37,3 +37,43 @@ test("decodeCoords8 splits little-endian float32 into rows of 8", () => {
 test("previewUrl points at the API redirect", () => {
   expect(previewUrl("42")).toBe("/api/preview/42");
 });
+
+test("vizHubs adds track_id when given, omits it otherwise", async () => {
+  mockFetch(200, { hubs: [], central: [], isolated: [], expected_k: 8 });
+  await api.vizHubs("42");
+  expect(fetch).toHaveBeenCalledWith("/api/viz/hubs?track_id=42", expect.anything());
+
+  mockFetch(200, { hubs: [], central: [], isolated: [], expected_k: 8 });
+  await api.vizHubs();
+  expect(fetch).toHaveBeenCalledWith("/api/viz/hubs?", expect.anything());
+});
+
+test("vizTour adds track_id when given, omits it otherwise", async () => {
+  mockFetch(200, { ids: [], coords8: "", variance: [] });
+  await api.vizTour("42");
+  expect(fetch).toHaveBeenCalledWith("/api/viz/tour?track_id=42", expect.anything());
+
+  mockFetch(200, { ids: [], coords8: "", variance: [] });
+  await api.vizTour();
+  expect(fetch).toHaveBeenCalledWith("/api/viz/tour?", expect.anything());
+});
+
+test("vizMst adds track_id when given, omits it otherwise", async () => {
+  mockFetch(200, { ids: [], edges: [] });
+  await api.vizMst("42");
+  expect(fetch).toHaveBeenCalledWith("/api/viz/mst?track_id=42", expect.anything());
+
+  mockFetch(200, { ids: [], edges: [] });
+  await api.vizMst();
+  expect(fetch).toHaveBeenCalledWith("/api/viz/mst?", expect.anything());
+});
+
+test("vizExtremes adds track_id when given, omits it otherwise", async () => {
+  mockFetch(200, { pc: 1, variance_pct: 10, low: [], high: [] });
+  await api.vizExtremes(1, 4, "42");
+  expect(fetch).toHaveBeenCalledWith("/api/viz/extremes?pc=1&limit=4&track_id=42", expect.anything());
+
+  mockFetch(200, { pc: 1, variance_pct: 10, low: [], high: [] });
+  await api.vizExtremes(1, 4);
+  expect(fetch).toHaveBeenCalledWith("/api/viz/extremes?pc=1&limit=4", expect.anything());
+});

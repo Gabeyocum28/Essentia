@@ -121,8 +121,10 @@ export function Insights() {
 
               {chip === "Explore" && <Galaxy map={map} selectedId={selectedId} onSelect={setSelectedId} />}
               {chip === "Walk" && <Walk map={map} selectedId={selectedId} onSelect={setSelectedId} />}
-              {chip === "Tour" && <Tour map={map} selectedId={selectedId} onSelect={setSelectedId} />}
-              {chip === "Topo" && <Topology map={map} selectedId={selectedId} onSelect={setSelectedId} />}
+              {chip === "Tour" && <Tour map={map} seedId={id} selectedId={selectedId} onSelect={setSelectedId} />}
+              {chip === "Topo" && (
+                <Topology map={map} seedId={id} selectedId={selectedId} onSelect={setSelectedId} />
+              )}
             </>
           )}
 
@@ -132,8 +134,8 @@ export function Insights() {
 
           {mode === "PROOF" && (
             <>
-              <Proof trackId={id} />
-              <Extremes />
+              <Proof seedId={id} />
+              <Extremes seedId={id} />
             </>
           )}
         </>
