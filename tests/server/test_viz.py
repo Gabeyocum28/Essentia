@@ -634,13 +634,13 @@ def test_viz_attribute_queues_the_pair_once_and_reports_pending(client, seeded_c
     first = client.get("/viz/attribute", params={"seed": seed, "rec": rec})
     assert first.status_code == 200
     assert first.json() == {"status": "pending"}
-    assert fake_mongo.jobs.find_one({"_id": f"attr:{seed}|{rec}"})["state"] == "queued"
+    assert fake_mongo.jobs.find_one({"_id": f"attr:{seed}:{rec}"})["state"] == "queued"
 
     # Polling must not pile the same job up behind itself.
     assert client.get("/viz/attribute", params={"seed": seed, "rec": rec}).json() == {
         "status": "pending"
     }
-    assert fake_mongo.jobs.find_one({"_id": f"attr:{seed}|{rec}"})["state"] == "queued"
+    assert fake_mongo.jobs.find_one({"_id": f"attr:{seed}:{rec}"})["state"] == "queued"
 
 
 def test_viz_attribute_serves_the_cached_result_when_the_worker_is_done(client, seeded_corpus):

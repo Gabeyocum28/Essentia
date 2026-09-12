@@ -7,6 +7,7 @@ Exit code 0 on success, 1 on any failure (message on stderr).
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -14,6 +15,14 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from music_recommendations.server import store  # noqa: E402
+
+_URI_RE = re.compile(r"mongodb(?:\+srv)?://[^\s\"']*")
+
+
+def _redact(text: str) -> str:
+    """pymongo errors can echo the connection string (credentials and all)
+    back at us; scrub it before it hits stderr/logs."""
+    return _URI_RE.sub("mongodb://<redacted>", text)
 
 TRACK = {"track_id": "atlas-check", "title": "check", "artist": "check",
          "album": "check", "artwork_url": "", "preview_url": ""}
@@ -24,11 +33,11 @@ def _cleanup() -> None:
     try:
         store.clear_embed_marker("atlas-check")
     except Exception as exc:  # noqa: BLE001 - report, don't mask
-        print(f"atlas check cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"atlas check cleanup failed: {type(exc).__name__}: {_redact(str(exc))}", file=sys.stderr)
     try:
         store.db().tracks.delete_one({"_id": "atlas-check"})
     except Exception as exc:  # noqa: BLE001 - report, don't mask
-        print(f"atlas check cleanup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"atlas check cleanup failed: {type(exc).__name__}: {_redact(str(exc))}", file=sys.stderr)
 
 
 def run() -> int:
@@ -52,7 +61,7 @@ def run() -> int:
         print(f"tracks: {before}  jobs: {jobs}  round-trip ok")
         return 0
     except Exception as exc:  # noqa: BLE001 - this script's job is to report any failure
-        print(f"atlas check failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"atlas check failed: {type(exc).__name__}: {_redact(str(exc))}", file=sys.stderr)
         return 1
 
 

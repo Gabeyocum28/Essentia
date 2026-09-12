@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,19 @@ from music_recommendations.analysis.schema import METRICS
 from music_recommendations.server import deezer, store, viz
 from music_recommendations.server.axes import AXIS_FEATURES, BLENDED_AXES
 
-app = FastAPI(title="Essencia")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """A read-only API process (no put_track/enqueue_* call of its own) would
+    otherwise never run ensure_indexes(), leaving Atlas without the
+    analyzed_at/jobs/cache indexes until some writer happened to start
+    first. _safe() so an unreachable Atlas at boot doesn't crash the API --
+    it falls back to serving the fixture, same as every other store call."""
+    _safe(store.ensure_indexes)
+    yield
+
+
+app = FastAPI(title="Essencia", lifespan=_lifespan)
 
 
 # ---- stable preview URLs ----

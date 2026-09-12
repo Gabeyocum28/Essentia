@@ -73,17 +73,23 @@ def test_process_job_prefers_fresh_deezer_preview_url(fake_mongo, monkeypatch, t
     assert store.get_track("42")["preview_url"] == ""
 
 
-def test_process_job_falls_back_to_stored_track_when_deezer_down(fake_mongo, analysis_ok, monkeypatch):
+def test_process_job_fails_cleanly_when_deezer_down(fake_mongo, analysis_ok, monkeypatch):
+    """store.get_track() never has a usable preview_url (it's always ""), so
+    there's no stored fallback left to fall back to -- a Deezer outage just
+    fails the job."""
     def deezer_down(t):
         raise OSError("no network")
 
     store.put_track_meta(TRACK)
+    store.enqueue_embed("42")
     monkeypatch.setattr(worker.deezer, "get_track", deezer_down)
-    assert worker.process_job("42") is True
-    assert_features_match("42", FEATURES)
+    assert worker.process_job("42") is False
+    assert store.get_features("42") is None
+    job = fake_mongo.jobs.find_one({"_id": "embed:42"})
+    assert job["state"] == "failed" and job["error"]
 
 
-def test_process_job_failure_logs_clears_marker_never_raises(fake_mongo, monkeypatch):
+def test_process_job_failure_logs_records_failed_job_never_raises(fake_mongo, monkeypatch):
     def boom(url):
         raise OSError("download failed")
 
@@ -94,12 +100,29 @@ def test_process_job_failure_logs_clears_marker_never_raises(fake_mongo, monkeyp
 
     assert worker.process_job("42") is False
     assert store.get_features("42") is None
-    assert store.enqueue_embed("42") is True   # marker cleared despite failure
+    job = fake_mongo.jobs.find_one({"_id": "embed:42"})
+    assert job["state"] == "failed"
+    assert "OSError" in job["error"] and "download failed" in job["error"]
 
 
 def test_process_job_no_metadata_anywhere_fails_cleanly(fake_mongo, monkeypatch):
     monkeypatch.setattr(worker.deezer, "get_track", lambda t: None)
     assert worker.process_job("42") is False
+
+
+def test_tick_sweeps_stale_jobs_before_dequeuing(fake_mongo, monkeypatch):
+    calls = {"n": 0}
+
+    def counting_requeue_stale(*args, **kwargs):
+        calls["n"] += 1
+        return 0
+
+    monkeypatch.setattr(worker.store, "requeue_stale", counting_requeue_stale)
+    monkeypatch.setattr(worker.store, "dequeue_job", lambda timeout=5: None)
+
+    worker._tick()
+
+    assert calls["n"] == 1
 
 
 def test_tick_survives_a_dequeue_connection_error(monkeypatch):

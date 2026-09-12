@@ -619,3 +619,14 @@ def test_seed_returns_502_when_analysis_fails(client, fake_mongo, monkeypatch, t
     r = client.post("/seed", json={"track_id": "42"})
     assert r.status_code == 502
     assert r.json()["detail"] == "analysis failed"
+
+
+# ---- indexes created at API startup ----
+
+def test_startup_creates_indexes_for_a_read_only_api_process(fake_mongo):
+    """A pure-reader API process never calls put_track/enqueue_* itself, so
+    without a startup hook it would never call ensure_indexes() -- Atlas
+    would run unindexed until some writer happened to start first."""
+    with TestClient(app_module.app):
+        pass
+    assert "expires_at_1" in fake_mongo.cache.index_information()

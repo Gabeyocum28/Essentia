@@ -3,7 +3,7 @@
   tracks  _id=track_id, title, artist, album, artwork_url,
           embedding (int8 bytes), scale (float), features_version, analyzed_at
           -- the last four are absent until the track is analyzed.
-  jobs    _id="embed:{id}" | "attr:{seed}|{rec}", kind, state, claimed_at,
+  jobs    _id="embed:{id}" | "attr:{seed}:{rec}", kind, state, claimed_at,
           attempts, error, created_at  (+ track_id or seed_id/rec_id)
   cache   _id="preview:{id}" | "attr:{seed}:{rec}", value, expires_at (TTL)
 
@@ -17,6 +17,16 @@ Timestamps are naive UTC throughout (not timezone-aware): mongomock strips
 tzinfo off datetimes on round-trip, so comparing an aware `_now()` against a
 value read back from mongomock raises. Using naive UTC everywhere avoids the
 mismatch in both the mongomock-backed tests and the real Atlas driver.
+
+The timestamps that drive watermarks and stale detection -- `analyzed_at`,
+`claimed_at`, `created_at` -- are stamped by the MongoDB server itself via
+`$currentDate`, not by the calling process's clock. The API and the embed
+worker are different hosts; if their clocks drifted, a client-stamped
+`analyzed_at` could sort before a watermark that was really taken later,
+silently hiding a row from `tracks_since`/`corpus_ids`. A single server
+clock removes that failure mode. `_now()` remains in use for read-side
+comparisons (e.g. cache expiry, the stale-job cutoff) where both sides of
+the comparison are evaluated in this process.
 """
 from __future__ import annotations
 
@@ -57,6 +67,8 @@ def db():
 def reset() -> None:
     """Forget the client and caches (tests, and after a fork)."""
     global _client, _indexes_ready, _ids_cache
+    if _client is not None:
+        _client.close()
     _client = None
     _indexes_ready = False
     _ids_cache = None
@@ -92,8 +104,8 @@ def put_track(track: dict, features: dict) -> None:
     db().tracks.update_one(
         {"_id": track["track_id"]},
         {"$set": {**_meta(track), "embedding": data, "scale": float(scale),
-                  "features_version": int(features.get(VERSION_KEY, 0)),
-                  "analyzed_at": _now()}},
+                  "features_version": int(features.get(VERSION_KEY, 0))},
+         "$currentDate": {"analyzed_at": True}},
         upsert=True,
     )
 
@@ -172,7 +184,11 @@ def corpus_ids() -> list[str]:
     global _ids_cache
     with _lock:
         if _ids_cache is None:
-            docs = list(db().tracks.find({"embedding": {"$exists": True}},
+            # analyzed_at, not embedding: only put_track ever sets either
+            # field (together), so the two filters are equivalent -- but
+            # analyzed_at has an index (ensure_indexes) and embedding does
+            # not.
+            docs = list(db().tracks.find({"analyzed_at": {"$exists": True}},
                                          {"analyzed_at": 1}))
             newest = max((d["analyzed_at"] for d in docs), default=datetime(1970, 1, 1))
             _ids_cache = (newest, sorted(d["_id"] for d in docs))
@@ -195,15 +211,43 @@ def corpus_size() -> int:
 
 
 def base_matrix() -> tuple[list[str], np.ndarray]:
-    """Every analyzed embedding as one float32 matrix, ids in row order."""
-    ids, rows = [], []
-    for d in db().tracks.find({"embedding": {"$exists": True}},
-                              {"embedding": 1, "scale": 1}).sort("_id", 1):
-        ids.append(d["_id"])
-        rows.append(from_int8(d["embedding"], d["scale"]))
-    if not rows:
+    """Every analyzed embedding as one float32 matrix, ids in row order.
+
+    Preallocated rather than stacked: a corpus of tens of thousands of
+    tracks means a stack of per-row arrays (and the list holding them)
+    doubles peak memory versus filling one array in place.
+    """
+    # analyzed_at, not embedding: only put_track ever sets either field
+    # (together), so the two filters are equivalent -- but analyzed_at has
+    # an index (ensure_indexes) and embedding does not.
+    n = db().tracks.count_documents({"analyzed_at": {"$exists": True}})
+    if n == 0:
         return [], np.empty((0, 1), dtype=np.float32)
-    return ids, np.stack(rows).astype(np.float32)
+
+    cursor = db().tracks.find({"analyzed_at": {"$exists": True}},
+                              {"embedding": 1, "scale": 1}).sort("_id", 1)
+    ids: list[str] = []
+    matrix: np.ndarray | None = None
+    i = 0
+    for d in cursor:
+        vec = from_int8(d["embedding"], d["scale"])
+        if matrix is None:
+            matrix = np.empty((n, vec.shape[0]), dtype=np.float32)
+        if i >= n:
+            # A track landed mid-read, past what count_documents saw:
+            # dropping it (rather than growing the array) keeps this a
+            # single allocation; the next call picks it up.
+            break
+        matrix[i] = vec
+        ids.append(d["_id"])
+        i += 1
+    if matrix is None:
+        return [], np.empty((0, 1), dtype=np.float32)
+    if i < n:
+        # A track vanished mid-read (or the count raced a write the other
+        # way): truncate to the rows actually filled.
+        matrix = matrix[:i]
+    return ids, matrix
 
 
 # ---- jobs (internal; not part of the HTTP contract) ----
@@ -216,7 +260,11 @@ _POLL_S = 0.5
 
 
 def _attr_pair(seed_id: str, rec_id: str) -> str:
-    return f"{seed_id}|{rec_id}"
+    """Job/cache key half: colon-joined, matching the cache key format
+    (`attr:{seed}:{rec}`). dequeue_job's returned payload is pipe-joined
+    instead -- scripts/embed_worker.py splits it on "|" -- so it is built
+    separately there, not through this helper."""
+    return f"{seed_id}:{rec_id}"
 
 
 def _enqueue(job_id: str, fields: dict) -> bool:
@@ -224,10 +272,11 @@ def _enqueue(job_id: str, fields: dict) -> bool:
     existing = db().jobs.find_one({"_id": job_id}, {"state": 1})
     if existing and existing["state"] in ("queued", "running"):
         return False
-    db().jobs.replace_one(
+    db().jobs.update_one(
         {"_id": job_id},
-        {"_id": job_id, **fields, "state": "queued", "claimed_at": None,
-         "attempts": 0, "error": None, "created_at": _now()},
+        {"$set": {**fields, "state": "queued", "claimed_at": None,
+                  "attempts": 0, "error": None},
+         "$currentDate": {"created_at": True}},
         upsert=True,
     )
     return True
@@ -246,7 +295,8 @@ def enqueue_attribution(seed_id: str, rec_id: str) -> bool:
 def _claim(kind: str) -> dict | None:
     return db().jobs.find_one_and_update(
         {"kind": kind, "state": "queued"},
-        {"$set": {"state": "running", "claimed_at": _now()}, "$inc": {"attempts": 1}},
+        {"$set": {"state": "running"}, "$inc": {"attempts": 1},
+         "$currentDate": {"claimed_at": True}},
         sort=[("created_at", pymongo.ASCENDING)],
         return_document=ReturnDocument.AFTER,
     )
@@ -261,7 +311,9 @@ def dequeue_job(timeout: int = 5) -> tuple[str, str] | None:
             return "embed", job["track_id"]
         job = _claim("attr")
         if job:
-            return "attribution", _attr_pair(job["seed_id"], job["rec_id"])
+            # Pipe-joined, not _attr_pair's colon: scripts/embed_worker.py
+            # splits this payload on "|".
+            return "attribution", f"{job['seed_id']}|{job['rec_id']}"
         if time.monotonic() >= deadline:
             return None
         time.sleep(_POLL_S)
