@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import { gaussianCurve, scaleBars } from "./histogram";
 import { Artwork } from "../components/Artwork";
@@ -7,15 +7,51 @@ import type { Track, VizHistogram, VizHubs, VizMap } from "../api/types";
 
 interface Props {
   trackId: string;
-  selectedId: string | null;
-  onSelect: (id: string | null) => void;
 }
 
 type Status = "loading" | "ready" | "error";
-type Correction = "off" | "on";
+
+interface ComparisonRow {
+  track: Track;
+  rawScore?: number;
+  correctedScore?: number;
+  rawRank?: number;
+  correctedRank?: number;
+}
 
 const PAD_X = 24;
 const PAD_Y = 16;
+
+// Ordered by the corrected list's order, then any extra raw-only recs.
+function buildComparison(raw: VizMap, corrected: VizMap): ComparisonRow[] {
+  const rawRankById = new Map(raw.recs.map((r, i) => [r.track_id, i + 1]));
+  const rawScoreById = new Map(raw.recs.map((r) => [r.track_id, r.score]));
+
+  const rows: ComparisonRow[] = corrected.recs.map((r, i) => ({
+    track: r,
+    correctedScore: r.score,
+    correctedRank: i + 1,
+    rawScore: rawScoreById.get(r.track_id),
+    rawRank: rawRankById.get(r.track_id),
+  }));
+
+  const seen = new Set(corrected.recs.map((r) => r.track_id));
+  for (const [i, r] of raw.recs.entries()) {
+    if (seen.has(r.track_id)) continue;
+    rows.push({ track: r, rawScore: r.score, rawRank: i + 1 });
+  }
+  return rows;
+}
+
+// "↑2" moved up (better) two ranks by correction, "↓1" moved down one, "·" unchanged or
+// not comparable (missing from one side).
+function rankBadge(rawRank: number | undefined, correctedRank: number | undefined): string {
+  if (rawRank === undefined || correctedRank === undefined) return "·";
+  const diff = rawRank - correctedRank;
+  if (diff > 0) return `↑${diff}`;
+  if (diff < 0) return `↓${-diff}`;
+  return "·";
+}
 
 function HubRail({
   title,
@@ -52,53 +88,44 @@ function HubRail({
   );
 }
 
-export function Proof({ trackId, selectedId, onSelect }: Props) {
+export function Proof({ trackId }: Props) {
   const [status, setStatus] = useState<Status>("loading");
   const [hist, setHist] = useState<VizHistogram | null>(null);
   const [hubs, setHubs] = useState<VizHubs | null>(null);
-
-  const [correction, setCorrection] = useState<Correction>("off");
+  const [rawMap, setRawMap] = useState<VizMap | null>(null);
   const [correctedMap, setCorrectedMap] = useState<VizMap | null>(null);
-  const [correctedStatus, setCorrectedStatus] = useState<Status>("loading");
+  const [reloadKey, setReloadKey] = useState(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const { play } = usePlayer();
 
-  const run = useCallback(async () => {
+  useEffect(() => {
+    let cancelled = false;
     setStatus("loading");
-    try {
-      const [h, hb] = await Promise.all([api.vizHistogram(trackId), api.vizHubs()]);
-      setHist(h);
-      setHubs(hb);
-      setStatus("ready");
-    } catch {
-      setStatus("error");
-    }
-  }, [trackId]);
-
-  useEffect(() => {
-    void run();
-  }, [run]);
-
-  const runCorrected = useCallback(
-    async (c: Correction) => {
-      setCorrectedStatus("loading");
+    (async () => {
       try {
-        const result = await api.vizMap(trackId, "surprise", 10, c);
-        setCorrectedMap(result);
-        setCorrectedStatus("ready");
+        const [h, hb, raw, corrected] = await Promise.all([
+          api.vizHistogram(trackId),
+          api.vizHubs(),
+          api.vizMap(trackId, "surprise", 10, "off"),
+          api.vizMap(trackId, "surprise", 10, "on"),
+        ]);
+        if (cancelled) return;
+        setHist(h);
+        setHubs(hb);
+        setRawMap(raw);
+        setCorrectedMap(corrected);
+        setStatus("ready");
       } catch {
-        setCorrectedStatus("error");
+        if (!cancelled) setStatus("error");
       }
-    },
-    [trackId],
-  );
-
-  useEffect(() => {
-    void runCorrected(correction);
-  }, [correction, runCorrected]);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [trackId, reloadKey]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -165,7 +192,8 @@ export function Proof({ trackId, selectedId, onSelect }: Props) {
     // Yellow ticks at each rec score.
     ctx.strokeStyle = "#FFD60A";
     ctx.lineWidth = 2;
-    for (const score of hist.rec_scores) {
+    for (const rawScore of hist.rec_scores) {
+      const score = Math.min(1, Math.max(-1, rawScore));
       const sx = xToScreen(score);
       ctx.beginPath();
       ctx.moveTo(sx, PAD_Y + innerH);
@@ -177,11 +205,11 @@ export function Proof({ trackId, selectedId, onSelect }: Props) {
   if (status === "loading") {
     return <p className="hint">Loading proof…</p>;
   }
-  if (status === "error" || !hist || !hubs) {
+  if (status === "error" || !hist || !hubs || !rawMap || !correctedMap) {
     return (
       <div className="error-box">
         <p>Couldn&apos;t load the proof data.</p>
-        <button type="button" onClick={() => void run()}>
+        <button type="button" onClick={() => setReloadKey((k) => k + 1)}>
           Try again
         </button>
       </div>
@@ -189,6 +217,7 @@ export function Proof({ trackId, selectedId, onSelect }: Props) {
   }
 
   const percentile = Math.round(hist.percentile);
+  const comparisonRows = buildComparison(rawMap, correctedMap);
 
   return (
     <div className="proof">
@@ -202,43 +231,33 @@ export function Proof({ trackId, selectedId, onSelect }: Props) {
       </div>
       <p className="mono proof-caption">seed&apos;s recs sit at the {percentile}th percentile</p>
 
-      <div className="proof-correction">
-        <span className="proof-correction-label">Correction</span>
-        <div className="segmented-control proof-correction-toggle">
-          {(["off", "on"] as Correction[]).map((c) => (
-            <button
-              key={c}
-              type="button"
-              className={`segmented-control-item${correction === c ? " segmented-control-item-active" : ""}`}
-              onClick={() => setCorrection(c)}
-            >
-              {c}
-            </button>
-          ))}
+      <div className="proof-corrected-list">
+        <div className="proof-corrected-header mono">
+          <span className="proof-corrected-header-title" />
+          <span className="proof-corrected-score-heading">raw</span>
+          <span className="proof-corrected-score-heading">corrected</span>
+          <span className="proof-corrected-rank-heading" />
         </div>
+        {comparisonRows.map((row) => (
+          <button
+            key={row.track.track_id}
+            type="button"
+            className="proof-corrected-item"
+            onClick={() => play(row.track)}
+            aria-label={`Play ${row.track.title}`}
+          >
+            <span className="proof-corrected-title">{row.track.title}</span>
+            <span className="proof-corrected-artist">{row.track.artist}</span>
+            <span className="mono proof-corrected-score">
+              {row.rawScore !== undefined ? row.rawScore.toFixed(4) : "—"}
+            </span>
+            <span className="mono proof-corrected-score">
+              {row.correctedScore !== undefined ? row.correctedScore.toFixed(4) : "—"}
+            </span>
+            <span className="mono proof-corrected-rank">{rankBadge(row.rawRank, row.correctedRank)}</span>
+          </button>
+        ))}
       </div>
-
-      {correctedStatus === "loading" && <p className="hint">Loading recs…</p>}
-      {correctedStatus === "error" && <p className="error-box">Couldn&apos;t load the corrected recs.</p>}
-      {correctedStatus === "ready" && correctedMap && (
-        <div className="proof-corrected-list">
-          {correctedMap.recs.map((rec) => (
-            <button
-              key={rec.track_id}
-              type="button"
-              className={`proof-corrected-item${selectedId === rec.track_id ? " proof-corrected-item-selected" : ""}`}
-              onClick={() => {
-                play(rec);
-                onSelect(rec.track_id);
-              }}
-            >
-              <span className="proof-corrected-title">{rec.title}</span>
-              <span className="proof-corrected-artist">{rec.artist}</span>
-              <span className="mono proof-corrected-score">{rec.score.toFixed(4)}</span>
-            </button>
-          ))}
-        </div>
-      )}
 
       <HubRail title="Hubs" items={hubs.hubs} badge={(item) => `×${item.count ?? 0}`} />
       <HubRail title="Central" items={hubs.central} badge={(item) => (item.centrality ?? 0).toFixed(3)} />

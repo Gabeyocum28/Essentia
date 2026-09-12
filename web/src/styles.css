@@ -128,17 +128,18 @@ a { color: var(--accent); }
 .proof-axis-labels { display: flex; justify-content: space-between; color: var(--muted); margin: 0; }
 .proof-caption { color: var(--muted); margin: 0; }
 
-.proof-correction { display: flex; align-items: center; gap: 12px; }
-.proof-correction-label { color: var(--muted); }
-.proof-correction-toggle { flex: 0 0 auto; width: 140px; margin-bottom: 0; }
-
 .proof-corrected-list { display: flex; flex-direction: column; gap: 4px; }
+.proof-corrected-header { display: flex; align-items: center; gap: 8px; padding: 0 0 2px; color: var(--muted);
+  font-size: 12px; }
+.proof-corrected-header-title { flex: 1; min-width: 0; }
+.proof-corrected-score-heading { width: 64px; text-align: right; flex-shrink: 0; }
+.proof-corrected-rank-heading { width: 32px; flex-shrink: 0; }
 .proof-corrected-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer;
   text-align: left; width: 100%; }
-.proof-corrected-item-selected { color: var(--accent); }
 .proof-corrected-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .proof-corrected-artist { color: var(--muted); font-size: 13px; flex-shrink: 0; }
-.proof-corrected-score { color: var(--muted); flex-shrink: 0; }
+.proof-corrected-score { color: var(--muted); flex-shrink: 0; width: 64px; text-align: right; }
+.proof-corrected-rank { color: var(--muted); flex-shrink: 0; width: 32px; text-align: right; }
 
 .proof-rail { display: flex; flex-direction: column; gap: 6px; }
 .proof-rail-title { color: var(--muted); font-size: 13px; }

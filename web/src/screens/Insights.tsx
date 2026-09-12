@@ -76,7 +76,9 @@ export function Insights() {
           {selectedRec && (
             <>
               <MathPanel rec={selectedRec} />
-              <WhySimilar seedId={map.seed.track_id} recId={selectedRec.track_id} />
+              {mode === "PROOF" && (
+                <WhySimilar seedId={map.seed.track_id} recId={selectedRec.track_id} />
+              )}
             </>
           )}
 
@@ -121,7 +123,7 @@ export function Insights() {
 
           {mode === "PROOF" && (
             <>
-              <Proof trackId={id} selectedId={selectedId} onSelect={setSelectedId} />
+              <Proof trackId={id} />
               <Extremes />
             </>
           )}

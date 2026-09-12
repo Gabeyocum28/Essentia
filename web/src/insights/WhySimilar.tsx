@@ -75,8 +75,12 @@ export function WhySimilar({ seedId, recId }: Props) {
     return <p className="error-box why-similar">{data?.error ?? "Something went wrong"}</p>;
   }
 
-  if (phase === "pending" || !data || !data.bands) {
+  if (phase === "pending" || !data) {
     return <p className="hint why-similar">Working out why these sound alike…</p>;
+  }
+
+  if (!data.bands) {
+    return <p className="error-box why-similar">No attribution data.</p>;
   }
 
   const bands = data.bands;
