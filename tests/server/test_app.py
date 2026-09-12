@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from music_recommendations.server import app as app_module
@@ -644,3 +645,60 @@ def test_root_is_404_without_a_build(monkeypatch, tmp_path, fake_mongo):
     monkeypatch.setenv("WEB_DIST", str(tmp_path / "missing"))
     with TestClient(app_module.app) as c:
         assert c.get("/").status_code == 404
+
+
+def test_dotdot_path_traversal_cannot_escape_web_dist(monkeypatch, tmp_path, fake_mongo):
+    """``..`` segments used to be joined onto WEB_DIST unresolved, so a
+    request for a file just outside the dist root would be served straight
+    off disk. httpx normalizes ".." before it ever reaches the server, so
+    the direct calls below -- not client.get -- are what actually exercise
+    the vulnerable join; the client.get call just confirms the end-to-end
+    behavior stays a 404 either way."""
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<html><body>spa</body></html>")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do not serve me")
+    monkeypatch.setenv("WEB_DIST", str(dist))
+
+    with pytest.raises(HTTPException) as exc:
+        app_module.spa_fallback("../secret.txt")
+    assert exc.value.status_code == 404
+
+    with pytest.raises(HTTPException) as exc:
+        app_module.spa_fallback("assets/../../secret.txt")
+    assert exc.value.status_code == 404
+
+    with TestClient(app_module.app) as c:
+        assert c.get("/../../pyproject.toml").status_code == 404
+
+
+def test_absolute_and_double_slash_paths_cannot_escape_web_dist(monkeypatch, tmp_path, fake_mongo):
+    """Path("/x") / "/etc/passwd" == "/etc/passwd" -- an absolute right
+    operand discards the left, so a path segment that is itself absolute
+    used to reach straight past WEB_DIST onto the real filesystem."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html><body>spa</body></html>")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do not serve me")
+    monkeypatch.setenv("WEB_DIST", str(dist))
+
+    # An absolute path parameter -- the exact case the join bug affected.
+    with pytest.raises(HTTPException) as exc:
+        app_module.spa_fallback(str(secret))
+    assert exc.value.status_code == 404
+
+    # A leading double slash (e.g. from a proxy that doesn't collapse it)
+    # must not bypass containment either.
+    with pytest.raises(HTTPException) as exc:
+        app_module.spa_fallback("//../secret.txt")
+    assert exc.value.status_code == 404
+
+    # A real request for a no-extension, absolute-looking path never reaches
+    # disk at all: it falls back to the SPA shell like any other unknown
+    # client-side route, so "//etc/hostname" can't leak the real file either.
+    with TestClient(app_module.app) as c:
+        r = c.get("//etc/hostname")
+        assert r.status_code == 200
+        assert r.text.endswith("spa</body></html>")

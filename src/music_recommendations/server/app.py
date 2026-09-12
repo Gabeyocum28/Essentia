@@ -953,8 +953,13 @@ def spa_root() -> FileResponse:
 @app.get("/{path:path}", include_in_schema=False)
 def spa_fallback(path: str) -> FileResponse:
     if "." in path.rsplit("/", 1)[-1]:
-        file = _web_dist() / path
-        if file.is_file():
-            return FileResponse(file)
-        raise HTTPException(404)
+        # Containment check: Path("/x") / "/etc/passwd" == "/etc/passwd" (an
+        # absolute right operand discards the left), and ".." segments are
+        # only normalized by well-behaved clients/proxies, not by us. Resolve
+        # both sides and require the result to still live under the root.
+        root = _web_dist().resolve()
+        file = (root / path.lstrip("/")).resolve()
+        if not file.is_relative_to(root) or not file.is_file():
+            raise HTTPException(404)
+        return FileResponse(file)
     return _spa_index()
