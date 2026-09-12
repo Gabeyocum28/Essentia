@@ -1,5 +1,5 @@
 """store.py: the Atlas document layout from the module docstring."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 
 import numpy as np
 
@@ -105,12 +105,23 @@ def test_base_matrix_rows_match_ids(fake_mongo):
 
 
 def test_tracks_since_returns_only_newer(fake_mongo):
+    # Inclusive of the boundary stamp: millisecond-resolution timestamps
+    # mean "old" itself may legitimately come back when queried with its
+    # own analyzed_at (see tracks_since's docstring) -- callers dedupe by
+    # id. What must hold is that "new" is present, and that a stamp
+    # strictly after both returns nothing.
     store.put_track({**TRACK, "track_id": "old"}, {"embedding": [1.0]})
     stamp = store.get_analyzed_at("old")
     store.put_track({**TRACK, "track_id": "new"}, {"embedding": [2.0]})
-    got = store.tracks_since(stamp)
-    assert [tid for tid, _ in got] == ["new"]
-    assert store.tracks_since(datetime.now(timezone.utc)) == []
+    got = [tid for tid, _ in store.tracks_since(stamp)]
+    assert "new" in got
+    # A stamp built to be unambiguously later than both writes, rather than
+    # a fresh `_now()` call racing "new" for the same millisecond (which
+    # $gte would then legitimately include) -- deterministic without a
+    # sleep. Naive, matching store.py's own naive-UTC timestamps: an aware
+    # datetime compared against mongomock's stored naive values is not
+    # reliable (mongomock's $gte mishandles aware-vs-naive).
+    assert store.tracks_since(store._now() + timedelta(seconds=1)) == []
 
 
 

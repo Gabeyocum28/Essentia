@@ -38,34 +38,9 @@ _client: pymongo.MongoClient | None = None
 _indexes_ready = False
 _lock = threading.Lock()
 
-_now_lock = threading.Lock()
-_last_now: datetime | None = None
-
 
 def _now() -> datetime:
-    """Naive UTC, monotonically increasing within this process.
-
-    MongoDB (mongomock included) stores datetimes at millisecond
-    resolution. Two calls close enough together would otherwise tie, and
-    corpus_ids()/tracks_since() rely on strict "$gt newest" to find only
-    newly-analyzed rows -- a tie would silently drop a row. Rather than
-    fabricating a value ahead of the real clock (which would make a
-    newly-written row look newer than a `datetime.now()` taken by a caller
-    moments later), spin until the wall clock itself ticks over to the next
-    millisecond. That costs at most ~1ms and only when two writes race.
-    """
-    global _last_now
-    with _now_lock:
-        while True:
-            now = datetime.utcnow()
-            # Round to millisecond precision up front: that is what a round
-            # trip through Mongo storage will truncate it to anyway, and
-            # the monotonic check below has to compare like with like.
-            now = now.replace(microsecond=(now.microsecond // 1000) * 1000)
-            if _last_now is None or now > _last_now:
-                _last_now = now
-                return now
-            time.sleep(0.0002)
+    return datetime.utcnow()
 
 
 def db():
@@ -81,11 +56,10 @@ def db():
 
 def reset() -> None:
     """Forget the client and caches (tests, and after a fork)."""
-    global _client, _indexes_ready, _ids_cache, _last_now
+    global _client, _indexes_ready, _ids_cache
     _client = None
     _indexes_ready = False
     _ids_cache = None
-    _last_now = None
 
 
 def ensure_indexes() -> None:
@@ -170,8 +144,19 @@ def get_analyzed_at(track_id: str) -> datetime | None:
 
 
 def tracks_since(stamp: datetime) -> list[tuple[str, np.ndarray]]:
-    """(id, float32 vector) for every track analyzed strictly after `stamp`."""
-    cursor = db().tracks.find({"analyzed_at": {"$gt": stamp}},
+    """(id, float32 vector) for every track analyzed at or after `stamp`.
+
+    Inclusive, not strict: MongoDB stores datetimes at millisecond
+    resolution and the API and the embed worker are separate processes, so
+    two tracks analyzed within the same millisecond (by the same process or
+    different ones) can legitimately tie on `analyzed_at`. A strict `$gt`
+    would then silently drop whichever of the tied rows a caller already
+    has the watermark for. Using `$gte` means the boundary row (the one
+    exactly at `stamp`) can come back again; callers that page through this
+    by re-using the last-seen `analyzed_at` as the next `stamp` must dedupe
+    by track id.
+    """
+    cursor = db().tracks.find({"analyzed_at": {"$gte": stamp}},
                               {"embedding": 1, "scale": 1}).sort("analyzed_at", 1)
     return [(d["_id"], from_int8(d["embedding"], d["scale"])) for d in cursor]
 
@@ -193,7 +178,11 @@ def corpus_ids() -> list[str]:
             _ids_cache = (newest, sorted(d["_id"] for d in docs))
             return list(_ids_cache[1])
         newest, ids = _ids_cache
-        fresh = list(db().tracks.find({"analyzed_at": {"$gt": newest}}, {"analyzed_at": 1}))
+        # $gte, not $gt: millisecond-resolution timestamps mean a track
+        # analyzed in another process within the same millisecond as the
+        # watermark would otherwise be missed. Re-fetching the watermark
+        # row itself is harmless -- the set union below dedupes it.
+        fresh = list(db().tracks.find({"analyzed_at": {"$gte": newest}}, {"analyzed_at": 1}))
         if fresh:
             newest = max(d["analyzed_at"] for d in fresh)
             ids = sorted(set(ids) | {d["_id"] for d in fresh})
@@ -304,7 +293,11 @@ def fail_job(job_id: str, error: str) -> None:
 
 
 def requeue_stale(max_age_s: int = 600, max_attempts: int = 3) -> int:
-    """Return jobs stuck in `running` to `queued`, or fail them past the cap."""
+    """Return jobs stuck in `running` to `queued`, or fail them past the cap.
+
+    `attempts` is incremented by `_claim()` on every dequeue, so the cap
+    counts total claims (including the one currently stuck), not retries.
+    """
     cutoff = _now() - timedelta(seconds=max_age_s)
     stale = list(db().jobs.find({"state": "running", "claimed_at": {"$lt": cutoff}}))
     for job in stale:
