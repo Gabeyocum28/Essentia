@@ -17,4 +17,5 @@ RUN pip install --no-cache-dir -e ".[analysis]"
 RUN python3 scripts/fetch_models.py
 
 ENV TF_CPP_MIN_LOG_LEVEL=2
-CMD ["python3", "-c", "import music_recommendations.analysis as a; print('analysis ok, v', a.FEATURES_VERSION)"]
+EXPOSE 8000
+CMD ["uvicorn", "music_recommendations.server.app:app", "--host", "0.0.0.0", "--port", "8000"]

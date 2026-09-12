@@ -11,6 +11,7 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .env
+deploy/.env
 ios/**/xcuserdata/
 
 # legacy MVP derived artifacts (library.json IS committed: it carries the

@@ -1,0 +1,43 @@
+# Essentia stack. Lives at /home/ubuntu/stacks/essentia (a git checkout of the
+# repo) on the VM; run from there:
+#   docker compose -f deploy/docker-compose.yml up -d --build
+# Nothing here binds a host port: Caddy (~/stacks/caddy) reaches the API by
+# container name over the external `web` network. See deploy/README.md.
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: essentia:local
+    container_name: essentia-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TF_CPP_MIN_LOG_LEVEL: "2"
+    command: >
+      uvicorn music_recommendations.server.app:app
+      --host 0.0.0.0 --port 8000 --workers 1
+      --proxy-headers --forwarded-allow-ips=*
+    expose:
+      - "8000"
+    networks: [web]
+    mem_limit: 4g
+    cpus: 1.5
+
+  worker:
+    image: essentia:local
+    container_name: essentia-worker
+    restart: unless-stopped
+    depends_on: [api]
+    env_file: .env
+    environment:
+      TF_CPP_MIN_LOG_LEVEL: "2"
+    command: python -m music_recommendations.worker
+    networks: [web]
+    mem_limit: 3g
+    cpus: 1.0
+
+networks:
+  web:
+    external: true

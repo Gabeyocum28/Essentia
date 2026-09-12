@@ -9,3 +9,5 @@ models
 .venv
 __pycache__
 *.pyc
+deploy/.env
+tests
