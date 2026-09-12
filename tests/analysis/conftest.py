@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 import wave
 from pathlib import Path
 
@@ -9,6 +11,24 @@ import numpy as np
 import pytest
 
 SR = 16000
+
+
+def run_essentia(script: str, out: Path) -> np.ndarray:
+    """Run `script` in a subprocess (it must np.save its result to `out`).
+
+    Essentia and TensorFlow cannot both be loaded in one process (they
+    deadlock/abort — verified locally), and this test suite also exercises
+    embedding.py's TensorFlow graph. So the essentia reference is always
+    computed out of process, and only numpy arrays cross back over.
+    """
+    try:
+        subprocess.run(
+            [sys.executable, "-c", script], check=True,
+            capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"essentia subprocess failed:\n{e.stderr}") from e
+    return np.load(out)
 
 
 def write_tone_wav(path: Path, seconds: float = 3.0, hz: float = 440.0,

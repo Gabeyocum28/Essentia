@@ -6,8 +6,9 @@ tracks with 30 s previews. Design: `Essencia_design_spec.md`.
 
 ## Setup
 
-    python3 -m pip install -e ".[dev]"     # or: uv sync
-    python3 scripts/fetch_models.py        # downloads EffNet + heads into models/
+    python3 -m pip install -e ".[dev,analysis]"   # analysis extra = tensorflow
+    brew install ffmpeg                            # or apt install ffmpeg
+    python3 scripts/fetch_models.py                # downloads EffNet into models/
     redis-server &                          # storage
     uvicorn music_recommendations.server.app:app --reload
 

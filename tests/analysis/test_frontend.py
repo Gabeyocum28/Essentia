@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import subprocess
-import sys
-
 import numpy as np
 import pytest
 
 from music_recommendations.analysis import frontend
-from tests.analysis.conftest import SR, needs_essentia
+from tests.analysis.conftest import SR, needs_essentia, run_essentia
 
 
 def test_decode_returns_mono_16k_float32(tone_wav):
@@ -25,10 +22,8 @@ def test_decode_missing_file_raises(tmp_path):
 
 @needs_essentia
 def test_decode_matches_essentia_monoloader(tone_wav, tmp_path):
-    # Essentia and TensorFlow cannot both be loaded in one process (they
-    # deadlock/abort — verified locally), and this test suite also exercises
-    # embedding.py's TensorFlow graph. Run the essentia reference decode in
-    # a subprocess so the two never share a process.
+    # See conftest.run_essentia: essentia and TensorFlow cannot share a
+    # process, so the reference decode runs out of process.
     ref_path = tmp_path / "ref.npy"
     script = (
         "import numpy as np\n"
@@ -36,8 +31,7 @@ def test_decode_matches_essentia_monoloader(tone_wav, tmp_path):
         f"ref = MonoLoader(filename={str(tone_wav)!r}, sampleRate={SR})()\n"
         f"np.save({str(ref_path)!r}, ref)\n"
     )
-    subprocess.run([sys.executable, "-c", script], check=True)
-    ref = np.load(ref_path)
+    ref = run_essentia(script, ref_path)
 
     ours = frontend.decode(tone_wav)
     n = min(len(ours), len(ref))
@@ -110,8 +104,7 @@ def test_mel_frames_match_essentia_input_musicnn(tmp_path):
         "    refs.append(ref_fn(frame))\n"
         f"np.save({str(ref_path)!r}, np.array(refs))\n"
     )
-    subprocess.run([sys.executable, "-c", script], check=True)
-    refs = np.load(ref_path)
+    refs = run_essentia(script, ref_path)
 
     for row, i in enumerate(indices):  # a spread of full frames
         ref = refs[row]
