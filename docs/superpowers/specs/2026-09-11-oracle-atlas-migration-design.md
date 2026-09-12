@@ -57,8 +57,9 @@ Folder: `src/music_recommendations/analysis/`, `tests/analysis/`.
   expects, matching Essentia's `TensorflowInputMusiCNN`: 512-sample frames,
   256 hop, Hann window, 96 mel bands over 0–8000 Hz computed from the power
   spectrum, then `log10(1 + 10000 * x)`. Patches of 128 frames with hop 62,
-  as Essentia's `TensorflowPredictEffnetDiscogs` uses, with zero padding on
-  the last patch.
+  as Essentia's `TensorflowPredictEffnetDiscogs` uses; a trailing partial
+  patch is discarded, and the last batch is zero-padded to the graph's fixed
+  batch of 64 with the padding rows dropped from the output.
 - `embedding.py` (rewritten). Loads `discogs-effnet-bs64-1.pb` with
   `tf.compat.v1` graph import once per process, feeds
   `serving_default_melspectrogram`, reads `PartitionedCall:1`, and returns
