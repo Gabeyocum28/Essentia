@@ -1,16 +1,9 @@
-"""embed_worker.py: pop queued tracks, analyze locally, write back to the store."""
-import importlib.util
-from pathlib import Path
-
+"""worker.py: embed queued tracks, run attributions, crawl when idle."""
 import numpy as np
 import pytest
 
+from music_recommendations import worker
 from music_recommendations.server import store
-
-SCRIPT = Path(__file__).parents[2] / "scripts" / "embed_worker.py"
-spec = importlib.util.spec_from_file_location("embed_worker", SCRIPT)
-worker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(worker)
 
 TRACK = {
     "track_id": "42",
@@ -343,3 +336,66 @@ def test_attribution_never_clips_a_hot_counterfactual(fake_mongo, embedding_stub
 
     assert len(peaks) == 11
     assert max(peaks) < 32767          # nothing pinned to the rail
+
+
+# ---- crawl + first-boot seed ----
+
+def _tracks(ids):
+    return [{"track_id": i, "title": f"t{i}", "artist": "a", "album": "b",
+             "artwork_url": "u", "preview_url": "p"} for i in ids]
+
+
+def test_seed_fixture_if_empty_enqueues_all_thirty_once(fake_mongo):
+    assert worker.seed_fixture_if_empty() == 30
+    assert store.queued_count() == 30
+    # Guard is "nothing queued and empty corpus": a second call is a no-op.
+    assert worker.seed_fixture_if_empty() == 0
+    assert store.queued_count() == 30
+
+
+def test_seed_fixture_skipped_when_corpus_has_tracks(fake_mongo):
+    store.put_track(_tracks(["x"])[0], {"embedding": [1.0]})
+    assert worker.seed_fixture_if_empty() == 0
+
+
+def test_crawl_step_enqueues_unseen_tracks_and_advances_cursor(fake_mongo, monkeypatch):
+    calls = []
+    monkeypatch.setattr(worker.crawl, "from_charts",
+                        lambda genre_ids, per_genre=100: (calls.append(("charts", genre_ids)), _tracks(["1", "2", "3"]))[1])
+    monkeypatch.setattr(worker.crawl, "snowball",
+                        lambda root_names, hops=1, per_artist=20: (calls.append(("snowball", root_names)), _tracks(["3", "4"]))[1])
+    store.put_track(_tracks(["2"])[0], {"embedding": [1.0]})      # already analyzed
+    assert worker.crawl_step() == 2                                 # 1 and 3
+    assert store.get_state("crawl") == {"step": 1}
+    assert worker.crawl_step() == 1                                 # 4 (3 is queued already)
+    assert store.get_state("crawl") == {"step": 2}
+    assert calls[0][0] == "charts" and calls[1][0] == "snowball"
+    assert store.get_track("1")["title"] == "t1"                    # meta stored for the queue
+
+
+def test_crawl_step_respects_corpus_cap_and_queue_depth(fake_mongo, monkeypatch):
+    monkeypatch.setattr(worker, "CORPUS_CAP", 1)
+    store.put_track(_tracks(["x"])[0], {"embedding": [1.0]})
+    assert worker.crawl_step() == 0
+    monkeypatch.setattr(worker, "CORPUS_CAP", 100000)
+    monkeypatch.setattr(worker, "MAX_QUEUED", 1)
+    store.enqueue_embed("q1")
+    assert worker.crawl_step() == 0
+
+
+def test_tick_crawls_only_when_idle_and_rate_limited(fake_mongo, monkeypatch):
+    crawls = []
+    monkeypatch.setattr(worker, "crawl_step", lambda: crawls.append(1) or 0)
+    monkeypatch.setattr(worker.store, "requeue_stale", lambda: 0)
+    monkeypatch.setattr(worker.store, "dequeue_job", lambda timeout=5: None)
+    monkeypatch.setattr(worker, "CRAWL_INTERVAL_S", 1000)
+    worker._last_crawl = 0.0
+    worker._tick()
+    worker._tick()
+    assert crawls == [1]                                            # second tick inside the interval
+    store.enqueue_embed("busy")
+    monkeypatch.setattr(worker.store, "dequeue_job", lambda timeout=5: ("embed", "busy"))
+    monkeypatch.setattr(worker, "process_job", lambda tid: True)
+    worker._last_crawl = 0.0
+    worker._tick()
+    assert crawls == [1]                                            # busy tick never crawls
