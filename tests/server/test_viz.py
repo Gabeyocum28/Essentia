@@ -750,6 +750,31 @@ def test_viz_subset_without_seed_is_the_first_rows(fake_mongo, monkeypatch):
     assert ids == ["a", "b"] and matrix.shape == (2, 2)
 
 
+def test_viz_subset_cache_tracks_a_grown_full_matrix(client, fake_mongo, monkeypatch):
+    """The cached subset must not outlive the full matrix it was sliced
+    from: id(matrix) can be reused by an unrelated array once _MATRIX_CACHE
+    replaces the original during a crawl, so the cache verifies identity on
+    the stored full matrix rather than trusting the id-keyed lookup alone."""
+    from music_recommendations.server import app as app_mod
+    monkeypatch.setattr(app_mod, "VIZ_MAX", 10)
+    for tid, v in {"a": [1, 0], "b": [0.9, 0.1]}.items():
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+    ids, _ = app_mod._viz_subset("a")
+    assert set(ids) == {"a", "b"}
+
+    store.put_track({**TRACK, "track_id": "c"}, {"embedding": [0.5, 0.5]})
+    # Force _MATRIX_CACHE to grow via a fresh request through the client.
+    client.get("/viz/hubs", params={"track_id": "a"})
+
+    ids2, matrix2 = app_mod._viz_subset("a")
+    assert "c" in ids2
+
+    current_matrix = app_mod._MATRIX_CACHE["embedding"].matrix
+    assert matrix2 is not current_matrix               # the subset is a copy, not a view
+    cached = app_mod._SUBSET_CACHE[(id(current_matrix), "a", ())]
+    assert cached[0] is current_matrix                  # the cache entry tracks the CURRENT full matrix
+
+
 def test_tour_and_mst_share_the_subset_for_a_seed(client, fake_mongo, monkeypatch):
     from music_recommendations.server import app as app_mod
     monkeypatch.setattr(app_mod, "VIZ_MAX", 3)

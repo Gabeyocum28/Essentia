@@ -703,18 +703,22 @@ def viz_map(track_id: str, axis: str,
 # (not cached at import) so tests can monkeypatch it per-test.
 VIZ_MAX = int(os.environ.get("VIZ_MAX", "8000"))
 
-# Seed id + extra ids -> (ids, matrix) for that seed's subset. Values hold a
-# reference to the matrix rows they were built from, which — together with
-# the 2-entry cap — keeps at most two subset matrices alive at once; this is
-# also what keeps id(matrix) from being reused by an unrelated array while a
-# _TOP8_CACHE/_MST_CACHE entry still refers to it by that id.
-_SUBSET_CACHE: "OrderedDict[tuple[int, str | None, tuple[str, ...]], tuple[list[str], np.ndarray]]" = OrderedDict()
+# Seed id + extra ids -> (matrix_all, ids, subset_matrix) for that seed's
+# subset. The full matrix the subset was sliced from is stored alongside it
+# (mirroring _top8/_mst) and re-checked with `is` on every lookup: the
+# subset itself is a COPY, not a view, so it does not by itself keep
+# id(matrix_all) from being reused by a later, differently-sized matrix once
+# _MATRIX_CACHE replaces the original during a crawl. A key whose stored
+# matrix no longer matches is evicted and treated as a miss rather than
+# risking rows from a stale corpus. The 2-entry cap otherwise keeps at most
+# two subset matrices alive at once, alternating between two seeds.
+_SUBSET_CACHE: "OrderedDict[tuple[int, str | None, tuple[str, ...]], tuple[np.ndarray, list[str], np.ndarray]]" = OrderedDict()
 _SUBSET_KEEP = 2
 
 
 def _viz_subset(seed_id: str | None,
                extra_ids: "list[str] | tuple[str, ...]" = ()) -> tuple[list[str], np.ndarray]:
-    """At most VIZ_MAX rows of the corpus for the insights endpoints.
+    """VIZ_MAX rows plus any extra ids, of the corpus, for the insights endpoints.
 
     With a seed: the seed plus its VIZ_MAX-1 nearest tracks by cosine over the
     FULL matrix (one matrix-vector product), plus any extra ids the caller
@@ -728,8 +732,10 @@ def _viz_subset(seed_id: str | None,
     key = (id(matrix_all), seed_id, extra)
     cached = _SUBSET_CACHE.get(key)
     if cached is not None:
-        _SUBSET_CACHE.move_to_end(key)
-        return cached
+        if cached[0] is matrix_all:
+            _SUBSET_CACHE.move_to_end(key)
+            return cached[1], cached[2]
+        del _SUBSET_CACHE[key]
 
     n = len(ids_all)
     if seed_id is None or seed_id not in ids_all:
@@ -745,11 +751,12 @@ def _viz_subset(seed_id: str | None,
     rows |= {index[t] for t in extra}
     rows = np.array(sorted(rows))
 
-    subset = (list(np.array(ids_all, dtype=object)[rows]), np.ascontiguousarray(matrix_all[rows]))
-    _SUBSET_CACHE[key] = subset
+    ids, subset_matrix = (list(np.array(ids_all, dtype=object)[rows]),
+                          np.ascontiguousarray(matrix_all[rows]))
+    _SUBSET_CACHE[key] = (matrix_all, ids, subset_matrix)
     while len(_SUBSET_CACHE) > _SUBSET_KEEP:
         _SUBSET_CACHE.popitem(last=False)
-    return subset
+    return ids, subset_matrix
 
 
 def _viz_subset_min2(seed_id: str | None) -> tuple[list[str], np.ndarray]:
