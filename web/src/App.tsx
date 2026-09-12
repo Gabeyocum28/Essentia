@@ -1,5 +1,49 @@
+import { BrowserRouter, Link, Route, Routes, useLocation } from "react-router-dom";
+import { PlayerProvider } from "./player/usePlayer";
+import { Player } from "./player/Player";
+import { Search } from "./screens/Search";
+import { Seed } from "./screens/Seed";
+import { Recommendations } from "./screens/Recommendations";
+
+function Insights() {
+  return (
+    <div className="screen">
+      <p className="hint">Insights coming next</p>
+    </div>
+  );
+}
+
+function TopBar() {
+  const location = useLocation();
+  return (
+    <div className="top-bar">
+      <Link to="/" className="top-bar-title">
+        Essentia
+      </Link>
+      {location.pathname !== "/" && (
+        <Link to="/" className="top-bar-back">
+          ← Back
+        </Link>
+      )}
+    </div>
+  );
+}
+
 function App() {
-  return <h1>Essentia</h1>;
+  return (
+    <BrowserRouter>
+      <PlayerProvider>
+        <TopBar />
+        <Routes>
+          <Route path="/" element={<Search />} />
+          <Route path="/seed/:id" element={<Seed />} />
+          <Route path="/recs/:id/:axis" element={<Recommendations />} />
+          <Route path="/insights/:id/:axis" element={<Insights />} />
+        </Routes>
+        <Player />
+      </PlayerProvider>
+    </BrowserRouter>
+  );
 }
 
 export default App;
