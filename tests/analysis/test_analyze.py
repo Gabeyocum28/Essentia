@@ -5,7 +5,8 @@ import importlib.util
 import numpy as np
 
 from music_recommendations.analysis import (FEATURES_VERSION, METRICS,
-                                            analyze_track, as_json)
+                                            analyze_track, analyze_tracks,
+                                            as_json)
 from tests.analysis.conftest import needs_effnet
 
 
@@ -34,3 +35,18 @@ def test_analyze_track_returns_only_embedding(tone_wav):
     assert feats["embedding"].shape == (1280,)
     js = as_json(feats)
     assert len(js["embedding"]) == 1280 and isinstance(js["embedding"][0], float)
+
+
+@needs_effnet
+def test_analyze_tracks_keeps_a_bad_path_from_sinking_the_group(tone_wav, tmp_path):
+    """One unreadable file in a group must not cost the others their
+    analysis: its slot holds the exception, the rest hold features, and the
+    features are the same ones analyze_track would have produced alone."""
+    out = analyze_tracks([tone_wav, tmp_path / "missing.mp3", tone_wav])
+
+    assert isinstance(out[1], Exception)
+    for feats in (out[0], out[2]):
+        assert set(feats) == {"embedding"}
+        assert feats["embedding"].shape == (1280,)
+    assert np.allclose(out[0]["embedding"], analyze_track(tone_wav)["embedding"],
+                       atol=1e-4)
