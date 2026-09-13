@@ -123,8 +123,10 @@ export function Walk({ map, selectedId, onSelect }: Props) {
     if (!canvas || size.width === 0 || size.height === 0) return;
 
     let raf = 0;
+    // Read once per effect, not per frame: canvasPalette() is a dozen
+    // getComputedStyle() calls, and draw() is on requestAnimationFrame.
+    const c = canvasPalette();
     const draw = () => {
-      const c = canvasPalette();
       const dpr = window.devicePixelRatio || 1;
       const applied = appliedSizeRef.current;
       if (applied.width !== size.width || applied.height !== size.height || applied.dpr !== dpr) {

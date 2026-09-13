@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { heatBytes } from "../audio/colormap";
+import { stretch } from "../audio/ssm";
 import type { SoundAnalysis } from "../audio/analyze";
 
 interface Props {
@@ -22,8 +23,11 @@ export function SelfSimilarity({ analysis, onSeek }: Props) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const image = ctx.createImageData(ssmColumns, ssmColumns);
+    // Not (s + 1) / 2: one track's pooled frames are all similar, so the raw
+    // cosines crowd the bright end and the picture came out a flat slab.
+    const shown = stretch(ssm);
     for (let i = 0; i < ssmColumns * ssmColumns; i++) {
-      const [r, g, b] = heatBytes((ssm[i] + 1) / 2); // cosine is [−1, 1]
+      const [r, g, b] = heatBytes(shown[i]);
       image.data[i * 4] = r;
       image.data[i * 4 + 1] = g;
       image.data[i * 4 + 2] = b;

@@ -20,7 +20,17 @@ import numpy as np
 
 
 _PAIRWISE_LOCK = threading.RLock()
-_PAIRWISE_CACHE: tuple[np.ndarray, np.ndarray] | None = None
+# id(matrix) -> (matrix, similarity), same identity-keyed shape as
+# _GRAPH_CACHE below (the matrix is in the value so a recycled id() is a miss,
+# not a wrong answer) and for the same reason: with a seed-anchored subset a
+# caller alternating between two seeds thrashed the single slot this used to
+# be, recomputing a dense n×n every other request.
+#
+# Both caches here are bounded by VIZ_MAX on the subset they hold, and
+# neither is reachable from app's _purge_viz_caches — app clears them only
+# through clear_geometry_cache().
+_PAIRWISE_CACHE: "OrderedDict[int, tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+_PAIRWISE_KEEP = 2
 # (id(matrix), k) -> (matrix, adjacency). The matrix is held in the VALUE ON
 # PURPOSE: keying by bare id(matrix) let the old array be garbage-collected
 # after a corpus growth, and a later array reusing the same address would
@@ -39,9 +49,8 @@ _GRAPH_KEEP = 4
 
 
 def clear_geometry_cache() -> None:
-    global _PAIRWISE_CACHE
     with _PAIRWISE_LOCK:
-        _PAIRWISE_CACHE = None
+        _PAIRWISE_CACHE.clear()
         _GRAPH_CACHE.clear()
 
 
@@ -59,13 +68,18 @@ def pairwise_cosine(matrix: np.ndarray) -> np.ndarray:
     remains a small-corpus visualization primitive — bounded by VIZ_MAX on
     the seed-anchored subset — rather than a ranking dependency.
     """
-    global _PAIRWISE_CACHE
+    key = id(matrix)
     with _PAIRWISE_LOCK:
-        if _PAIRWISE_CACHE is not None and _PAIRWISE_CACHE[0] is matrix:
-            return _PAIRWISE_CACHE[1]
+        cached = _PAIRWISE_CACHE.get(key)
+        if cached is not None and cached[0] is matrix:
+            _PAIRWISE_CACHE.move_to_end(key)
+            return cached[1]
         unit = normalized_rows(matrix)
         similarity = np.clip(unit @ unit.T, -1.0, 1.0)
-        _PAIRWISE_CACHE = (matrix, similarity)
+        _PAIRWISE_CACHE[key] = (matrix, similarity)
+        _PAIRWISE_CACHE.move_to_end(key)
+        while len(_PAIRWISE_CACHE) > _PAIRWISE_KEEP:
+            _PAIRWISE_CACHE.popitem(last=False)
         return similarity
 
 
@@ -192,9 +206,9 @@ def project_top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """(n, d) -> (coords8 (n, 8) float64, variance fractions (8,) float64).
 
     Same row-normalization, mean-centering, and per-component sign-fixing
-    rule as project_2d, extended to all 8 components — columns 0 and 1 are
-    numerically identical to project_2d's output (same components as the
-    thin SVD, computed via the 1280×1280 covariance: 7× faster at 8k rows),
+    rule as project_2d, extended to all 8 components — columns 0 and 1 agree
+    with project_2d's output to float noise (same components as the thin
+    SVD, computed via the 1280×1280 covariance: 7× faster at 8k rows),
     so one decomposition serves /viz/map, /viz/walk, and /viz/tour.
 
     Covariance rather than a thin SVD because d is fixed at 1280 while n

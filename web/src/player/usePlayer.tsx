@@ -49,12 +49,16 @@ const PROXY_LOAD_TIMEOUT_MS = 5000;
 
 /** Swap the element onto the same-origin proxy, keeping position and state.
  *
- * Rejects if the proxy never answers. Without the timeout the await was
- * unbounded: a stalled proxy response fires neither `loadedmetadata` nor
- * `error`, so the solo promise hung forever and every later solo attempt
- * joined the same dead in-flight attach. On timeout the element is put back
- * on the src (and position) it had, so ordinary playback survives a failed
- * SOUND-mode attach. */
+ * Rejects if the proxy never answers, and equally if it answers with an
+ * error. Without the timeout the await was unbounded: a stalled proxy
+ * response fires neither `loadedmetadata` nor `error`, so the solo promise
+ * hung forever and every later solo attempt joined the same dead in-flight
+ * attach. And an `error` used to RESOLVE, which was worse than hanging: the
+ * caller went on to build a source node over an element with no media, so
+ * SOUND mode was permanently silent instead of merely unavailable.
+ *
+ * Either way the element is put back on the src (and position, and play
+ * state) it had, so ordinary playback survives a failed SOUND-mode attach. */
 async function moveToProxy(el: HTMLAudioElement, trackId: string): Promise<void> {
   const wasPlaying = !el.paused;
   const position = el.currentTime;
@@ -69,14 +73,18 @@ async function moveToProxy(el: HTMLAudioElement, trackId: string): Promise<void>
       const cleanup = () => {
         clearTimeout(timer);
         el.removeEventListener("loadedmetadata", done);
-        el.removeEventListener("error", done);
+        el.removeEventListener("error", failed);
       };
       const done = () => {
         cleanup();
         resolve();
       };
+      const failed = () => {
+        cleanup();
+        reject(new Error("the audio proxy failed to load"));
+      };
       el.addEventListener("loadedmetadata", done);
-      el.addEventListener("error", done);
+      el.addEventListener("error", failed);
       el.load?.();
     });
   } catch (err) {
@@ -107,11 +115,25 @@ async function createGraph(): Promise<AudioGraph | null> {
   // Harmless while same-origin; required the day the redirect target grows
   // CORS headers.
   el.crossOrigin = "anonymous";
+
+  // Constructed and resumed BEFORE the await. Safari only lets a context
+  // start inside the user gesture that asked for it, and an `await` ends
+  // that gesture -- building the context after moveToProxy() left it stuck
+  // in "suspended" and every solo silent. The only ordering that actually
+  // matters for correctness is proxy-src-before-createMediaElementSource,
+  // which is still true: the node is made after the await.
+  let context: AudioContext;
+  try {
+    context = new Ctor();
+  } catch {
+    return null; // no Web Audio here; playback keeps working, unfiltered
+  }
+  void context.resume?.();
+
   if (currentTrackId && !isProxySrc(el, currentTrackId)) {
     await moveToProxy(el, currentTrackId);
   }
   try {
-    const context = new Ctor();
     const source = context.createMediaElementSource(el);
     source.connect(context.destination); // audible by default
     graph = { context, source };
@@ -137,6 +159,17 @@ export function attachGraph(): Promise<AudioGraph | null> {
 
 /** Whether SOUND mode has taken the element over; drives the URL play() uses. */
 export const isGraphAttached = () => graph !== null;
+
+/** Nudge the context awake from inside a user gesture.
+ *
+ * Once a source node exists the element's audio only reaches the speakers
+ * through the context, so a context Safari has suspended (backgrounded tab,
+ * or one that never started inside a gesture) means a play button that
+ * "works" and makes no sound. play() and toggle() ARE gestures, so this is
+ * the right place to ask. */
+function resumeGraph(): void {
+  void graph?.context.resume?.();
+}
 
 /** Test seam: install a stub element and forget any attached graph. */
 export function __resetPlayerForTests(el: HTMLAudioElement | null = null): void {
@@ -225,6 +258,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     setNowPlaying(track);
     setErrorMessage(null);
     setProgress(startProgress ?? 0);
+    resumeGraph();
     // Once SOUND mode owns the element it must stay same-origin, or the
     // source node goes silent on the next track.
     el.src = isGraphAttached() ? previewAudioUrl(trackId) : previewUrl(trackId);
@@ -249,6 +283,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const toggle = useCallback(() => {
     const el = getAudio();
     if (!nowPlayingRef.current) return;
+    resumeGraph();
     if (!isPlayingRef.current) {
       el.play().then(
         () => {

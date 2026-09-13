@@ -93,10 +93,11 @@ export function Tour({ map, seedId, recIds, selectedId }: Props) {
     let raf = 0;
     let lastTime = performance.now();
     let cancelled = false;
+    // Read once per effect, not per frame: canvasPalette() is a dozen
+    // getComputedStyle() calls, and this runs at 60 fps.
+    const c = canvasPalette();
 
     const draw = (now: number) => {
-
-      const c = canvasPalette();
       if (cancelled) return;
       // Clamp dt so a tab that was backgrounded and resumes doesn't jump the tour forward.
       const dt = Math.min((now - lastTime) / 1000, 0.1);

@@ -32,7 +32,7 @@ MAX_QUEUED = 200          # don't flood the queue; the worker drains ~12 tracks/
 # download fan-out, which keeps the network wait roughly the length of the
 # slowest preview instead of the sum of three.
 GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "3"))
-DOWNLOAD_THREADS = 3
+DOWNLOAD_THREADS = int(os.environ.get("DOWNLOAD_THREADS", "3"))
 FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"
 _last_crawl = 0.0
 
@@ -143,6 +143,7 @@ def process_jobs(track_ids: list[str]) -> int:
         return 0
     started = time.monotonic()
     ready: list[tuple[str, dict, Path]] = []
+    stored = 0
     try:
         with ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS) as pool:
             prepared = list(pool.map(_prepare_safe, track_ids))
@@ -159,7 +160,6 @@ def process_jobs(track_ids: list[str]) -> int:
         except Exception as exc:  # noqa: BLE001 - a dead graph fails the group
             results = [exc] * len(paths)
 
-        stored = 0
         for (track_id, track, _mp3), features in zip(ready, results):
             try:
                 if isinstance(features, Exception):
@@ -176,8 +176,10 @@ def process_jobs(track_ids: list[str]) -> int:
         for _, _, mp3 in ready:
             mp3.unlink(missing_ok=True)
         elapsed = time.monotonic() - started
-        rate = len(track_ids) / elapsed * 60 if elapsed > 0 else 0.0
-        print(f"[worker] group of {len(track_ids)}: {elapsed:.1f}s "
+        # Throughput is what was actually STORED, not what was claimed: a
+        # group where two of three downloads 403'd is not doing 12/min.
+        rate = stored / elapsed * 60 if elapsed > 0 else 0.0
+        print(f"[worker] group of {len(track_ids)}: {stored} stored in {elapsed:.1f}s "
               f"({rate:.1f} tracks/min)", flush=True)
 
 

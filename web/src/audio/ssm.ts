@@ -31,6 +31,62 @@ export function pool(frames: Float32Array[], bands: number, target: number): Flo
   return pooled;
 }
 
+/** Percentile window the off-diagonal values are stretched across. */
+const LOW_PCT = 0.02;
+const HIGH_PCT = 0.98;
+
+/**
+ * Contrast-stretch an SSM for display: off-diagonal values map from their
+ * 2nd–98th percentile onto 0–1, the diagonal stays 1.
+ *
+ * Pooled mel frames of one track are all fairly alike, so their cosines sit
+ * in a narrow band near the top of [−1, 1] — the naive `(s + 1) / 2` sent
+ * essentially every cell to the bright end of the colormap and the picture
+ * was a uniform slab. Stretching across the percentile window (rather than
+ * min–max) spends the whole ramp on the differences that are actually
+ * there, without letting one outlier cell set the scale.
+ *
+ * Pure and total: a constant matrix has no spread, so every off-diagonal
+ * cell becomes a mid-grey 0.5 rather than a NaN.
+ */
+export function stretch(values: Float32Array): Float32Array {
+  const out = new Float32Array(values.length);
+  if (values.length === 0) return out;
+  const columns = Math.round(Math.sqrt(values.length));
+
+  const offDiagonal: number[] = [];
+  for (let r = 0; r < columns; r++) {
+    for (let c = 0; c < columns; c++) {
+      if (r !== c) offDiagonal.push(values[r * columns + c]);
+    }
+  }
+  if (offDiagonal.length === 0) {
+    out.fill(1);
+    return out;
+  }
+
+  offDiagonal.sort((a, b) => a - b);
+  const at = (p: number) =>
+    offDiagonal[Math.max(0, Math.min(offDiagonal.length - 1, Math.round(p * (offDiagonal.length - 1))))];
+  const lo = at(LOW_PCT);
+  const hi = at(HIGH_PCT);
+  const span = hi - lo;
+
+  for (let r = 0; r < columns; r++) {
+    for (let c = 0; c < columns; c++) {
+      const i = r * columns + c;
+      if (r === c) {
+        out[i] = 1;
+      } else if (span <= 0) {
+        out[i] = 0.5; // no spread to show; a flat mid-tone, never a NaN
+      } else {
+        out[i] = Math.max(0, Math.min(1, (values[i] - lo) / span));
+      }
+    }
+  }
+  return out;
+}
+
 export function selfSimilarity(frames: Float32Array[], maxColumns = MAX_COLUMNS): Ssm {
   const bands = frames[0]?.length ?? 0;
   if (!bands || frames.length === 0) return { columns: 0, values: new Float32Array(0) };

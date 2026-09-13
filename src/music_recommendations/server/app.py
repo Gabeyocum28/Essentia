@@ -192,10 +192,25 @@ def preview_audio(track_id: str) -> StreamingResponse:
         finally:
             upstream.close()
 
+    # An mp3 is already compressed, so gzipping it costs CPU and buys nothing
+    # -- and worse, GZipMiddleware would strip the Content-Length and force
+    # the <audio> element into a non-seekable stream. `identity` tells
+    # Starlette's gzip middleware to pass the body through untouched.
+    headers = {
+        "Cache-Control": "private, max-age=600",
+        "Content-Encoding": "identity",
+    }
+    length = upstream.headers.get("Content-Length") if hasattr(upstream, "headers") else None
+    if length:
+        # Both of these are what let the element seek inside the preview
+        # instead of treating it as an open-ended stream.
+        headers["Content-Length"] = str(length)
+        headers["Accept-Ranges"] = "bytes"
+
     return StreamingResponse(
         chunks(),
         media_type="audio/mpeg",
-        headers={"Cache-Control": "private, max-age=600"},
+        headers=headers,
     )
 
 _FIXTURE_PATH = Path(__file__).parents[3] / "contract" / "fixture.json"
@@ -516,7 +531,12 @@ def _build(corpus: tuple[str, ...], feature_key: str, metric: str,
         ids, rows = _rows_for(fresh, feature_key)
         if rows:
             cached = _CorpusMatrix(
-                corpus, cached.ids + ids, np.vstack([cached.matrix, np.stack(rows)]),
+                corpus, cached.ids + ids,
+                # _vector() returns float64; without the cast the whole corpus
+                # matrix (float32 from store.base_matrix) would be upcast on
+                # the first growth step and double in memory.
+                np.vstack([cached.matrix,
+                           np.stack(rows).astype(cached.matrix.dtype, copy=False)]),
                 None,  # the corpus moved, so any cached centrality is stale
             )
         else:
@@ -1167,9 +1187,8 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
                   ) -> tuple[list[str], np.ndarray]:
     """The corpus matrix the insights endpoints project, stable for a window.
 
-    `require` is the track ids the caller must be able to find -- its seed,
-    and for /viz/map the recs it is about to return. If the snapshot
-    predates any of them (and the live corpus does have them), it refreshes
+    `require` is the track ids the caller must be able to find -- its seed.
+    If the snapshot predates any of them (and the live corpus does have them), it refreshes
     once; the refreshed snapshot is the live matrix, so it then holds all of
     them. Without this a track analyzed inside the window would rank as a
     rec but have no row to draw at, and every client reads rec.x/rec.y
@@ -1192,7 +1211,12 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
         if snapshot is not None:
             stamp, snap_ids, snap_matrix = snapshot
             fresh = time.monotonic() - stamp < VIZ_REFRESH_S
-            small_growth = len(ids) < len(snap_ids) * (1.0 + VIZ_GROWTH_PCT / 100.0)
+            # A corpus that SHRANK means the store was cleared and rebuilt:
+            # the snapshot's ids no longer describe the live corpus, so it
+            # has to be retaken rather than merely "not grown enough".
+            small_growth = (
+                len(snap_ids) <= len(ids) < len(snap_ids) * (1.0 + VIZ_GROWTH_PCT / 100.0)
+            )
             held = set(snap_ids) if wanted else set()
             live_ids = set(ids) if wanted else set()
             missing = any(t in live_ids and t not in held for t in wanted)

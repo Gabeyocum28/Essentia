@@ -44,6 +44,13 @@ function stubElement() {
       el.paused = false;
       return Promise.resolve();
     },
+    pause() {
+      el.paused = true;
+    },
+    /** Dispatch a media event by hand, for the failure paths. */
+    fire(type: string) {
+      for (const fn of [...(listeners.get(type) ?? [])]) fn();
+    },
   };
   return el;
 }
@@ -51,6 +58,11 @@ function stubElement() {
 function stubAudioContext() {
   const created: unknown[] = [];
   const connections: string[] = [];
+  // Every source node ever made. The context itself is now constructed
+  // BEFORE the proxy swap is awaited (Safari only starts one inside the
+  // gesture), so "nothing was attached" has to be asserted on the nodes.
+  const sources: unknown[] = [];
+  const resumes: unknown[] = [];
   class Ctx {
     destination = { id: "destination" };
     currentTime = 0;
@@ -58,18 +70,21 @@ function stubAudioContext() {
       created.push(this);
     }
     createMediaElementSource(el: unknown) {
-      return {
+      const node = {
         el,
         // Recorded so the test can prove the default path is audible.
         connect: (to: { id?: string }) => connections.push(to.id ?? "?"),
         disconnect: () => {},
       };
+      sources.push(node);
+      return node;
     }
     resume() {
+      resumes.push(this);
       return Promise.resolve();
     }
   }
-  return { Ctx, created, connections };
+  return { Ctx, created, connections, sources, resumes };
 }
 
 let el: ReturnType<typeof stubElement>;
@@ -177,7 +192,7 @@ test("an already-proxied element is left alone", async () => {
 });
 
 test("a proxy that never answers times out, restores the src, and rejects", async () => {
-  const { Ctx, created } = stubAudioContext();
+  const { Ctx, sources } = stubAudioContext();
   globalThis.AudioContext = Ctx as unknown as typeof AudioContext;
   const { result } = renderHook(() => usePlayer(), { wrapper });
 
@@ -203,7 +218,7 @@ test("a proxy that never answers times out, restores the src, and rejects", asyn
 
   expect(el.src).toBe("/api/preview/42"); // put back the way it was
   expect(el.currentTime).toBe(12);
-  expect(created).toHaveLength(0); // no source node over a half-loaded element
+  expect(sources).toHaveLength(0); // no source node over a half-loaded element
   expect(isGraphAttached()).toBe(false);
 });
 
@@ -222,4 +237,87 @@ test("once attached, play() keeps later tracks on the same-origin proxy", async 
     result.current.play(track("99"));
   });
   expect(el.src).toBe("/api/preview/99/audio");
+});
+
+test("a proxy that errors rejects, restores the src, and leaves no source node", async () => {
+  const { Ctx, sources } = stubAudioContext();
+  globalThis.AudioContext = Ctx as unknown as typeof AudioContext;
+  const { result } = renderHook(() => usePlayer(), { wrapper });
+
+  await act(async () => {
+    result.current.play(track("42"));
+  });
+  el.currentTime = 12;
+  el.paused = false;
+  const playsBefore = el.played;
+  // The proxy answers, but with a 502: the element fires `error`, not
+  // `loadedmetadata`. This used to RESOLVE, so a source node was built over
+  // an element with no media and SOUND mode went silent for the session.
+  el.load = () => {
+    el.loads++;
+    queueMicrotask(() => el.fire("error"));
+  };
+
+  await expect(attachGraph()).rejects.toThrow(/proxy/);
+
+  expect(el.src).toBe("/api/preview/42"); // put back the way it was
+  expect(el.currentTime).toBe(12);
+  expect(el.played).toBe(playsBefore + 1); // it was playing, so it resumes
+  expect(sources).toHaveLength(0);
+  expect(isGraphAttached()).toBe(false);
+});
+
+test("the context is built and resumed before the src swap awaits (Safari's gesture)", async () => {
+  const { Ctx, created, resumes } = stubAudioContext();
+  globalThis.AudioContext = Ctx as unknown as typeof AudioContext;
+  const { result } = renderHook(() => usePlayer(), { wrapper });
+
+  await act(async () => {
+    result.current.play(track("42"));
+  });
+
+  // Safari only lets a context start inside the gesture that asked for it,
+  // and an `await` ends the gesture -- so the context must exist and have
+  // been resumed by the time moveToProxy() starts loading.
+  let contextsAtSwap = -1;
+  let resumesAtSwap = -1;
+  el.load = () => {
+    el.loads++;
+    contextsAtSwap = created.length;
+    resumesAtSwap = resumes.length;
+    queueMicrotask(() => el.fire("loadedmetadata"));
+  };
+
+  await act(async () => {
+    await attachGraph();
+  });
+
+  expect(contextsAtSwap).toBe(1);
+  expect(resumesAtSwap).toBeGreaterThanOrEqual(1);
+  expect(isGraphAttached()).toBe(true);
+});
+
+test("play() and toggle() resume a suspended context", async () => {
+  const { Ctx, resumes } = stubAudioContext();
+  globalThis.AudioContext = Ctx as unknown as typeof AudioContext;
+  const { result } = renderHook(() => usePlayer(), { wrapper });
+
+  await act(async () => {
+    result.current.play(track("42"));
+  });
+  await act(async () => {
+    await attachGraph();
+  });
+  const after = resumes.length;
+
+  await act(async () => {
+    result.current.play(track("99"));
+  });
+  expect(resumes.length).toBeGreaterThan(after);
+
+  const afterPlay = resumes.length;
+  await act(async () => {
+    result.current.toggle();
+  });
+  expect(resumes.length).toBeGreaterThan(afterPlay);
 });

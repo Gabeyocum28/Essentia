@@ -1473,6 +1473,9 @@ p.why-similar {
   font-size: 10px;
   text-align: center;
 }
+.band-strip-label-error {
+  color: var(--danger);
+}
 
 .self-similarity {
   display: flex;
@@ -1543,6 +1546,18 @@ p.why-similar {
     flex: 1;
     width: auto;
     height: 18px;
+    /* Horizontal here, so the drag axis — and the cursor — turn with it. */
+    cursor: ew-resize;
+  }
+  /* The selection is positioned with left/width in this layout (BandStrip
+     picks the axis from the measured rect), so the vertical stretch has to
+     be released or it would still span only the strip's height. */
+  .band-strip-selection {
+    top: 0;
+    bottom: 0;
+    left: auto;
+    right: auto;
+    background: linear-gradient(90deg, var(--accent-hover), var(--accent));
   }
   .extremes-rails {
     grid-template-columns: 1fr;

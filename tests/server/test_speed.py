@@ -104,6 +104,27 @@ def test_viz_snapshot_refreshes_after_the_window_or_growth(fake_mongo,
     assert len(ids3) == 13
 
 
+def test_viz_snapshot_refreshes_when_the_corpus_shrank(fake_mongo, monkeypatch):
+    """A corpus with FEWER tracks than the snapshot means the store was
+    cleared and rebuilt: the snapshot's ids no longer describe anything
+    live, so "hasn't grown 5% yet" is the wrong answer."""
+    for i in range(30):
+        store.put_track({**TRACK, "track_id": f"t{i}"},
+                        {"embedding": [1.0, i / 29.0]})
+    ids1, m1 = app_module._viz_snapshot()
+    assert len(ids1) == 30
+
+    # Same window, but half the corpus is gone.
+    survivors = [(f"t{i}", [1.0, i / 29.0]) for i in range(10)]
+    monkeypatch.setattr(
+        app_module, "_viz_embedding_corpus",
+        lambda: ([t for t, _ in survivors],
+                 np.array([v for _, v in survivors], dtype=np.float32)),
+    )
+    ids2, m2 = app_module._viz_snapshot()
+    assert len(ids2) == 10 and m2 is not m1
+
+
 def test_viz_snapshot_refreshes_for_a_seed_it_does_not_hold(fake_mongo):
     """A track analyzed by /seed right now must appear on its own Insights
     screen, whatever the refresh window says."""
@@ -367,6 +388,39 @@ def test_viz_hubs_counts_match_the_uncached_definition(fake_mongo):
     assert np.allclose(
         centrality,
         (similarity.sum(axis=1) - np.diag(similarity)) / 39.0, atol=1e-6)
+
+
+def test_pairwise_cosine_keeps_two_matrices_and_evicts_the_oldest(monkeypatch):
+    """A single slot thrashed: with a seed-anchored subset, a user flipping
+    between two seeds recomputed a dense n x n on every request."""
+    rng = np.random.default_rng(11)
+    a = rng.standard_normal((12, 4)).astype(np.float32)
+    b = rng.standard_normal((12, 4)).astype(np.float32)
+    c = rng.standard_normal((12, 4)).astype(np.float32)
+
+    computed = []
+    real = viz.normalized_rows
+    monkeypatch.setattr(viz, "normalized_rows",
+                        lambda m: (computed.append(id(m)), real(m))[1])
+
+    sa, sb = viz.pairwise_cosine(a), viz.pairwise_cosine(b)
+    assert len(computed) == 2
+    # Alternating between the two is now free in both directions.
+    assert viz.pairwise_cosine(a) is sa
+    assert viz.pairwise_cosine(b) is sb
+    assert len(computed) == 2
+
+    # A third matrix evicts the least recently used, which is `a`.
+    viz.pairwise_cosine(c)
+    assert len(computed) == 3
+    assert viz.pairwise_cosine(b) is sb            # still held
+    assert len(computed) == 3
+    assert viz.pairwise_cosine(a) is not sa        # recomputed
+    assert len(computed) == 4
+
+    viz.clear_geometry_cache()
+    viz.pairwise_cosine(a)
+    assert len(computed) == 5
 
 
 def test_viz_walk_builds_the_knn_graph_once_per_subset_and_k(client,

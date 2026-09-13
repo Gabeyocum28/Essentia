@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { formatHz } from "../audio/mel";
-import { soloBand, soloOff, useSoloBand } from "../audio/soloStore";
+import { soloBand, soloOff, useSoloBand, useSoloError } from "../audio/soloStore";
 import type { VizAttribution } from "../api/types";
 
 interface Props {
@@ -21,6 +21,7 @@ export function WhySimilar({ seedId, recId }: Props) {
   const [phase, setPhase] = useState<Phase>("pending");
   const [data, setData] = useState<VizAttribution | null>(null);
   const solo = useSoloBand();
+  const soloFailure = useSoloError();
 
   useEffect(() => {
     setPhase("pending");
@@ -116,6 +117,7 @@ export function WhySimilar({ seedId, recId }: Props) {
           );
         })}
       </div>
+      {soloFailure && <p className="error-box why-similar-solo-error">{soloFailure}</p>}
       <div className="why-similar-note">
         <span className="hint">Tap a band to hear only that band.</span>
         <button type="button" className="why-similar-solo-off" onClick={soloOff} disabled={solo === null}>
