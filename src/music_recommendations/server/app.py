@@ -24,6 +24,7 @@ import numpy as np
 from collections import OrderedDict
 from contextvars import ContextVar
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from starlette.requests import Request
@@ -82,6 +83,16 @@ class _CaptureBaseURL:
 
 
 app.add_middleware(_CaptureBaseURL)
+
+# The viz payloads are long lists of near-identical JSON numbers and repeated
+# track dicts; gzip takes /viz/map's 2.1 MB to a small fraction of it, which
+# on a phone over cell is most of the wall clock. Added AFTER _CaptureBaseURL
+# so it sits outermost: compression is the last thing to happen on the way
+# out, and the base-URL ContextVar is still set in the endpoint's own task
+# (both are plain ASGI wrappers, so neither hops tasks). minimum_size keeps
+# it off the small responses -- /preview's 302 above all -- where the header
+# and CPU cost more than the bytes saved.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 def _base() -> str:
@@ -166,6 +177,79 @@ def _safe(fn, *args, default=None):
         return default
 
 
+# ---- track metadata cache ----
+#
+# Title/artist/album/artwork never change once a track is crawled, but every
+# endpoint that returns tracks was paying an Atlas round trip for them:
+# /recommend did ten sequential get_track calls (1-2 s of the request), and
+# /viz/map fetched all VIZ_MAX point dicts every time (0.39 s at 7.5k).
+# Metadata is small and immutable, so it is held in process, keyed by id,
+# and every read goes through _tracks_cached -- which collapses whatever it
+# does not hold into ONE get_many_tracks call.
+#
+# Cached dicts are treated as read-only by callers (_playable already builds
+# a new dict), so entries are never copied on the way out.
+_TRACK_META: "OrderedDict[str, dict]" = OrderedDict()
+# ~50k tracks of six short strings: tens of MB, an order of magnitude under
+# the embedding matrix already in this process. Module-level so tests can
+# shrink it.
+_TRACK_META_MAX = 50000
+# Its own lock, not _VIZ_CACHE_LOCK: this is read on the /recommend path,
+# which must not queue behind an Insights request's cache bookkeeping.
+_TRACK_META_LOCK = threading.Lock()
+
+
+def _remember_track(track: dict | None) -> dict | None:
+    """Put a track dict in the metadata cache (LRU-trimmed); give back what
+    was cached.
+
+    Normalized to the shape store.get_track returns, so a track that arrived
+    from /search or Deezer (carrying a live 15-minute preview signature and
+    whatever else Deezer sent) cannot leak that expiring URL to a later
+    reader: preview_url is "" here exactly as it is out of the store, and
+    _playable re-points it at this server.
+    """
+    if not track or not track.get("track_id"):
+        return None
+    track_id = track["track_id"]
+    entry = {"track_id": track_id,
+             **{key: track.get(key) for key in store.TRACK_FIELDS},
+             "preview_url": ""}
+    with _TRACK_META_LOCK:
+        _TRACK_META[track_id] = entry
+        _TRACK_META.move_to_end(track_id)
+        while len(_TRACK_META) > _TRACK_META_MAX:
+            _TRACK_META.popitem(last=False)
+    return entry
+
+
+def _tracks_cached(track_ids: "list[str] | tuple[str, ...]") -> list[dict | None]:
+    """Metadata for these ids, in order; one bulk fetch for whatever is missing.
+
+    None for an id the store does not know. A miss is NOT cached: an id can
+    be absent because the worker has not written its metadata yet, and a
+    cached None would outlive that by the life of the process.
+    """
+    track_ids = list(track_ids)
+    found: dict[str, dict] = {}
+    misses: list[str] = []
+    with _TRACK_META_LOCK:
+        for track_id in track_ids:
+            hit = _TRACK_META.get(track_id)
+            if hit is not None:
+                _TRACK_META.move_to_end(track_id)
+                found[track_id] = hit
+            elif track_id not in misses:
+                misses.append(track_id)
+
+    if misses:
+        fetched = _safe(store.get_many_tracks, misses) or [None] * len(misses)
+        for track_id, track in zip(misses, fetched):
+            if track:
+                found[track_id] = _remember_track(track)
+    return [found.get(track_id) for track_id in track_ids]
+
+
 class SeedRequest(BaseModel):
     track_id: str
 
@@ -225,6 +309,7 @@ def seed(req: SeedRequest) -> dict:
         with _ANALYZE_SEM:
             features = _to_plain(analyze_track(mp3))
         _safe(store.put_track, track, features)
+        _remember_track(track)
     except (NotImplementedError, ImportError):
         # Analysis can't run on this host (no aarch64 essentia wheels on the
         # ARM VM). Hand the job to the worker and wait.
@@ -269,6 +354,7 @@ _EMBED_POLL_S = 0.5
 
 def _seed_via_worker(track_id: str, track: dict) -> dict:
     _safe(store.put_track_meta, track)
+    _remember_track(track)
     queued = _safe(store.enqueue_embed, track_id)
     if queued is None:
         # The store is down: there is no queue to hand to and no features to
@@ -470,6 +556,31 @@ def _blended(corpus: tuple[str, ...], seed_features: dict,
     return base_ids, fused, parts
 
 
+def _take(order: np.ndarray, ids: list[str], seed_id: str,
+          limit: int) -> list[int]:
+    """The first `limit` ranked rows that are not the seed.
+
+    Also warms the metadata cache for exactly those rows: building the
+    result list first and fetching after turns what used to be `limit`
+    sequential store.get_track round trips (1-2 s of every /recommend) into
+    one bulk read, or none at all once the ids are cached.
+    """
+    chosen: list[int] = []
+    for idx in order:
+        if ids[idx] == seed_id:
+            continue
+        chosen.append(int(idx))
+        if len(chosen) == limit:
+            break
+    _tracks_cached([ids[idx] for idx in chosen])
+    return chosen
+
+
+def _rec_track(track_id: str) -> dict:
+    """A result's track dict, from the metadata cache _take just warmed."""
+    return _playable(_tracks_cached([track_id])[0]) or {"track_id": track_id}
+
+
 @app.get("/recommend")
 def recommend(track_id: str, axis: str,
               limit: int = Query(10, ge=1, le=50)) -> dict:
@@ -484,15 +595,11 @@ def recommend(track_id: str, axis: str,
         results = _fixture_fallback(track_id, limit)
     elif axis in BLENDED_AXES:
         ids, fused, parts = _blended(corpus, seed_features, BLENDED_AXES[axis])
-        results = []
-        for idx in np.argsort(fused)[::-1]:
-            if ids[idx] == track_id:
-                continue
-            track = store.get_track(ids[idx])
-            results.append({**_playable(track), "score":
-                            round(float(fused[idx]) / 100.0, 4)})
-            if len(results) == limit:
-                break
+        chosen = _take(np.argsort(fused)[::-1], ids, track_id, limit)
+        results = [
+            {**_rec_track(ids[idx]), "score": round(float(fused[idx]) / 100.0, 4)}
+            for idx in chosen
+        ]
     else:
         feature_key, direction = AXIS_FEATURES[axis]
         from music_recommendations.server import rank as rank_mod
@@ -511,14 +618,11 @@ def recommend(track_id: str, axis: str,
             seed_vec, matrix, direction=direction, limit=limit + 1,
             metric=metric, correction=correction, similarity=similarity,
         )
-        results = []
-        for idx in order:
-            if ids[idx] == track_id:
-                continue
-            track = store.get_track(ids[idx])
-            results.append({**_playable(track), "score": float(similarity[idx])})
-            if len(results) == limit:
-                break
+        chosen = _take(order, ids, track_id, limit)
+        results = [
+            {**_rec_track(ids[idx]), "score": float(similarity[idx])}
+            for idx in chosen
+        ]
 
     return {"seed_track_id": track_id, "axis": axis, "results": results}
 
@@ -595,9 +699,16 @@ def _mst(matrix: np.ndarray) -> list[tuple[int, int, float]]:
 @app.get("/viz/map")
 def viz_map(track_id: str, axis: str,
             limit: int = Query(10, ge=1, le=50),
-            correction: Literal["on", "off"] = "on") -> dict:
+            correction: Literal["on", "off"] = "on",
+            points: Literal["full", "compact"] = "full") -> dict:
     """Everything the wow screen needs in one payload: the whole corpus as 2D
-    points, the seed, and the recs with the actual numbers behind each score."""
+    points, the seed, and the recs with the actual numbers behind each score.
+
+    `points=compact` drops points.tracks — the ids/x/y are all a client that
+    only draws the galaxy needs, and the per-point track dicts are ~2 MB of
+    the 2.1 MB response at VIZ_MAX rows. Default stays "full" so existing
+    clients are untouched.
+    """
     blended_weights = BLENDED_AXES.get(axis)
     if blended_weights is None and axis not in AXIS_FEATURES:
         raise HTTPException(400, f"unknown axis {axis!r}")
@@ -647,7 +758,6 @@ def viz_map(track_id: str, axis: str,
         rec_id = ids[idx]
         if rec_id == track_id or rec_id not in emb_id_set:
             continue
-        track = _safe(store.get_track, rec_id)
         if blended_weights is not None:
             row = emb_at.get(rec_id)
             if row is None:
@@ -665,46 +775,51 @@ def viz_map(track_id: str, axis: str,
                 seed_vec, matrix[idx], metric,
                 float(correction[idx]) if correction is not None else None,
             )
-        recs.append({
-            **(_playable(track) or {"track_id": rec_id}),
-            "score": score,
-            "math": math,
-        })
+        recs.append({"track_id": rec_id, "score": score, "math": math})
         if len(recs) == limit:
             break
 
+    # Projected on the SNAPSHOT, ranked on the live matrix: the ranking must
+    # be the one /recommend just served, while the projection must reuse the
+    # subset/PCA the other Insights endpoints already hold. The seed and
+    # every rec are `require`d, so a track analyzed inside the window is
+    # still drawn -- clients read rec.x/rec.y unconditionally, and a rec
+    # without a position would put NaN through their bounds math.
+    snapshot_ids, snapshot_matrix = _viz_snapshot(
+        require=[track_id, *(rec["track_id"] for rec in recs)],
+        live=(emb_ids, emb_matrix),
+    )
     # The points/projection are seed-anchored, not the whole corpus: recs
     # (e.g. `surprise`'s far neighbours) are drawn even when they fall
     # outside the nearest-VIZ_MAX ring, via extra_ids.
     subset_ids, subset_matrix = _viz_subset(
         track_id, extra_ids=[rec["track_id"] for rec in recs],
-        corpus=(emb_ids, emb_matrix),
+        corpus=(snapshot_ids, snapshot_matrix),
     )
     xy = _projection(subset_matrix)
     position = {tid: i for i, tid in enumerate(subset_ids)}
-    for rec in recs:
-        pos = position[rec["track_id"]]
-        rec["x"] = float(xy[pos, 0])
-        rec["y"] = float(xy[pos, 1])
 
-    seed_track = _playable(_safe(store.get_track, track_id)) or {"track_id": track_id}
+    # One bulk metadata read for everything this response names, before any
+    # of it is assembled: in "full" that is the whole subset (the points),
+    # in "compact" only the seed and the recs.
+    named = (list(subset_ids) if points == "full"
+             else [track_id, *(rec["track_id"] for rec in recs)])
+    named_meta = _tracks_cached(named)
+
+    recs = [
+        {**_viz_track(rec["track_id"]), **rec,
+         "x": float(xy[position[rec["track_id"]], 0]),
+         "y": float(xy[position[rec["track_id"]], 1])}
+        for rec in recs
+    ]
+
+    seed_track = _playable(_tracks_cached([track_id])[0]) or {"track_id": track_id}
     seed_pos = position[track_id]
     seed = {
         **seed_track,
         "x": float(xy[seed_pos, 0]),
         "y": float(xy[seed_pos, 1]),
     }
-    point_tracks = []
-    for point_id, track in zip(subset_ids, _safe(store.get_many_tracks, subset_ids,
-                                                  default=[])):
-        point_tracks.append(_playable(track) or {
-            "track_id": point_id,
-            "title": point_id,
-            "artist": "Unknown artist",
-            "album": "",
-            "artwork_url": None,
-            "preview_url": None,
-        })
     axis_info = {"id": axis, "metric": metric, "direction": direction}
     if blended_weights is not None:
         axis_info["metric"] = "blend"
@@ -712,13 +827,21 @@ def viz_map(track_id: str, axis: str,
     if direction == -1:
         axis_info["correction"] = "on" if use_correction else "off"
 
+    point_data = {
+        "ids": subset_ids,
+        "x": [round(float(v), 4) for v in xy[:, 0]],
+        "y": [round(float(v), 4) for v in xy[:, 1]],
+    }
+    if points == "full":
+        # Straight off the one bulk read above rather than _viz_track per
+        # row: at VIZ_MAX that would be 8000 cache lookups to the same end.
+        point_data["tracks"] = [
+            _playable(track) or _unknown_track(point_id)
+            for point_id, track in zip(subset_ids, named_meta)
+        ]
+
     return {
-        "points": {
-            "ids": subset_ids,
-            "x": [round(float(v), 4) for v in xy[:, 0]],
-            "y": [round(float(v), 4) for v in xy[:, 1]],
-            "tracks": point_tracks,
-        },
+        "points": point_data,
         "seed": seed,
         "recs": recs,
         "axis": axis_info,
@@ -783,9 +906,15 @@ def _viz_subset(seed_id: str | None,
     The dense n×n work downstream happens on this copy, never on the corpus.
 
     `corpus` is the (ids, matrix) pair a caller already holds (/viz/map has
-    just built it), passed in so this does not re-derive the same pair.
+    just taken the snapshot), passed in so this does not re-derive it.
+    Otherwise the pair comes from _viz_snapshot, NOT the live matrix: the
+    cache key below is id(matrix_all), so a live matrix would be a new
+    object -- and a cold subset, PCA and MST -- on every newly crawled
+    track. `seed_id` is passed as the snapshot's `require`, so a track
+    analyzed inside the window still gets its own screen.
     """
-    ids_all, matrix_all = corpus if corpus is not None else _viz_embedding_corpus()
+    ids_all, matrix_all = (corpus if corpus is not None
+                           else _viz_snapshot(require=seed_id))
     # Hoisted out of the generator: as an inline condition this rebuilt the
     # whole id set once per extra id.
     known = set(ids_all)
@@ -841,6 +970,76 @@ def _viz_subset_min2(seed_id: str | None,
     return ids, matrix
 
 
+# ---- the viz snapshot ----
+#
+# Every derived insights cache (_SUBSET_CACHE, _TOP8_CACHE, _MST_CACHE,
+# viz._PAIRWISE_CACHE) keys on the identity of the matrix it was computed
+# from, and _corpus_matrix hands back a NEW matrix object the moment the
+# crawler analyzes one more track. With a crawl running that is every few
+# seconds, so those caches were cold on essentially every Insights request:
+# the PCA, the pairwise similarity and the MST were all recomputed for the
+# sake of one extra row in eight thousand.
+#
+# So the insights endpoints read a SNAPSHOT instead of the live matrix. It
+# holds the live matrix object itself (no copy -- the snapshot only pins a
+# matrix _MATRIX_CACHE would otherwise have dropped) and refreshes when the
+# window closes, when the corpus has grown by VIZ_GROWTH_PCT, or when a
+# caller needs a track the snapshot predates (`require`: a track the user
+# just seeded must appear on its own Insights screen).
+#
+# What this trades away: a track analyzed inside the window is not drawn
+# until the next refresh. That is the intended trade -- a point appearing up
+# to VIZ_REFRESH_S late is invisible, a 9 s map is not.
+VIZ_REFRESH_S = float(os.environ.get("VIZ_REFRESH_S", "300"))
+VIZ_GROWTH_PCT = float(os.environ.get("VIZ_GROWTH_PCT", "5"))
+
+# (taken at, ids, matrix)
+_VIZ_SNAPSHOT: "tuple[float, list[str], np.ndarray] | None" = None
+
+
+def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
+                  live: "tuple[list[str], np.ndarray] | None" = None,
+                  ) -> tuple[list[str], np.ndarray]:
+    """The corpus matrix the insights endpoints project, stable for a window.
+
+    `require` is the track ids the caller must be able to find -- its seed,
+    and for /viz/map the recs it is about to return. If the snapshot
+    predates any of them (and the live corpus does have them), it refreshes
+    once; the refreshed snapshot is the live matrix, so it then holds all of
+    them. Without this a track analyzed inside the window would rank as a
+    rec but have no row to draw at, and every client reads rec.x/rec.y
+    unconditionally. An id that is in neither is NOT a reason to rebuild --
+    otherwise a bogus ?track_id= would refresh on every request.
+
+    `live` is the current (ids, matrix) pair when the caller already holds
+    it (/viz/map ranks on it), so the growth check does not repeat that
+    caller's corpus_ids read.
+    """
+    global _VIZ_SNAPSHOT
+
+    # Read live first: this is also the call that appends newly analyzed rows
+    # to _MATRIX_CACHE, and it is the cheap part (only new ids are parsed).
+    ids, matrix = live if live is not None else _viz_embedding_corpus()
+    wanted = [require] if isinstance(require, str) else list(require or ())
+
+    with _VIZ_CACHE_LOCK:
+        snapshot = _VIZ_SNAPSHOT
+        if snapshot is not None:
+            stamp, snap_ids, snap_matrix = snapshot
+            fresh = time.monotonic() - stamp < VIZ_REFRESH_S
+            small_growth = len(ids) < len(snap_ids) * (1.0 + VIZ_GROWTH_PCT / 100.0)
+            held = set(snap_ids) if wanted else set()
+            live_ids = set(ids) if wanted else set()
+            missing = any(t in live_ids and t not in held for t in wanted)
+            if fresh and small_growth and not missing:
+                return snap_ids, snap_matrix
+        _VIZ_SNAPSHOT = (time.monotonic(), ids, matrix)
+        # The derived caches belong to the superseded matrix; drop them now
+        # rather than letting them pin it until the LRU happens to evict.
+        _purge_viz_caches(matrix)
+    return ids, matrix
+
+
 def _viz_embedding_corpus() -> tuple[list[str], np.ndarray]:
     corpus = tuple(_safe(store.corpus_ids, default=[]))
     if not corpus:
@@ -870,8 +1069,10 @@ def _rec_ids(recs: str | None) -> tuple[str, ...]:
                  (chunk.strip() for chunk in recs.split(",")) if part)[:_MAX_RECS]
 
 
-def _viz_track(track_id: str) -> dict:
-    return _playable(_safe(store.get_track, track_id)) or {
+def _unknown_track(track_id: str) -> dict:
+    """The placeholder row for an id the store has no metadata for -- an id
+    in the embedding matrix whose track document has not landed yet."""
+    return {
         "track_id": track_id,
         "title": track_id,
         "artist": "Unknown artist",
@@ -879,6 +1080,13 @@ def _viz_track(track_id: str) -> dict:
         "artwork_url": None,
         "preview_url": None,
     }
+
+
+def _viz_track(track_id: str) -> dict:
+    """One track's display dict, from the metadata cache. Callers that need
+    many warm it first with a single _tracks_cached(ids) call, so this is a
+    memory hit rather than a round trip per row."""
+    return _playable(_tracks_cached([track_id])[0]) or _unknown_track(track_id)
 
 
 @app.get("/viz/walk")
@@ -897,6 +1105,7 @@ def viz_walk(from_: str = Query(alias="from"), to: str = Query(),
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     xy = _projection(matrix)
+    _tracks_cached([ids[index] for index in path])   # one read for the walk
     steps = [
         {
             **_viz_track(ids[index]),
@@ -973,6 +1182,11 @@ def viz_hubs(track_id: str | None = None,
     central_order = np.lexsort((index, -centrality))
     isolated_order = np.lexsort((index, centrality))
 
+    # Only the rows this response names, in one read: the subset is up to
+    # VIZ_MAX rows but at most 3 x limit of them are shown.
+    _tracks_cached([ids[i] for order in (hub_order, central_order, isolated_order)
+                    for i in order[:limit]])
+
     def rows(order: np.ndarray, field: str, values: np.ndarray) -> list[dict]:
         return [
             {**_viz_track(ids[i]), field: float(values[i])}
@@ -1047,6 +1261,8 @@ def viz_extremes(track_id: str | None = None,
     k = min(limit, len(ids))
     low_order = np.argsort(values, kind="stable")          # most negative first
     high_order = np.argsort(-values, kind="stable")         # most positive first
+    _tracks_cached([ids[i] for order in (low_order, high_order)
+                    for i in order[:k]])
 
     return {
         "pc": pc,
