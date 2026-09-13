@@ -9,6 +9,7 @@ import type { Track, VizHistogram, VizHubs, VizMap } from "../api/types";
 interface Props {
   seedId: string;
   recIds: string[];
+  feel?: number;
 }
 
 type Status = "loading" | "ready" | "error";
@@ -90,7 +91,7 @@ function HubRail({
   );
 }
 
-export function Proof({ seedId, recIds }: Props) {
+export function Proof({ seedId, recIds, feel }: Props) {
   const [status, setStatus] = useState<Status>("loading");
   const [hist, setHist] = useState<VizHistogram | null>(null);
   const [hubs, setHubs] = useState<VizHubs | null>(null);
@@ -111,8 +112,8 @@ export function Proof({ seedId, recIds }: Props) {
         const [h, hb, raw, corrected] = await Promise.all([
           api.vizHistogram(seedId),
           api.vizHubs(seedId, recIds),
-          api.vizMap(seedId, "surprise", 10, "off"),
-          api.vizMap(seedId, "surprise", 10, "on"),
+          api.vizMap(seedId, "surprise", 10, "off", feel),
+          api.vizMap(seedId, "surprise", 10, "on", feel),
         ]);
         if (cancelled) return;
         setHist(h);
@@ -127,7 +128,7 @@ export function Proof({ seedId, recIds }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [seedId, recIds, reloadKey]);
+  }, [seedId, recIds, reloadKey, feel]);
 
   useEffect(() => {
     const el = containerRef.current;

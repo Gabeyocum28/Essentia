@@ -85,8 +85,8 @@ test("fetches raw and corrected maps in parallel, exactly once each", async () =
   await waitFor(() => expect(screen.getByText("Track A")).toBeInTheDocument());
 
   expect(api.vizMap).toHaveBeenCalledTimes(2);
-  expect(api.vizMap).toHaveBeenCalledWith("seed", "surprise", 10, "off");
-  expect(api.vizMap).toHaveBeenCalledWith("seed", "surprise", 10, "on");
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "surprise", 10, "off", undefined);
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "surprise", 10, "on", undefined);
   expect(api.vizHubs).toHaveBeenCalledWith("seed", ["rec1"]);
 });
 
