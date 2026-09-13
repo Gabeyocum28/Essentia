@@ -12,6 +12,7 @@ import { Extremes } from "../insights/Extremes";
 import { MathPanel } from "../insights/MathPanel";
 import { WhySimilar } from "../insights/WhySimilar";
 import { Sound } from "../insights/Sound";
+import { Skeleton } from "../components/Skeleton";
 
 type Status = "loading" | "ready" | "unanalyzed" | "error";
 type Mode = "GALAXY" | "SOUND" | "PROOF";
@@ -62,7 +63,21 @@ export function Insights() {
 
   return (
     <div className="screen insights-screen">
-      {status === "loading" && <p className="hint">Loading insights…</p>}
+      {status === "loading" && (
+        <>
+          <p className="hint">Loading insights…</p>
+          <div className="rec-strip" aria-hidden="true">
+            {Array.from({ length: 8 }, (_, i) => (
+              <div className="rec-strip-item" key={i}>
+                <Skeleton width={48} height={48} radius={8} />
+                <Skeleton width="90%" height={9} />
+              </div>
+            ))}
+          </div>
+          <Skeleton height={44} radius={999} />
+          <Skeleton height={360} radius={16} />
+        </>
+      )}
 
       {status === "unanalyzed" && (
         <div className="error-box">
@@ -95,22 +110,22 @@ export function Insights() {
             </>
           )}
 
-          <div className="segmented-control">
-            {(["GALAXY", "SOUND", "PROOF"] as Mode[]).map((m) => (
-              <button
-                key={m}
-                type="button"
-                className={`segmented-control-item${mode === m ? " segmented-control-item-active" : ""}`}
-                aria-pressed={mode === m}
-                onClick={() => setMode(m)}
-              >
-                {m}
-              </button>
-            ))}
-          </div>
+          <div className="insights-controls">
+            <div className="segmented-control">
+              {(["GALAXY", "SOUND", "PROOF"] as Mode[]).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  className={`segmented-control-item${mode === m ? " segmented-control-item-active" : ""}`}
+                  aria-pressed={mode === m}
+                  onClick={() => setMode(m)}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
 
-          {mode === "GALAXY" && (
-            <>
+            {mode === "GALAXY" && (
               <div className="chip-row">
                 {(["Explore", "Walk", "Tour", "Topo"] as GalaxyChip[]).map((c) => (
                   <button
@@ -124,7 +139,11 @@ export function Insights() {
                   </button>
                 ))}
               </div>
+            )}
+          </div>
 
+          {mode === "GALAXY" && (
+            <>
               {chip === "Explore" && <Galaxy map={map} selectedId={selectedId} onSelect={setSelectedId} />}
               {chip === "Walk" && <Walk map={map} selectedId={selectedId} onSelect={setSelectedId} />}
               {chip === "Tour" && (

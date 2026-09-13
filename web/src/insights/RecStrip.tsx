@@ -25,7 +25,7 @@ export function RecStrip({ seed, recs, selectedId, onSelect }: Props) {
         }}
         aria-label={`Play ${seed.title}`}
       >
-        <Artwork url={seed.artwork_url} size={56} />
+        <Artwork url={seed.artwork_url} size={48} />
         <div className="rec-strip-title">{seed.title}</div>
       </button>
       {recs.map((rec) => (
@@ -39,7 +39,7 @@ export function RecStrip({ seed, recs, selectedId, onSelect }: Props) {
           }}
           aria-label={`Play ${rec.title}`}
         >
-          <Artwork url={rec.artwork_url} size={56} />
+          <Artwork url={rec.artwork_url} size={48} />
           <div className="rec-strip-title">{rec.title}</div>
         </button>
       ))}

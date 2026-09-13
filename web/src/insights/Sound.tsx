@@ -70,7 +70,7 @@ export function Sound({ track }: Props) {
         </button>
       </div>
 
-      {status === "loading" && <div className="sound-skeleton" data-testid="sound-skeleton" />}
+      {status === "loading" && <div className="skeleton sound-skeleton" data-testid="sound-skeleton" />}
       {status === "error" && <p className="error-box">Couldn’t load this preview’s audio.</p>}
 
       {status === "ready" && analysis && (

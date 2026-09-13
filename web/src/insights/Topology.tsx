@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { canvasPalette } from "../theme";
 import { api } from "../api/client";
 import { UnionFind } from "./unionfind";
 import { fitTransform, nearestIndex, toScreen } from "./geometry";
@@ -115,6 +116,7 @@ export function Topology({ map, seedId, recIds, selectedId, onSelect }: Props) {
 
     let raf = 0;
     const draw = () => {
+      const c = canvasPalette();
       const dpr = window.devicePixelRatio || 1;
       canvas.width = size.width * dpr;
       canvas.height = size.height * dpr;
@@ -123,13 +125,13 @@ export function Topology({ map, seedId, recIds, selectedId, onSelect }: Props) {
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.fillStyle = "#000";
+      ctx.fillStyle = c.bg;
       ctx.fillRect(0, 0, size.width, size.height);
 
       const t = fitTransform(xs, ys, size.width, size.height, PAD);
 
       // Edges under threshold
-      ctx.strokeStyle = "rgba(255,255,255,.14)";
+      ctx.strokeStyle = c.edge;
       ctx.lineWidth = 1;
       for (const [a, b] of activeEdges) {
         const [sxA, syA] = toScreen(t, xs[a], ys[a]);
@@ -155,12 +157,12 @@ export function Topology({ map, seedId, recIds, selectedId, onSelect }: Props) {
         if (!recSet.has(mst.ids[i])) continue;
         const [sx, sy] = toScreen(t, xs[i], ys[i]);
         if (selectedId === mst.ids[i]) {
-          ctx.fillStyle = "rgba(10,132,255,.35)";
+          ctx.fillStyle = c.accentSoft;
           ctx.beginPath();
           ctx.arc(sx, sy, 11, 0, Math.PI * 2);
           ctx.fill();
         }
-        ctx.fillStyle = "#0A84FF";
+        ctx.fillStyle = c.accent;
         ctx.beginPath();
         ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
         ctx.fill();
@@ -168,15 +170,15 @@ export function Topology({ map, seedId, recIds, selectedId, onSelect }: Props) {
 
       if (seedIdx !== undefined) {
         const [sx, sy] = toScreen(t, xs[seedIdx], ys[seedIdx]);
-        ctx.fillStyle = "rgba(255,214,10,.25)";
+        ctx.fillStyle = c.seedSofter;
         ctx.beginPath();
         ctx.arc(sx, sy, 18, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = "rgba(255,214,10,.6)";
+        ctx.fillStyle = c.seedSoft;
         ctx.beginPath();
         ctx.arc(sx, sy, 9, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = "#FFD60A";
+        ctx.fillStyle = c.seed;
         ctx.beginPath();
         ctx.arc(sx, sy, 4, 0, Math.PI * 2);
         ctx.fill();
@@ -191,6 +193,7 @@ export function Topology({ map, seedId, recIds, selectedId, onSelect }: Props) {
     if (!mst) return;
     const canvas = barcodeRef.current;
     if (!canvas || size.width === 0) return;
+    const c = canvasPalette();
     const height = 28;
     const dpr = window.devicePixelRatio || 1;
     canvas.width = size.width * dpr;
@@ -200,10 +203,10 @@ export function Topology({ map, seedId, recIds, selectedId, onSelect }: Props) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = "#000";
+    ctx.fillStyle = c.bg;
     ctx.fillRect(0, 0, size.width, height);
 
-    ctx.strokeStyle = "#64D2FF";
+    ctx.strokeStyle = c.cyan;
     ctx.lineWidth = 1;
     for (const [, , d] of mst.edges) {
       const x = (d / maxD) * size.width;
@@ -214,7 +217,7 @@ export function Topology({ map, seedId, recIds, selectedId, onSelect }: Props) {
     }
 
     const cursorX = (threshold / maxD) * size.width;
-    ctx.strokeStyle = "#FFD60A";
+    ctx.strokeStyle = c.seed;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(cursorX, 0);

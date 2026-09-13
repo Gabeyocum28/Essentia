@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import { TrackRow } from "../components/TrackRow";
+import { SkeletonTrackList } from "../components/Skeleton";
 import type { Track } from "../api/types";
 
 type Status = "idle" | "loading" | "error" | "ready";
@@ -31,6 +32,13 @@ export function Search() {
 
   return (
     <div className="screen search-screen">
+      <div className="search-hero">
+        <h1 className="search-hero-title">Find a track to start from</h1>
+        <p className="search-hero-sub">
+          Pick a seed and Essentia maps the corpus around it.
+        </p>
+      </div>
+
       <form onSubmit={onSubmit} className="search-form">
         <input
           type="text"
@@ -39,11 +47,18 @@ export function Search() {
           placeholder="Search for a track or artist"
           aria-label="Search"
         />
-        <button type="submit">Search</button>
+        <button type="submit" className="btn btn-primary">
+          Search
+        </button>
       </form>
 
       {status === "idle" && <p className="hint">Search for a track to get started.</p>}
-      {status === "loading" && <p className="hint">Searching…</p>}
+      {status === "loading" && (
+        <>
+          <p className="hint">Searching…</p>
+          <SkeletonTrackList rows={6} />
+        </>
+      )}
       {status === "error" && (
         <div className="error-box">
           <p>Something went wrong</p>
