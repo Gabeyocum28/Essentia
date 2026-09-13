@@ -34,7 +34,7 @@ from typing import Literal, NamedTuple
 from contract.features import AXES
 from music_recommendations.analysis import analyze_track, frontend
 from music_recommendations.analysis.schema import METRICS
-from music_recommendations.server import deezer, store, viz
+from music_recommendations.server import deezer, dedupe, store, viz
 from music_recommendations.server.axes import AXIS_FEATURES, BLENDED_AXES
 
 
@@ -633,23 +633,128 @@ def _blended(corpus: tuple[str, ...], seed_features: dict,
     return base_ids, fused, parts
 
 
+# Second net, after the crawler's key guard: whatever duplicates are already
+# stored must not reach a result list twice.
+#
+# Two candidates are the same recording when their dedupe keys match, or --
+# for a re-release whose title says nothing -- when their embeddings are
+# within this cosine. 0.995 was measured: 8.8% of a 20k corpus has a
+# near-identical partner at that threshold, and 320 of 323 sampled pairs
+# above it were the same recording under another Deezer id (the rest were
+# genuine covers, which the key check keeps because it includes the artist).
+_NEAR_DUPLICATE_COSINE = 0.995
+
+# Every candidate the collapse drops needs another to take its place, so the
+# ranked scan looks this many times `limit` deep. One extra pass is enough
+# for a corpus where duplicates are ~10% of rows, and it keeps the whole
+# thing bounded: at most 2*limit+1 candidates, `limit` kept keys, `limit`
+# kept rows -- O(limit^2) dot products and ONE bulk metadata read.
+_COLLAPSE_WIDEN = 1
+
+
+def _scan_width(limit: int) -> int:
+    """How many ranked candidates a result loop may look at for `limit` rows."""
+    return limit * (1 + _COLLAPSE_WIDEN) + 1
+
+
+def _dedupe_key(track_id: str) -> str | None:
+    """A track's dedupe key from cached metadata; None if we have no metadata.
+
+    Read from the metadata cache rather than the stored `dedupe_key` field:
+    the cache is already warm for exactly these ids, so this costs nothing,
+    and the field never has to be projected into a contract response.
+    """
+    meta = _tracks_cached([track_id])[0]
+    if not meta:
+        return None
+    return dedupe.dedupe_key(meta.get("title"), meta.get("artist"))
+
+
+def _unit_rows(feature_key: str, matrix: np.ndarray) -> np.ndarray | None:
+    """The unit matrix _similarity just cached for this matrix, if any."""
+    cached = _UNIT_CACHE.get(feature_key)
+    return cached[1] if cached is not None and cached[0] is matrix else None
+
+
+class _Collapse:
+    """Rejects a result candidate that repeats the seed or an earlier result.
+
+    Holds at most `limit` keys and `limit` unit rows -- the state is the
+    result list itself, never the corpus.
+    """
+
+    def __init__(self, seed_id: str, matrix: np.ndarray | None = None,
+                 unit: np.ndarray | None = None):
+        self._matrix = matrix
+        self._unit = unit
+        self._seed_id = seed_id
+        # Resolved on first accept(), not here: the caller warms the whole
+        # candidate window -- the seed included -- in ONE bulk metadata
+        # read, and reading the seed's key in the constructor would cost a
+        # round trip of its own ahead of it.
+        self._keys: set[str] | None = None
+        self._rows: list[np.ndarray] = []
+
+    def _row(self, index: int | None) -> np.ndarray | None:
+        if index is None or self._matrix is None:
+            return None
+        if self._unit is not None:
+            return self._unit[index]
+        # No cached unit matrix (a non-cosine axis, or a matrix _similarity
+        # did not normalize): normalize the ONE row, not the corpus.
+        vec = np.asarray(self._matrix[index], dtype=np.float32)
+        norm = float(np.linalg.norm(vec))
+        return vec / norm if norm else None
+
+    def accept(self, track_id: str, index: int | None = None) -> bool:
+        """True if this candidate is a new recording; records it if so."""
+        if self._keys is None:
+            seed_key = _dedupe_key(self._seed_id)
+            self._keys = {seed_key} if seed_key else set()
+        key = _dedupe_key(track_id)
+        if key and key in self._keys:
+            return False
+        row = self._row(index)
+        if row is not None and any(float(row @ prev) > _NEAR_DUPLICATE_COSINE
+                                   for prev in self._rows):
+            return False
+        if key:
+            self._keys.add(key)
+        if row is not None:
+            self._rows.append(row)
+        return True
+
+
 def _take(order: np.ndarray, ids: list[str], seed_id: str,
-          limit: int) -> list[int]:
-    """The first `limit` ranked rows that are not the seed.
+          limit: int, collapse: "_Collapse | None" = None) -> list[int]:
+    """The first `limit` ranked rows that are not the seed (nor a duplicate).
 
     Also warms the metadata cache for exactly those rows: building the
     result list first and fetching after turns what used to be `limit`
     sequential store.get_track round trips (1-2 s of every /recommend) into
     one bulk read, or none at all once the ids are cached.
+
+    With a `collapse`, the whole candidate window is warmed UP FRONT
+    instead: the collapse test reads each candidate's title and artist, and
+    fetching those one at a time would undo the single round trip this
+    function exists for.
     """
+    if collapse is not None:
+        order = [int(idx) for idx in order[:_scan_width(limit)]]
+        _tracks_cached([seed_id, *(ids[idx] for idx in order)])
+
     chosen: list[int] = []
     for idx in order:
+        idx = int(idx)
         if ids[idx] == seed_id:
             continue
-        chosen.append(int(idx))
+        if collapse is not None and not collapse.accept(ids[idx], idx):
+            continue
+        chosen.append(idx)
         if len(chosen) == limit:
             break
-    _tracks_cached([ids[idx] for idx in chosen])
+    if collapse is None:
+        _tracks_cached([ids[idx] for idx in chosen])
     return chosen
 
 
@@ -672,7 +777,10 @@ def recommend(track_id: str, axis: str,
         results = _fixture_fallback(track_id, limit)
     elif axis in BLENDED_AXES:
         ids, fused, parts = _blended(corpus, seed_features, BLENDED_AXES[axis])
-        chosen = _take(np.argsort(fused)[::-1], ids, track_id, limit)
+        # No matrix to compare rows in: a blended axis scores in no single
+        # vector space, so duplicates are collapsed on the key alone.
+        chosen = _take(np.argsort(fused)[::-1], ids, track_id, limit,
+                       _Collapse(track_id))
         results = [
             {**_rec_track(ids[idx]), "score": round(float(fused[idx]) / 100.0, 4)}
             for idx in chosen
@@ -690,12 +798,16 @@ def recommend(track_id: str, axis: str,
 
         # The seed is a row in the cached matrix like any other, so ask for one
         # extra and drop it — cheaper than rebuilding the matrix per seed.
+        # Wider still (_scan_width) so the duplicates _take collapses have
+        # replacements to draw on; rank() sorts the whole column regardless
+        # of `limit`, so asking for more is free.
         similarity = _similarity(feature_key, matrix, seed_vec, metric)
         order = rank_mod.rank(
-            seed_vec, matrix, direction=direction, limit=limit + 1,
+            seed_vec, matrix, direction=direction, limit=_scan_width(limit),
             metric=metric, correction=correction, similarity=similarity,
         )
-        chosen = _take(order, ids, track_id, limit)
+        chosen = _take(order, ids, track_id, limit,
+                       _Collapse(track_id, matrix, _unit_rows(feature_key, matrix)))
         results = [
             {**_rec_track(ids[idx]), "score": float(similarity[idx])}
             for idx in chosen
@@ -906,10 +1018,20 @@ def viz_map(track_id: str, axis: str,
         seed_vec = _vector(seed_features, feature_key)
         similarity = _similarity(feature_key, matrix, seed_vec, metric)
         order = rank_mod.rank(seed_vec, matrix, direction=direction,
-                              limit=limit + 1 + skippable, metric=metric,
+                              limit=_scan_width(limit) + skippable, metric=metric,
                               correction=correction, similarity=similarity)
 
     emb_id_set = set(emb_ids)
+    # Same two nets as /recommend (see _Collapse): Insights explains the list
+    # the user saw, so it must collapse the same duplicates. A blended axis
+    # has no single vector space, so it gets the key check only.
+    collapse = _Collapse(track_id, *((None, None) if blended_weights is not None
+                                     else (matrix, _unit_rows(feature_key, matrix))))
+    # The scan is bounded (widened by the rows the snapshot is missing, and
+    # again by the duplicates the collapse may drop), and its metadata is
+    # read in one go: _Collapse reads a title and artist per candidate.
+    order = [int(idx) for idx in order[:_scan_width(limit) + skippable]]
+    _tracks_cached([track_id, *(ids[idx] for idx in order)])
     recs = []
     for idx in order:
         rec_id = ids[idx]
@@ -918,6 +1040,8 @@ def viz_map(track_id: str, axis: str,
         # Before the limit truncation, so the list is still `limit` long and
         # every entry has a row to be positioned at.
         if rec_id not in snapshot_id_set:
+            continue
+        if not collapse.accept(rec_id, None if blended_weights is not None else idx):
             continue
         if blended_weights is not None:
             row = emb_at.get(rec_id)

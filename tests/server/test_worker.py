@@ -359,12 +359,15 @@ def test_enqueue_new_reads_features_in_one_batch(fake_mongo, monkeypatch):
     assert calls["single"] == 0
 
 
-def test_seed_fixture_if_empty_enqueues_all_thirty_once(fake_mongo):
-    assert worker.seed_fixture_if_empty() == 30
-    assert store.queued_count() == 30
+def test_seed_fixture_if_empty_enqueues_the_distinct_fixture_tracks_once(fake_mongo):
+    # 29, not 30: the fixture holds two Deezer ids for Django Reinhardt's
+    # "Minor Swing" (79845626 on a compilation, 6431303 on the Rome
+    # Sessions), and _enqueue_new now queues one edition per recording.
+    assert worker.seed_fixture_if_empty() == 29
+    assert store.queued_count() == 29
     # Guard is "nothing queued and empty corpus": a second call is a no-op.
     assert worker.seed_fixture_if_empty() == 0
-    assert store.queued_count() == 30
+    assert store.queued_count() == 29
 
 
 def test_seed_fixture_skipped_when_corpus_has_tracks(fake_mongo):
@@ -490,6 +493,53 @@ def test_enqueue_new_skips_failed_tracks(fake_mongo):
     assert worker._enqueue_new(_tracks(["1", "2", "3"])) == 2
     assert store.queued_count() == 2
     assert store.get_track("2") is None              # never even wrote metadata
+
+
+def _edition(track_id, title, artist="Miles Davis"):
+    return {"track_id": track_id, "title": title, "artist": artist,
+            "album": "Kind of Blue", "artwork_url": "u", "preview_url": "p"}
+
+
+def test_enqueue_new_skips_a_re_release_of_a_stored_track(fake_mongo):
+    store.put_track(_edition("1", "So What"), {"embedding": [1.0]})
+    assert worker._enqueue_new([_edition("2", "So What (2009 Remaster)")]) == 0
+    assert store.queued_count() == 0
+    assert store.get_track("2") is None          # no metadata written either
+
+
+def test_enqueue_new_queues_one_of_two_editions_in_the_same_batch(fake_mongo):
+    queued = worker._enqueue_new([
+        _edition("1", "So What"),
+        _edition("2", "So What - Live at the Blackhawk"),
+        _edition("3", "Blue in Green"),
+    ])
+    assert queued == 2
+    assert sorted(j["track_id"] for j in fake_mongo.jobs.find({})) == ["1", "3"]
+
+
+def test_enqueue_new_keeps_a_cover_by_another_artist(fake_mongo):
+    store.put_track(_edition("1", "So What"), {"embedding": [1.0]})
+    assert worker._enqueue_new([_edition("2", "So What", artist="Ron Carter")]) == 1
+
+
+def test_enqueue_new_reads_existing_keys_in_one_batch(fake_mongo, monkeypatch):
+    calls = []
+    original = store.existing_keys
+    monkeypatch.setattr(worker.store, "existing_keys",
+                        lambda keys: (calls.append(list(keys)), original(keys))[1])
+    assert worker._enqueue_new(_tracks(["1", "2", "3", "4", "5"])) == 5
+    assert len(calls) == 1                       # one query for the whole batch
+    assert len(calls[0]) == 5
+
+
+def test_crawl_step_logs_duplicates_skipped(fake_mongo, monkeypatch, capsys):
+    monkeypatch.setattr(worker.crawl, "from_charts",
+                        lambda genre_ids, per_genre=100: [
+                            _edition("1", "So What"),
+                            _edition("2", "So What (Remastered)"),
+                        ])
+    worker.crawl_step()
+    assert "1 queued, 1 duplicates skipped" in capsys.readouterr().out
 
 
 def test_crawl_step_respects_corpus_cap_and_queue_depth(fake_mongo, monkeypatch):

@@ -40,6 +40,7 @@ import pymongo
 from pymongo import ReturnDocument
 
 from music_recommendations.analysis.quantize import from_int8, to_int8
+from music_recommendations.server.dedupe import dedupe_key
 
 TRACK_FIELDS = ("title", "artist", "album", "artwork_url")
 VERSION_KEY = "_features_version"   # what corpus/ingest.py expects to read back
@@ -81,6 +82,10 @@ def ensure_indexes() -> None:
         return
     d = db()
     d.tracks.create_index("analyzed_at")
+    # The crawler asks "which of these 100 keys do we already have?" once per
+    # batch (existing_keys), and the backfill groups the whole collection on
+    # it; neither is affordable as a scan at corpus scale.
+    d.tracks.create_index("dedupe_key")
     d.jobs.create_index([("state", pymongo.ASCENDING), ("created_at", pymongo.ASCENDING)])
     d.cache.create_index("expires_at", expireAfterSeconds=0)
     _indexes_ready = True
@@ -94,7 +99,26 @@ def _contract(doc: dict) -> dict:
 
 
 def _meta(track: dict) -> dict:
-    return {k: track.get(k) for k in TRACK_FIELDS}
+    """The contract fields plus the dedupe key derived from them.
+
+    `dedupe_key` is stored, not computed on read, so the crawler's
+    "have we got this recording already?" question is one indexed `$in`
+    instead of a scan. It is NOT a contract field: _contract() projects
+    TRACK_FIELDS only, so it can never reach a response.
+    """
+    return {**{k: track.get(k) for k in TRACK_FIELDS},
+            "dedupe_key": dedupe_key(track.get("title"), track.get("artist"))}
+
+
+# A track that is analyzed and has not been retired as a duplicate of
+# another recording. Every CORPUS ENUMERATION (corpus_ids, base_matrix,
+# tracks_since) filters on this, which is what removes retired rows from
+# ranking, the viz snapshot and the crawl watermark in one place.
+#
+# Deliberately NOT applied to get_features/get_many_features/get_track: a
+# retired id is still a legitimate SEED (a user can search it up on Deezer
+# and press play), and refusing to look it up would 404 a playable track.
+LIVE = {"analyzed_at": {"$exists": True}, "duplicate_of": {"$exists": False}}
 
 
 def put_track(track: dict, features: dict) -> None:
@@ -142,6 +166,12 @@ def get_features(track_id: str) -> dict | None:
 
 
 def get_many_features(track_ids: list[str]) -> list[dict | None]:
+    """Features per requested id, in order; None for an unanalyzed id.
+
+    No LIVE filter on purpose: an id asked for by name (a seed, an
+    attribution pair, a crawl candidate) is answered even if it was retired
+    as a duplicate. Only the corpus enumerations hide retired rows.
+    """
     if not track_ids:
         return []
     found = {d["_id"]: _features(d) for d in
@@ -167,8 +197,13 @@ def tracks_since(stamp: datetime) -> list[tuple[str, np.ndarray]]:
     exactly at `stamp`) can come back again; callers that page through this
     by re-using the last-seen `analyzed_at` as the next `stamp` must dedupe
     by track id.
+
+    Retired duplicates (`duplicate_of` set) are excluded, like every other
+    corpus enumeration -- a caller paging this to build a matrix must not
+    re-introduce a row corpus_ids() no longer lists.
     """
-    cursor = db().tracks.find({"analyzed_at": {"$gte": stamp}},
+    cursor = db().tracks.find({"duplicate_of": {"$exists": False},
+                               "analyzed_at": {"$gte": stamp}},
                               {"embedding": 1, "scale": 1}).sort("analyzed_at", 1)
     return [(d["_id"], from_int8(d["embedding"], d["scale"])) for d in cursor]
 
@@ -180,7 +215,7 @@ _ids_cache: tuple[datetime, list[str]] | None = None
 
 
 def corpus_ids() -> list[str]:
-    """All analyzed track ids, sorted."""
+    """All analyzed, non-retired track ids, sorted (see LIVE)."""
     global _ids_cache
     with _lock:
         if _ids_cache is None:
@@ -188,8 +223,7 @@ def corpus_ids() -> list[str]:
             # field (together), so the two filters are equivalent -- but
             # analyzed_at has an index (ensure_indexes) and embedding does
             # not.
-            docs = list(db().tracks.find({"analyzed_at": {"$exists": True}},
-                                         {"analyzed_at": 1}))
+            docs = list(db().tracks.find(LIVE, {"analyzed_at": 1}))
             newest = max((d["analyzed_at"] for d in docs), default=datetime(1970, 1, 1))
             _ids_cache = (newest, sorted(d["_id"] for d in docs))
             return list(_ids_cache[1])
@@ -198,7 +232,9 @@ def corpus_ids() -> list[str]:
         # analyzed in another process within the same millisecond as the
         # watermark would otherwise be missed. Re-fetching the watermark
         # row itself is harmless -- the set union below dedupes it.
-        fresh = list(db().tracks.find({"analyzed_at": {"$gte": newest}}, {"analyzed_at": 1}))
+        fresh = list(db().tracks.find({"duplicate_of": {"$exists": False},
+                                       "analyzed_at": {"$gte": newest}},
+                                      {"analyzed_at": 1}))
         if fresh:
             newest = max(d["analyzed_at"] for d in fresh)
             ids = sorted(set(ids) | {d["_id"] for d in fresh})
@@ -210,8 +246,43 @@ def corpus_size() -> int:
     return len(corpus_ids())
 
 
+def existing_keys(keys: list[str]) -> set[str]:
+    """Which of these dedupe keys the corpus already holds, in one query.
+
+    Retired duplicates are ignored: their key belongs to the primary that
+    replaced them, so counting them again would be double-counting -- and
+    if the primary itself were ever removed, the key should be free to
+    return.
+    """
+    keys = [k for k in dict.fromkeys(keys) if k]
+    if not keys:
+        return set()
+    docs = db().tracks.find(
+        {"dedupe_key": {"$in": keys}, "duplicate_of": {"$exists": False}},
+        {"dedupe_key": 1},
+    )
+    return {d["dedupe_key"] for d in docs if d.get("dedupe_key")}
+
+
+def mark_duplicate(track_id: str, primary_id: str) -> None:
+    """Retire `track_id` as another edition of `primary_id`.
+
+    The document stays (its features still answer an explicit seed); it just
+    leaves every corpus enumeration. The in-process id cache is dropped so
+    this takes effect without a restart -- it only ever grows otherwise.
+    """
+    global _ids_cache
+    db().tracks.update_one({"_id": track_id},
+                           {"$set": {"duplicate_of": primary_id}})
+    with _lock:
+        _ids_cache = None
+
+
 def base_matrix() -> tuple[list[str], np.ndarray]:
-    """Every analyzed embedding as one float32 matrix, ids in row order.
+    """Every live embedding as one float32 matrix, ids in row order.
+
+    "Live" is analyzed and not retired as a duplicate (see LIVE), so a
+    backfilled duplicate stops being a rankable row everywhere at once.
 
     Preallocated rather than stacked: a corpus of tens of thousands of
     tracks means a stack of per-row arrays (and the list holding them)
@@ -220,12 +291,11 @@ def base_matrix() -> tuple[list[str], np.ndarray]:
     # analyzed_at, not embedding: only put_track ever sets either field
     # (together), so the two filters are equivalent -- but analyzed_at has
     # an index (ensure_indexes) and embedding does not.
-    n = db().tracks.count_documents({"analyzed_at": {"$exists": True}})
+    n = db().tracks.count_documents(LIVE)
     if n == 0:
         return [], np.empty((0, 1), dtype=np.float32)
 
-    cursor = db().tracks.find({"analyzed_at": {"$exists": True}},
-                              {"embedding": 1, "scale": 1}).sort("_id", 1)
+    cursor = db().tracks.find(LIVE, {"embedding": 1, "scale": 1}).sort("_id", 1)
     ids: list[str] = []
     matrix: np.ndarray | None = None
     i = 0
