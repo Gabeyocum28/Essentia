@@ -25,6 +25,11 @@ export function Insights() {
   const [chip, setChip] = useState<GalaxyChip>("Explore");
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
+  // The global viz endpoints (tour/mst/hubs/extremes) build their own
+  // seed-anchored subset, which need not contain a far `surprise` rec. Hand
+  // them the ids this map drew so the highlighting lines up across chips.
+  const recIds = useMemo(() => map?.recs.map((r) => r.track_id) ?? [], [map]);
+
   const selectedRec = useMemo(
     () => map?.recs.find((r) => r.track_id === selectedId) ?? null,
     [map, selectedId],
@@ -121,8 +126,12 @@ export function Insights() {
 
               {chip === "Explore" && <Galaxy map={map} selectedId={selectedId} onSelect={setSelectedId} />}
               {chip === "Walk" && <Walk map={map} selectedId={selectedId} onSelect={setSelectedId} />}
-              {chip === "Tour" && <Tour map={map} selectedId={selectedId} onSelect={setSelectedId} />}
-              {chip === "Topo" && <Topology map={map} selectedId={selectedId} onSelect={setSelectedId} />}
+              {chip === "Tour" && (
+                <Tour map={map} seedId={id} recIds={recIds} selectedId={selectedId} onSelect={setSelectedId} />
+              )}
+              {chip === "Topo" && (
+                <Topology map={map} seedId={id} recIds={recIds} selectedId={selectedId} onSelect={setSelectedId} />
+              )}
             </>
           )}
 
@@ -132,8 +141,8 @@ export function Insights() {
 
           {mode === "PROOF" && (
             <>
-              <Proof trackId={id} />
-              <Extremes />
+              <Proof seedId={id} recIds={recIds} />
+              <Extremes seedId={id} recIds={recIds} />
             </>
           )}
         </>

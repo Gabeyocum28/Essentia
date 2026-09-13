@@ -26,6 +26,12 @@ const q = (params: Record<string, string | number | undefined>) =>
   "?" + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined)
     .map(([k, v]) => [k, String(v)])).toString();
 
+// The subset the global viz endpoints build is seed-anchored, so a `surprise`
+// rec can fall outside it and have no row to highlight. Passing the rec ids
+// guarantees each one a row. undefined (not "") when there are none, so `q`
+// drops the param entirely rather than sending an empty list.
+const recList = (recs?: string[]) => (recs && recs.length ? recs.join(",") : undefined);
+
 export const previewUrl = (trackId: string) => `${BASE}/preview/${trackId}`;
 
 export function decodeCoords8(b64: string, n: number): Float32Array[] {
@@ -44,12 +50,17 @@ export const api = {
     request<T.VizMap>(`/viz/map${q({ track_id, axis, limit, correction })}`),
   vizWalk: (from: string, to: string, k = 8) => request<T.VizWalk>(`/viz/walk${q({ from, to, k })}`),
   vizHistogram: (track_id: string) => request<T.VizHistogram>(`/viz/histogram${q({ track_id })}`),
-  vizHubs: () => request<T.VizHubs>("/viz/hubs"),
-  vizTour: async (): Promise<T.VizTour> => {
-    const raw = await request<{ ids: string[]; coords8: string; variance: number[] }>("/viz/tour");
+  vizHubs: (track_id?: string, recs?: string[]) =>
+    request<T.VizHubs>(`/viz/hubs${q({ track_id, recs: recList(recs) })}`),
+  vizTour: async (track_id?: string, recs?: string[]): Promise<T.VizTour> => {
+    const raw = await request<{ ids: string[]; coords8: string; variance: number[] }>(
+      `/viz/tour${q({ track_id, recs: recList(recs) })}`,
+    );
     return { ids: raw.ids, coords: decodeCoords8(raw.coords8, raw.ids.length), variance: raw.variance };
   },
-  vizMst: () => request<T.VizMst>("/viz/mst"),
-  vizExtremes: (pc: number, limit = 4) => request<T.VizExtremes>(`/viz/extremes${q({ pc, limit })}`),
+  vizMst: (track_id?: string, recs?: string[]) =>
+    request<T.VizMst>(`/viz/mst${q({ track_id, recs: recList(recs) })}`),
+  vizExtremes: (pc: number, limit = 4, track_id?: string, recs?: string[]) =>
+    request<T.VizExtremes>(`/viz/extremes${q({ pc, limit, track_id, recs: recList(recs) })}`),
   vizAttribute: (seed: string, rec: string) => request<T.VizAttribution>(`/viz/attribute${q({ seed, rec })}`),
 };

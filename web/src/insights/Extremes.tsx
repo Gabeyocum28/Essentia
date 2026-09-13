@@ -32,20 +32,25 @@ function Rail({ label, tracks }: { label: string; tracks: Track[] }) {
   );
 }
 
-export function Extremes() {
+interface Props {
+  seedId: string;
+  recIds: string[];
+}
+
+export function Extremes({ seedId, recIds }: Props) {
   const [status, setStatus] = useState<Status>("loading");
   const [pcs, setPcs] = useState<VizExtremesData[]>([]);
 
   const run = useCallback(async () => {
     setStatus("loading");
     try {
-      const results = await Promise.all(PCS.map((pc) => api.vizExtremes(pc, 4)));
+      const results = await Promise.all(PCS.map((pc) => api.vizExtremes(pc, 4, seedId, recIds)));
       setPcs(results);
       setStatus("ready");
     } catch {
       setStatus("error");
     }
-  }, []);
+  }, [seedId, recIds]);
 
   useEffect(() => {
     void run();

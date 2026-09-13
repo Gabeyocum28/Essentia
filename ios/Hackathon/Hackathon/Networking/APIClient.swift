@@ -99,7 +99,7 @@ actor APIClient {
         try await get("viz/hubs", as: VizHubs.self)
     }
 
-    /// GET /viz/tour — whole-corpus 8-d PCA coordinates for the Grand Tour.
+    /// GET /viz/tour — 8-d PCA coordinates over the seed's subset for the Grand Tour.
     func vizTour() async throws -> VizTour {
         try await get("viz/tour", as: VizTour.self)
     }

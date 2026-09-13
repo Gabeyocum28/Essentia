@@ -6,6 +6,8 @@ import type { VizMap, VizTour } from "../api/types";
 
 interface Props {
   map: VizMap;
+  seedId: string;
+  recIds: string[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
 }
@@ -14,7 +16,7 @@ type Status = "loading" | "ready" | "error";
 
 const PAD = 24;
 
-export function Tour({ map, selectedId }: Props) {
+export function Tour({ map, seedId, recIds, selectedId }: Props) {
   const [status, setStatus] = useState<Status>("loading");
   const [tour, setTour] = useState<VizTour | null>(null);
   const [playing, setPlaying] = useState(true);
@@ -37,13 +39,13 @@ export function Tour({ map, selectedId }: Props) {
   const run = useCallback(async () => {
     setStatus("loading");
     try {
-      const result = await api.vizTour();
+      const result = await api.vizTour(seedId, recIds);
       setTour(result);
       setStatus("ready");
     } catch {
       setStatus("error");
     }
-  }, []);
+  }, [seedId, recIds]);
 
   useEffect(() => {
     void run();
@@ -77,7 +79,9 @@ export function Tour({ map, selectedId }: Props) {
     return new Map(tour.ids.map((id, i) => [id, i]));
   }, [tour]);
 
-  const recIds = useMemo(() => new Set(map.recs.map((r) => r.track_id)), [map.recs]);
+  // The highlight set for drawing, distinct from the `recIds` prop, which is
+  // the list sent to the server so those tracks are in the subset at all.
+  const recSet = useMemo(() => new Set(map.recs.map((r) => r.track_id)), [map.recs]);
   const seedIdx = tour ? idIndex.get(map.seed.track_id) : undefined;
 
   useEffect(() => {
@@ -119,7 +123,7 @@ export function Tour({ map, selectedId }: Props) {
 
       ctx.fillStyle = "rgba(255,255,255,.7)";
       for (let i = 0; i < x.length; i++) {
-        if (i === seedIdx || recIds.has(tour.ids[i])) continue;
+        if (i === seedIdx || recSet.has(tour.ids[i])) continue;
         const [sx, sy] = toScreen(t, x[i], y[i]);
         ctx.beginPath();
         ctx.arc(sx, sy, 2.4, 0, Math.PI * 2);
@@ -127,7 +131,7 @@ export function Tour({ map, selectedId }: Props) {
       }
 
       for (let i = 0; i < x.length; i++) {
-        if (!recIds.has(tour.ids[i]) || i === seedIdx) continue;
+        if (!recSet.has(tour.ids[i]) || i === seedIdx) continue;
         const [sx, sy] = toScreen(t, x[i], y[i]);
         if (selectedId === tour.ids[i]) {
           ctx.fillStyle = "rgba(10,132,255,.35)";
@@ -161,7 +165,7 @@ export function Tour({ map, selectedId }: Props) {
       cancelled = true;
       cancelAnimationFrame(raf);
     };
-  }, [tour, size, radius, seedIdx, recIds, selectedId]);
+  }, [tour, size, radius, seedIdx, recSet, selectedId]);
 
   const variancePct = useMemo(() => {
     if (!tour) return 0;

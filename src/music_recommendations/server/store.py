@@ -414,6 +414,49 @@ def queued_count() -> int:
     return db().jobs.count_documents({"state": "queued"})
 
 
+_SYSTEM_DBS = ("admin", "local", "config")
+
+
+def _db_stats_bytes(database) -> int:
+    stats = database.command("dbStats")
+    return int(stats.get("dataSize", 0)) + int(stats.get("indexSize", 0))
+
+
+def data_size_bytes() -> int:
+    """Data plus index bytes for the WHOLE CLUSTER (what Atlas counts against
+    the free tier's 512 MB), not just our own database.
+
+    Atlas bills the cluster, so a leftover database beside `essentia` --
+    a scratch copy, an older crawl -- counts against the same cap while
+    being invisible to a single-database dbStats. The crawler's byte cap is
+    only a real brake if it sees what Atlas sees.
+
+    Three levels of fallback, because this must never be the thing that
+    stops a crawl: the cluster sum, then our own database, then a
+    2 KB-per-track estimate (mongomock, which implements neither
+    list_database_names' stats nor dbStats).
+    """
+    try:
+        client = db().client
+        names = [n for n in client.list_database_names() if n not in _SYSTEM_DBS]
+        if not names:
+            # mongomock lists nothing until a write lands, and a cluster that
+            # reports no user databases is a broken read, not an empty disk.
+            # Either way, 0 would silently disable the crawler's byte cap.
+            raise NotImplementedError("no user databases listed")
+        return sum(_db_stats_bytes(client[name]) for name in names)
+    except (pymongo.errors.PyMongoError, NotImplementedError,
+            TypeError, AttributeError) as exc:
+        print(f"data_size_bytes: cluster-wide dbStats unavailable ({exc!r}); "
+              f"falling back to this database")
+    try:
+        return _db_stats_bytes(db())
+    except (pymongo.errors.PyMongoError, NotImplementedError, TypeError) as exc:
+        print(f"data_size_bytes: dbStats unavailable ({exc!r}); "
+              f"estimating from document count")
+    return db().tracks.count_documents({}) * 2048
+
+
 def failed_ids(track_ids: list[str]) -> set[str]:
     """Which of these track ids have a permanently failed embed job, in one
     query -- so a crawl never re-enqueues a track that already failed."""

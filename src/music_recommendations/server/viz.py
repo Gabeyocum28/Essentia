@@ -35,7 +35,7 @@ def clear_geometry_cache() -> None:
 
 
 def normalized_rows(matrix: np.ndarray) -> np.ndarray:
-    matrix = np.asarray(matrix, dtype=float)
+    matrix = np.asarray(matrix, dtype=np.float32)
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     return matrix / np.where(norms == 0.0, 1.0, norms)
 
@@ -43,8 +43,10 @@ def normalized_rows(matrix: np.ndarray) -> np.ndarray:
 def pairwise_cosine(matrix: np.ndarray) -> np.ndarray:
     """Dense cosine matrix cached by matrix identity; safe through ~10k rows.
 
-    At 20k rows float64 approaches 3.2 GB, so this intentionally remains a
-    small-corpus visualization primitive rather than a ranking dependency.
+    float32 throughout (normalized_rows casts): at 10k rows that is 400 MB
+    rather than 800 MB. It is still an n^2 allocation, so this intentionally
+    remains a small-corpus visualization primitive — bounded by VIZ_MAX on
+    the seed-anchored subset — rather than a ranking dependency.
     """
     global _PAIRWISE_CACHE
     with _PAIRWISE_LOCK:
@@ -64,8 +66,13 @@ def shortest_walk(matrix: np.ndarray, start: int, end: int,
     matching the numbers shown in the walkthrough. The graph is cached by
     matrix identity and k because embedding matrices are already cache-owned
     by the server for the lifetime of one corpus state.
+
+    The matrix is used as handed in, never re-cast: it arrives as the float32
+    seed subset, and an `asarray(..., dtype=float)` rebinding both doubled it
+    and produced a NEW object, which missed pairwise_cosine's identity cache
+    and recomputed the n^2 similarity for the walk, the MST and the hubs
+    separately.
     """
-    matrix = np.asarray(matrix, dtype=float)
     n = len(matrix)
     if not (0 <= start < n and 0 <= end < n):
         raise IndexError("walk endpoint outside matrix")
@@ -201,11 +208,12 @@ def minimum_spanning_tree(matrix: np.ndarray) -> list[tuple[int, int, float]]:
 
     Returns exactly n-1 (i, j, d) edges, i < j, sorted ascending by d.
     Deterministic tie-breaking: when multiple unvisited nodes tie for the
-    cheapest edge, the lowest index wins. Reuses pairwise_cosine's cache,
-    so this stays cheap through the ~10k-row scale that primitive already
-    documents; not engineered past it.
+    cheapest edge, the lowest index wins. Reuses pairwise_cosine's cache --
+    the matrix is passed through untouched, so /viz/walk, /viz/mst and
+    /viz/hubs on one subset share a single similarity matrix -- and so stays
+    cheap through the ~10k-row scale that primitive already documents; not
+    engineered past it.
     """
-    matrix = np.asarray(matrix, dtype=float)
     n = len(matrix)
     if n < 2:
         return []

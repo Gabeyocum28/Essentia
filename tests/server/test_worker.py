@@ -519,3 +519,10 @@ def test_tick_crawls_only_when_idle_and_rate_limited(fake_mongo, monkeypatch):
     worker._last_crawl = 0.0
     worker._tick()
     assert crawls == [1]                                            # busy tick never crawls
+
+
+def test_crawl_step_stops_at_the_byte_cap(fake_mongo, monkeypatch):
+    monkeypatch.setattr(worker, "CORPUS_BYTES_CAP", 10)
+    monkeypatch.setattr(worker.store, "data_size_bytes", lambda: 11)
+    monkeypatch.setattr(worker.crawl, "from_charts", lambda *a, **k: _tracks(["1"]))
+    assert worker.crawl_step() == 0

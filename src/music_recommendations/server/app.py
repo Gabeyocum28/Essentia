@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
+from collections import OrderedDict
 from contextvars import ContextVar
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, RedirectResponse
@@ -354,12 +355,16 @@ def _build(corpus: tuple[str, ...], feature_key: str, metric: str,
            want_correction: bool) -> tuple[list[str], np.ndarray, np.ndarray | None]:
     cached = _MATRIX_CACHE.get(feature_key)
     known = set(cached.ids) if cached else set()
+    # One set for both the subset test and the membership checks below;
+    # `known.issubset(corpus)` would build its own copy of a 90k-id tuple.
+    corpus_set = set(corpus)
 
     # Tracks only ever get added, so the common case is a short tail of new ids.
     # A track disappearing means someone cleared the store: drop it all and rebuild.
-    if cached is not None and not known.issubset(corpus):
+    if cached is not None and not known.issubset(corpus_set):
         cached, known = None, set()
 
+    # Iterated over the tuple, not the set: row order must follow corpus order.
     fresh = [i for i in corpus if i not in known]
     if cached is None:
         ids, matrix = _cold_matrix(corpus, feature_key)
@@ -395,7 +400,12 @@ def _build(corpus: tuple[str, ...], feature_key: str, metric: str,
 # at 90k tracks. The unit rows only change when rows are appended, and
 # _corpus_matrix hands back a NEW ndarray when that happens, so keying on the
 # matrix object itself invalidates this cache for free.
-_UNIT_CACHE: dict[str, tuple[int, np.ndarray]] = {}
+#
+# The matrix is held IN the tuple, not reduced to id(matrix): a bare id lets
+# the array it named be freed, and a later array allocated at the same address
+# would then be served a unit matrix belonging to a different (possibly
+# differently-sized) corpus. Same reason viz._PAIRWISE_CACHE holds its matrix.
+_UNIT_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
 
 def _similarity(feature_key: str, matrix: np.ndarray, seed_vec: np.ndarray,
@@ -406,11 +416,13 @@ def _similarity(feature_key: str, matrix: np.ndarray, seed_vec: np.ndarray,
     if metric != "cosine" or not len(matrix):
         return rank_mod.scores(seed_vec, matrix, metric)
 
-    stamp, unit = _UNIT_CACHE.get(feature_key, (None, None))
-    if stamp != id(matrix):
-        unit = rank_mod.normalize(np.asarray(matrix, dtype=float))
-        _UNIT_CACHE[feature_key] = (id(matrix), unit)
-    return unit @ rank_mod.normalize(np.asarray(seed_vec, dtype=float))
+    cached = _UNIT_CACHE.get(feature_key)
+    if cached is not None and cached[0] is matrix:
+        unit = cached[1]
+    else:
+        unit = rank_mod.normalize(np.asarray(matrix, dtype=np.float32))
+        _UNIT_CACHE[feature_key] = (matrix, unit)
+    return unit @ rank_mod.normalize(np.asarray(seed_vec, dtype=np.float32))
 
 
 def _percentile(values: np.ndarray) -> np.ndarray:
@@ -517,22 +529,44 @@ def recommend(track_id: str, axis: str,
 # was computed from: recomputed only when _corpus_matrix hands back a new
 # object (corpus grew or was rebuilt), served from memory otherwise. One SVD
 # serves /viz/map + /viz/walk (columns 0:2) and /viz/tour + /viz/extremes
-# (all 8 columns) — matrix-identity-pinned like _PAIRWISE_CACHE/_GRAPH_CACHE
-# in viz.py (never key by bare id(matrix): a freed array's address can be
-# reused by a later, differently-sized corpus).
-_TOP8_CACHE: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+# (all 8 columns). Keyed by id(matrix), not a single fixed slot: the
+# seed-anchored subset means two different seeds' matrices can both be live
+# at once (a caller alternating between two seeds), so a single-entry cache
+# thrashed on every other request. The matrix is stored in the VALUE and
+# re-checked with `is`, so a reused id is a miss rather than a wrong answer,
+# and entries whose subset matrix is no longer cached are purged by
+# _viz_subset (see _purge_viz_caches) instead of pinning it in memory.
+_TOP8_CACHE: "OrderedDict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]" = OrderedDict()
 
-# The MST edge list of the embedding matrix, matrix-identity-pinned the same
-# way. Not part of contract/contract.md — see /viz/mst below.
-_MST_CACHE: dict[str, tuple[np.ndarray, list[tuple[int, int, float]]]] = {}
+# The MST edge list of the embedding matrix, keyed the same way. Not part of
+# contract/contract.md — see /viz/mst below.
+_MST_CACHE: "OrderedDict[int, tuple[np.ndarray, list[tuple[int, int, float]]]]" = OrderedDict()
+_CACHE_KEEP = 4
+
+# One lock for all three viz caches (_SUBSET_CACHE, _TOP8_CACHE, _MST_CACHE).
+# Endpoints run on FastAPI's threadpool, and every one of these caches is a
+# read-modify-write (lookup + move_to_end, insert + evict, purge): without
+# this, two concurrent /viz calls could interleave a move_to_end with a
+# popitem and drop the entry that was just promoted, or leave an OrderedDict
+# mid-mutation. Deliberately NOT _MATRIX_LOCK: _viz_subset calls
+# _corpus_matrix, which takes that lock, so sharing one would self-deadlock.
+_VIZ_CACHE_LOCK = threading.Lock()
 
 
 def _top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    cached = _TOP8_CACHE.get("embedding")
-    if cached is not None and cached[0] is matrix:
-        return cached[1], cached[2]
+    key = id(matrix)
+    with _VIZ_CACHE_LOCK:
+        cached = _TOP8_CACHE.get(key)
+        if cached is not None and cached[0] is matrix:
+            _TOP8_CACHE.move_to_end(key)
+            return cached[1], cached[2]
+    # The SVD runs outside the lock: it is the expensive part, and two
+    # threads racing on the same matrix would only compute it twice.
     coords8, variance = viz.project_top8(matrix)
-    _TOP8_CACHE["embedding"] = (matrix, coords8, variance)
+    with _VIZ_CACHE_LOCK:
+        _TOP8_CACHE[key] = (matrix, coords8, variance)
+        while len(_TOP8_CACHE) > _CACHE_KEEP:
+            _TOP8_CACHE.popitem(last=False)
     return coords8, variance
 
 
@@ -544,11 +578,17 @@ def _projection(matrix: np.ndarray) -> np.ndarray:
 
 
 def _mst(matrix: np.ndarray) -> list[tuple[int, int, float]]:
-    cached = _MST_CACHE.get("embedding")
-    if cached is not None and cached[0] is matrix:
-        return cached[1]
+    key = id(matrix)
+    with _VIZ_CACHE_LOCK:
+        cached = _MST_CACHE.get(key)
+        if cached is not None and cached[0] is matrix:
+            _MST_CACHE.move_to_end(key)
+            return cached[1]
     edges = viz.minimum_spanning_tree(matrix)
-    _MST_CACHE["embedding"] = (matrix, edges)
+    with _VIZ_CACHE_LOCK:
+        _MST_CACHE[key] = (matrix, edges)
+        while len(_MST_CACHE) > _CACHE_KEEP:
+            _MST_CACHE.popitem(last=False)
     return edges
 
 
@@ -572,8 +612,6 @@ def viz_map(track_id: str, axis: str,
                                             want_correction=False)
     if track_id not in emb_ids:
         raise HTTPException(404, f"track {track_id} not in corpus")
-    xy = _projection(emb_matrix)
-    position = {tid: i for i, tid in enumerate(emb_ids)}
 
     from music_recommendations.server import rank as rank_mod
 
@@ -603,13 +641,13 @@ def viz_map(track_id: str, axis: str,
                               limit=limit + 1, metric=metric,
                               correction=correction, similarity=similarity)
 
+    emb_id_set = set(emb_ids)
     recs = []
     for idx in order:
         rec_id = ids[idx]
-        if rec_id == track_id or rec_id not in position:
+        if rec_id == track_id or rec_id not in emb_id_set:
             continue
         track = _safe(store.get_track, rec_id)
-        pos = position[rec_id]
         if blended_weights is not None:
             row = emb_at.get(rec_id)
             if row is None:
@@ -630,12 +668,24 @@ def viz_map(track_id: str, axis: str,
         recs.append({
             **(_playable(track) or {"track_id": rec_id}),
             "score": score,
-            "x": float(xy[pos, 0]),
-            "y": float(xy[pos, 1]),
             "math": math,
         })
         if len(recs) == limit:
             break
+
+    # The points/projection are seed-anchored, not the whole corpus: recs
+    # (e.g. `surprise`'s far neighbours) are drawn even when they fall
+    # outside the nearest-VIZ_MAX ring, via extra_ids.
+    subset_ids, subset_matrix = _viz_subset(
+        track_id, extra_ids=[rec["track_id"] for rec in recs],
+        corpus=(emb_ids, emb_matrix),
+    )
+    xy = _projection(subset_matrix)
+    position = {tid: i for i, tid in enumerate(subset_ids)}
+    for rec in recs:
+        pos = position[rec["track_id"]]
+        rec["x"] = float(xy[pos, 0])
+        rec["y"] = float(xy[pos, 1])
 
     seed_track = _playable(_safe(store.get_track, track_id)) or {"track_id": track_id}
     seed_pos = position[track_id]
@@ -645,8 +695,8 @@ def viz_map(track_id: str, axis: str,
         "y": float(xy[seed_pos, 1]),
     }
     point_tracks = []
-    for point_id, track in zip(emb_ids, _safe(store.get_many_tracks, emb_ids,
-                                                default=[])):
+    for point_id, track in zip(subset_ids, _safe(store.get_many_tracks, subset_ids,
+                                                  default=[])):
         point_tracks.append(_playable(track) or {
             "track_id": point_id,
             "title": point_id,
@@ -664,7 +714,7 @@ def viz_map(track_id: str, axis: str,
 
     return {
         "points": {
-            "ids": emb_ids,
+            "ids": subset_ids,
             "x": [round(float(v), 4) for v in xy[:, 0]],
             "y": [round(float(v), 4) for v in xy[:, 1]],
             "tracks": point_tracks,
@@ -673,6 +723,122 @@ def viz_map(track_id: str, axis: str,
         "recs": recs,
         "axis": axis_info,
     }
+
+
+# Insights endpoints (tour/mst/hubs/walk/map) do dense n x n work over
+# whatever matrix they're handed; VIZ_MAX bounds that matrix's row count
+# regardless of how large the analyzed corpus grows. Read at call time
+# (not cached at import) so tests can monkeypatch it per-test.
+VIZ_MAX = int(os.environ.get("VIZ_MAX", "8000"))
+
+# Seed id + extra ids -> (matrix_all, ids, subset_matrix) for that seed's
+# subset. The full matrix the subset was sliced from is stored alongside it
+# (mirroring _top8/_mst) and re-checked with `is` on every lookup: the
+# subset itself is a COPY, not a view, so it does not by itself keep
+# id(matrix_all) from being reused by a later, differently-sized matrix once
+# _MATRIX_CACHE replaces the original during a crawl. A key whose stored
+# matrix no longer matches is evicted and treated as a miss rather than
+# risking rows from a stale corpus, and every miss also purges the entries
+# belonging to superseded full matrices (_purge_viz_caches) so a stale key
+# cannot pin one in memory. The cap bounds what is left.
+_SUBSET_CACHE: "OrderedDict[tuple[int, str | None, tuple[str, ...]], tuple[np.ndarray, list[str], np.ndarray]]" = OrderedDict()
+# Four, not two: one Insights screen asks for the seed's subset with the recs
+# of the corrected map, the recs of the raw map, and (from /viz/tour, /viz/mst,
+# /viz/hubs, /viz/extremes) the recs it was handed — distinct `extra` tuples,
+# so a 2-entry cap thrashed within a single screen load.
+_SUBSET_KEEP = 4
+
+
+def _purge_viz_caches(matrix_all: np.ndarray) -> None:
+    """Drop every viz cache entry that belongs to a superseded full matrix.
+
+    Caller must hold _VIZ_CACHE_LOCK. A _SUBSET_CACHE value holds a strong
+    reference to the full matrix it was sliced from, so one stale entry pins
+    a whole ~450 MB corpus matrix that _MATRIX_CACHE has already replaced.
+    LRU eviction alone does not do this: the stale entry can stay inside the
+    keep window indefinitely if it is never looked up again. _TOP8_CACHE and
+    _MST_CACHE pin subset matrices the same way, so they are purged down to
+    whatever subsets are still cached.
+    """
+    for key in [k for k, v in _SUBSET_CACHE.items() if v[0] is not matrix_all]:
+        _SUBSET_CACHE.pop(key, None)
+    live = [value[2] for value in _SUBSET_CACHE.values()]
+    for cache in (_TOP8_CACHE, _MST_CACHE):
+        for key in [k for k, v in cache.items()
+                    if not any(v[0] is subset for subset in live)]:
+            cache.pop(key, None)
+
+
+def _viz_subset(seed_id: str | None,
+                extra_ids: "list[str] | tuple[str, ...]" = (),
+                corpus: "tuple[list[str], np.ndarray] | None" = None,
+                ) -> tuple[list[str], np.ndarray]:
+    """VIZ_MAX rows plus any extra ids, of the corpus, for the insights endpoints.
+
+    With a seed: the seed plus its VIZ_MAX-1 nearest tracks by cosine over the
+    FULL matrix (one matrix-vector product), plus any extra ids the caller
+    needs drawn (an axis's recs, which for `surprise` are far away). Without
+    a seed: the first VIZ_MAX rows, for clients that predate the parameter.
+    Row order is the full matrix's order, so tour/mst/hubs agree on indices.
+    The dense n×n work downstream happens on this copy, never on the corpus.
+
+    `corpus` is the (ids, matrix) pair a caller already holds (/viz/map has
+    just built it), passed in so this does not re-derive the same pair.
+    """
+    ids_all, matrix_all = corpus if corpus is not None else _viz_embedding_corpus()
+    # Hoisted out of the generator: as an inline condition this rebuilt the
+    # whole id set once per extra id.
+    known = set(ids_all)
+    extra = tuple(t for t in extra_ids if t in known)
+    key = (id(matrix_all), seed_id, extra)
+    with _VIZ_CACHE_LOCK:
+        cached = _SUBSET_CACHE.get(key)
+        if cached is not None:
+            if cached[0] is matrix_all:
+                _SUBSET_CACHE.move_to_end(key)
+                return cached[1], cached[2]
+            _SUBSET_CACHE.pop(key, None)
+
+    n = len(ids_all)
+    if seed_id is None or seed_id not in ids_all:
+        rows = set(range(min(n, VIZ_MAX)))
+    else:
+        seed_row = ids_all.index(seed_id)
+        sims = _similarity("embedding", matrix_all, matrix_all[seed_row], "cosine")
+        keep = min(n, VIZ_MAX)
+        nearest = np.argpartition(-sims, keep - 1)[:keep] if keep < n else np.arange(n)
+        rows = set(nearest.tolist()) | {seed_row}
+
+    index = {t: i for i, t in enumerate(ids_all)}
+    rows |= {index[t] for t in extra}
+    rows = np.array(sorted(rows))
+
+    ids, subset_matrix = (list(np.array(ids_all, dtype=object)[rows]),
+                          np.ascontiguousarray(matrix_all[rows]))
+    with _VIZ_CACHE_LOCK:
+        _SUBSET_CACHE[key] = (matrix_all, ids, subset_matrix)
+        # Any miss is the moment to notice a superseded corpus matrix: purge
+        # before the LRU trim so eviction spends its budget on live entries.
+        _purge_viz_caches(matrix_all)
+        while len(_SUBSET_CACHE) > _SUBSET_KEEP:
+            _SUBSET_CACHE.popitem(last=False)
+    return ids, subset_matrix
+
+
+def _viz_subset_min2(seed_id: str | None,
+                     extra_ids: "list[str] | tuple[str, ...]" = (),
+                     ) -> tuple[list[str], np.ndarray]:
+    """Like _viz_subset, but the T2 endpoints (/viz/tour, /viz/mst,
+    /viz/extremes) are pinned to a single 404 message regardless of whether
+    the corpus is empty or has exactly one track -- SVD/MST need at least
+    two rows either way."""
+    try:
+        ids, matrix = _viz_subset(seed_id, extra_ids)
+    except HTTPException:
+        ids, matrix = [], np.empty((0, 1))
+    if len(ids) < 2:
+        raise HTTPException(404, "needs at least two tracks")
+    return ids, matrix
 
 
 def _viz_embedding_corpus() -> tuple[list[str], np.ndarray]:
@@ -687,18 +853,21 @@ def _viz_embedding_corpus() -> tuple[list[str], np.ndarray]:
     return ids, matrix
 
 
-def _viz_embedding_corpus_min2() -> tuple[list[str], np.ndarray]:
-    """Like _viz_embedding_corpus, but the T2 endpoints (/viz/tour,
-    /viz/mst, /viz/extremes) are pinned to a single 404 message regardless
-    of whether the corpus is empty or has exactly one track -- SVD/MST need
-    at least two rows either way."""
-    try:
-        ids, matrix = _viz_embedding_corpus()
-    except HTTPException:
-        ids, matrix = [], np.empty((0, 1))
-    if len(ids) < 2:
-        raise HTTPException(404, "needs at least two tracks")
-    return ids, matrix
+_MAX_RECS = 50
+
+
+def _rec_ids(recs: str | None) -> tuple[str, ...]:
+    """Parse the optional `recs` query param: comma-separated track ids the
+    caller wants guaranteed a row in the subset, so rec highlighting still
+    works on `surprise`, whose recs sit outside the seed's nearest ring.
+
+    Capped at _MAX_RECS so a hostile query cannot widen the subset without
+    bound; ids not in the corpus are dropped by _viz_subset itself.
+    """
+    if not recs:
+        return ()
+    return tuple(part for part in
+                 (chunk.strip() for chunk in recs.split(",")) if part)[:_MAX_RECS]
 
 
 def _viz_track(track_id: str) -> dict:
@@ -715,7 +884,7 @@ def _viz_track(track_id: str) -> dict:
 @app.get("/viz/walk")
 def viz_walk(from_: str = Query(alias="from"), to: str = Query(),
              k: int = Query(8, ge=1, le=50)) -> dict:
-    ids, matrix = _viz_embedding_corpus()
+    ids, matrix = _viz_subset(from_, extra_ids=[to])
     position = {track_id: index for index, track_id in enumerate(ids)}
     for endpoint in (from_, to):
         if endpoint not in position:
@@ -754,10 +923,12 @@ def viz_histogram(track_id: str) -> dict:
     if track_id not in ids:
         raise HTTPException(404, f"track {track_id} not analyzed")
 
-    from music_recommendations.server import rank as rank_mod
-
-    similarities = rank_mod.scores(
-        _vector(seed_features, "embedding"), matrix, "cosine"
+    # Through _similarity, not rank.scores directly: this is the same full
+    # embedding matrix /recommend just ranked against, so the cached float32
+    # unit matrix is already in hand and re-normalizing it here would be the
+    # single most expensive thing the endpoint does.
+    similarities = _similarity(
+        "embedding", matrix, _vector(seed_features, "embedding"), "cosine"
     )
     values = np.delete(similarities, ids.index(track_id))
     counts, edges = np.histogram(values, bins=60, range=(-1.0, 1.0))
@@ -780,9 +951,11 @@ def viz_histogram(track_id: str) -> dict:
 
 
 @app.get("/viz/hubs")
-def viz_hubs(k: int = Query(8, ge=1, le=50),
-             limit: int = Query(5, ge=1, le=20)) -> dict:
-    ids, matrix = _viz_embedding_corpus()
+def viz_hubs(track_id: str | None = None,
+             k: int = Query(8, ge=1, le=50),
+             limit: int = Query(5, ge=1, le=20),
+             recs: str | None = None) -> dict:
+    ids, matrix = _viz_subset(track_id, _rec_ids(recs))
     if len(ids) < 2:
         raise HTTPException(404, "hubness needs at least two tracks")
     neighbor_k = min(k, len(ids) - 1)
@@ -822,14 +995,17 @@ def viz_hubs(k: int = Query(8, ge=1, le=50),
 
 
 @app.get("/viz/tour")
-def viz_tour() -> dict:
+def viz_tour(track_id: str | None = None, recs: str | None = None) -> dict:
     """Per-track top-8 PC coordinates + variance explained (T2.1).
 
     Non-contract debug/demo endpoint, like /viz/map and /viz/hubs. Columns
-    0-1 of coords8 are numerically identical to /viz/map's x/y — same SVD,
-    same sign convention, same matrix-pinned cache (_TOP8_CACHE).
+    0-1 of coords8 come from the same SVD, sign convention and matrix-pinned
+    cache (_TOP8_CACHE) as /viz/map's x/y, but they are NOT the same numbers
+    unless the subsets match: both are seed-anchored, and /viz/map's subset
+    also contains that axis's recs. Pass the same ids in `recs` to line the
+    two up.
     """
-    ids, matrix = _viz_embedding_corpus_min2()
+    ids, matrix = _viz_subset_min2(track_id, _rec_ids(recs))
     coords8, variance = _top8(matrix)
     coords8_b64 = base64.b64encode(
         np.asarray(coords8, dtype="<f4").tobytes()
@@ -842,25 +1018,28 @@ def viz_tour() -> dict:
 
 
 @app.get("/viz/mst")
-def viz_mst() -> dict:
+def viz_mst(track_id: str | None = None, recs: str | None = None) -> dict:
     """The n-1 MST edges over cosine distance — Prim in numpy (T2.2).
 
     Non-contract debug/demo endpoint. The H0 barcode's death times are
     exactly these edge weights.
     """
-    ids, matrix = _viz_embedding_corpus_min2()
+    ids, matrix = _viz_subset_min2(track_id, _rec_ids(recs))
     edges = _mst(matrix)
     return {"ids": ids, "edges": [[i, j, d] for i, j, d in edges]}
 
 
 @app.get("/viz/extremes")
-def viz_extremes(pc: int = Query(1, ge=1, le=8),
-                 limit: int = Query(4, ge=1, le=10)) -> dict:
+def viz_extremes(track_id: str | None = None,
+                 pc: int = Query(1, ge=1, le=8),
+                 limit: int = Query(4, ge=1, le=10),
+                 recs: str | None = None) -> dict:
     """Top/bottom tracks along one principal component (T2.4).
 
-    Non-contract debug/demo endpoint. Reuses /viz/tour's top-8 PC cache.
+    Non-contract debug/demo endpoint. Reuses /viz/tour's top-8 PC cache —
+    for the same (track_id, recs) pair, which is the same subset.
     """
-    ids, matrix = _viz_embedding_corpus_min2()
+    ids, matrix = _viz_subset_min2(track_id, _rec_ids(recs))
     coords8, variance = _top8(matrix)
     col = pc - 1
     values = coords8[:, col]
