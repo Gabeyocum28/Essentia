@@ -478,3 +478,99 @@ def test_knn_graph_cache_holds_several_subsets_and_is_bounded(monkeypatch):
     c = rng.standard_normal((12, 4)).astype(np.float32)
     viz.shortest_walk(c, 0, 5, k=3)
     assert len(viz._GRAPH_CACHE) == 2   # bounded; the LRU entry went
+
+
+# ---- sparse feature keys: ids looked up once, not once per request ----
+
+FEEL_DIM = 11
+
+
+def _feel_corpus(n: int, scored: set[str]) -> list[str]:
+    """n tracks; only `scored` ids carry a feel vector."""
+    ids = []
+    for i in range(n):
+        track_id = f"t{i}"
+        features = {"embedding": [1.0, i / float(n)]}
+        if track_id in scored:
+            features["feel"] = [0.5] * FEEL_DIM
+        store.put_track({**TRACK, "track_id": track_id, "title": f"Track {i}"},
+                        features)
+        ids.append(track_id)
+    return ids
+
+
+def test_unscored_ids_are_looked_up_once_not_once_per_request(client, fake_mongo,
+                                                              monkeypatch):
+    """`feel` is absent on every row the backfill has not reached, so those ids
+    never become matrix rows. A `fresh` list derived from the rows alone
+    therefore re-queried every unscored track on EVERY request -- the exact
+    per-request corpus read the matrix cache exists to remove. _CorpusMatrix
+    remembers what it has ATTEMPTED, not only what it holds."""
+    _feel_corpus(6, scored={"t0"})
+
+    calls = []
+    real = store.get_many_feel
+    monkeypatch.setattr(store, "get_many_feel",
+                        lambda ids, _f=real: (calls.append(list(ids)), _f(ids))[1])
+    # The embedding matrix comes from base_matrix(), and the feel matrix now
+    # has a projection of its own, so a cold request touches the generic
+    # per-track feature read not at all.
+    generic = []
+    real_generic = store.get_many_features
+    monkeypatch.setattr(store, "get_many_features",
+                        lambda ids, _f=real_generic: (generic.append(list(ids)),
+                                                      _f(ids))[1])
+
+    params = {"track_id": "t0", "axis": "sounds_like", "feel": 1.0}
+    assert client.get("/recommend", params=params).status_code == 200
+    assert calls == [[f"t{i}" for i in range(6)]], "one bulk read, every id once"
+    assert generic == [], "the feel matrix must not use the generic feature read"
+
+    calls.clear()
+    client.get("/recommend", params=params)
+    client.get("/recommend", params=params)
+    assert calls == [], "an unchanged corpus must not be re-read, scored or not"
+
+    # ...but a genuinely new track is still picked up, exactly once.
+    store.put_track({**TRACK, "track_id": "t6", "title": "Track 6"},
+                    {"embedding": [1.0, 1.0], "feel": [0.4] * FEEL_DIM})
+    client.get("/recommend", params=params)
+    assert calls == [["t6"]]
+    calls.clear()
+    client.get("/recommend", params=params)
+    assert calls == []
+
+
+def test_the_feel_matrix_reads_feel_alone(fake_mongo):
+    """Eleven floats a row: dequantizing a 1280-int8 embedding per candidate
+    to then discard it was the whole cost of building this matrix."""
+    _feel_corpus(3, scored={"t0", "t2"})
+    assert store.get_many_feel(["t0", "t1", "t2", "nope"]) == [
+        [0.5] * FEEL_DIM, None, [0.5] * FEEL_DIM, None,
+    ]
+    assert store.get_many_feel([]) == []
+    ids, rows = app_module._rows_for(["t0", "t1", "t2"], "feel")
+    assert ids == ["t0", "t2"]
+    assert [len(r) for r in rows] == [FEEL_DIM, FEEL_DIM]
+
+
+def test_viz_map_builds_no_feel_matrix_for_surprise(client, fake_mongo, monkeypatch):
+    """_feel_blend and _feel_math both ignore the vector off sounds_like, so
+    assembling the whole feel matrix for a `surprise` map is pure cost."""
+    _feel_corpus(6, scored={f"t{i}" for i in range(6)})
+    builds = []
+    real = app_module._feel_rows
+    monkeypatch.setattr(app_module, "_feel_rows",
+                        lambda *a, _f=real: (builds.append(1), _f(*a))[1])
+
+    r = client.get("/viz/map", params={"track_id": "t0", "axis": "surprise",
+                                       "limit": 3, "feel": 1.0})
+    assert r.status_code == 200
+    assert builds == [], "surprise must never touch the feel matrix"
+
+    r = client.get("/viz/map", params={"track_id": "t0", "axis": "sounds_like",
+                                       "limit": 3, "feel": 0})
+    assert r.status_code == 200
+    # Still built at feel=0 on sounds_like: the math panel shows the
+    # comparison whether or not it is currently weighted.
+    assert builds == [1]

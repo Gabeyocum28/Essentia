@@ -453,6 +453,15 @@ class _CorpusMatrix(NamedTuple):
     ids: list[str]                 # the rows actually present, in row order
     matrix: np.ndarray
     correction: np.ndarray | None  # centrality, computed only if an axis wants it
+    # Every id this key has been LOOKED UP for, whether or not it turned out
+    # to have the feature. Sparse keys need it: `feel` is absent on every row
+    # scripts/feel_backfill.py has not reached, so those ids never enter
+    # `ids` -- and a `fresh` computed from `ids` alone re-queried all of them
+    # on every single request, which is the whole cost the cache exists to
+    # avoid. An id enters this set once and stays; a row that gains its
+    # vector later is picked up at the next process start (or the next
+    # corpus rebuild), which is the same cadence a backfill runs on.
+    attempted: frozenset[str] = frozenset()
 
 
 # One assembled matrix per feature key, extended as the corpus grows.
@@ -472,6 +481,16 @@ _MATRIX_LOCK = threading.Lock()
 def _rows_for(track_ids: list[str], feature_key: str) -> tuple[list[str], list[np.ndarray]]:
     """Fetch and vectorize a set of tracks, skipping any without this feature."""
     ids, rows = [], []
+    if feature_key == "feel":
+        # Eleven floats per row, so the generic read below was fetching a
+        # 1280-byte int8 embedding and dequantizing it to float32 for every
+        # candidate purely to throw it away. store.get_many_feel projects
+        # `feel` alone and does no dequantization at all.
+        for track_id, vector in zip(track_ids, store.get_many_feel(track_ids)):
+            if vector:
+                ids.append(track_id)
+                rows.append(np.atleast_1d(np.asarray(vector, dtype=float)))
+        return ids, rows
     for track_id, features in zip(track_ids, store.get_many_features(track_ids)):
         if features and feature_key in features:
             ids.append(track_id)
@@ -514,22 +533,30 @@ def _build(corpus: tuple[str, ...], feature_key: str, metric: str,
            want_correction: bool) -> tuple[list[str], np.ndarray, np.ndarray | None]:
     cached = _MATRIX_CACHE.get(feature_key)
     known = set(cached.ids) if cached else set()
+    attempted = cached.attempted if cached else frozenset()
     # One set for both the subset test and the membership checks below;
     # `known.issubset(corpus)` would build its own copy of a 90k-id tuple.
     corpus_set = set(corpus)
 
     # Tracks only ever get added, so the common case is a short tail of new ids.
     # A track disappearing means someone cleared the store: drop it all and rebuild.
+    # The shrink test reads `ids` (the rows actually held), not `attempted`:
+    # an id that was looked up and had no vector was never a row, so its
+    # absence from the corpus is not evidence the store was cleared.
     if cached is not None and not known.issubset(corpus_set):
-        cached, known = None, set()
+        cached, known, attempted = None, set(), frozenset()
 
     # Iterated over the tuple, not the set: row order must follow corpus order.
-    fresh = [i for i in corpus if i not in known]
+    # Against `attempted`, not `known`: an id with no vector for this key is
+    # not a row and never will be one, so testing `known` re-fetched every
+    # unscored track on every request.
+    fresh = [i for i in corpus if i not in attempted]
     if cached is None:
         ids, matrix = _cold_matrix(corpus, feature_key)
-        cached = _CorpusMatrix(corpus, ids, matrix, None)
+        cached = _CorpusMatrix(corpus, ids, matrix, None, frozenset(corpus))
     elif fresh:
         ids, rows = _rows_for(fresh, feature_key)
+        seen = attempted | frozenset(fresh)
         if rows:
             cached = _CorpusMatrix(
                 corpus, cached.ids + ids,
@@ -539,9 +566,10 @@ def _build(corpus: tuple[str, ...], feature_key: str, metric: str,
                 np.vstack([cached.matrix,
                            np.stack(rows).astype(cached.matrix.dtype, copy=False)]),
                 None,  # the corpus moved, so any cached centrality is stale
+                seen,
             )
         else:
-            cached = cached._replace(corpus=corpus)
+            cached = cached._replace(corpus=corpus, attempted=seen)
     _MATRIX_CACHE[feature_key] = cached
 
     if want_correction and cached.correction is None and len(cached.ids):
@@ -603,7 +631,7 @@ def _similarity(feature_key: str, matrix: np.ndarray, seed_vec: np.ndarray,
 # mean absolute difference of probabilities in [0, 1]. w == 0 reproduces the
 # embedding-only order EXACTLY, which is what makes the slider safe to ship.
 
-FEEL_DEFAULT = 0.5
+FEEL_DEFAULT = 0.3
 FEEL_MAX = 3.0
 
 
@@ -892,7 +920,13 @@ def recommend(track_id: str, axis: str,
               feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX)) -> dict:
     """`feel` weights the eleven-dimension feel penalty on sounds_like.
     0 is the embedding-only order this endpoint served before the heads
-    shipped; it is ignored on every other axis."""
+    shipped; it is ignored on every other axis.
+
+    `score` is the number the list was RANKED by, so on sounds_like with
+    feel > 0 it is the blended value -- cosine minus `feel` times the mean
+    absolute feel difference -- and can therefore sit below the raw cosine,
+    and below zero. At feel == 0 (and on every other axis) it is exactly the
+    raw similarity, unchanged from before the heads shipped."""
     if axis not in AXIS_FEATURES and axis not in BLENDED_AXES:
         raise HTTPException(400, f"unknown axis {axis!r}")
 
@@ -1157,7 +1191,11 @@ def viz_map(track_id: str, axis: str,
         # Computed even at feel=0, unlike /recommend: the math panel shows the
         # per-dimension comparison whether or not it is currently weighted,
         # and that is the whole point of a slider you can turn back down.
-        feel_rows = _feel_rows(corpus, ids, matrix, seed_features)
+        # But only where it can ever apply: _feel_blend and _feel_math both
+        # ignore it off sounds_like, so building the whole feel matrix for a
+        # `surprise` map was pure cost.
+        feel_rows = (_feel_rows(corpus, ids, matrix, seed_features)
+                     if axis == "sounds_like" else None)
         similarity = _feel_blend(axis, feel, similarity, feel_rows)
         order = rank_mod.rank(seed_vec, matrix, direction=direction,
                               limit=_scan_width(limit) + skippable, metric=metric,
@@ -1203,8 +1241,8 @@ def viz_map(track_id: str, axis: str,
                 seed_vec, matrix[idx], metric,
                 float(correction[idx]) if correction is not None else None,
             )
-            math.update(_feel_math(feel_rows if axis == "sounds_like" else None,
-                                   idx))
+            # feel_rows is already None off sounds_like (see above).
+            math.update(_feel_math(feel_rows, idx))
         recs.append({"track_id": rec_id, "score": score, "math": math})
         if len(recs) == limit:
             break
@@ -1472,7 +1510,7 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
     it (/viz/map ranks on it), so the growth check does not repeat that
     caller's corpus_ids read.
     """
-    global _VIZ_SNAPSHOT, _ROW_NORMS
+    global _VIZ_SNAPSHOT, _ROW_NORMS, _FEEL_ALIGN_CACHE
 
     # Read live first: this is also the call that appends newly analyzed rows
     # to _MATRIX_CACHE, and it is the cheap part (only new ids are parsed).
@@ -1502,8 +1540,11 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
         _VIZ_SNAPSHOT = (time.monotonic(), ids, matrix)
         # The derived caches belong to the superseded matrix; drop them now
         # rather than letting them pin it until the LRU happens to evict.
-        # _ROW_NORMS holds a strong reference to the old matrix too.
+        # _ROW_NORMS and _FEEL_ALIGN_CACHE hold strong references to the old
+        # matrix too (the alignment holds the embedding matrix AND the feel
+        # matrix, so a stale entry pins both).
         _ROW_NORMS = None
+        _FEEL_ALIGN_CACHE = None
         _purge_viz_caches(matrix)
     return ids, matrix
 

@@ -21,6 +21,27 @@ tracks with 30 s previews. Design: `Essencia_design_spec.md`.
 Production is built into the API image by `deploy/Dockerfile` and served
 at `/` by the FastAPI app (`web/dist`).
 
+### The feel slider
+
+Embedding cosine ranks by *style*: it puts a hushed solo take and a full-band
+blast of the same idiom in the same corner of the space, because idiomatically
+they are the same thing. Eleven small classifier heads (`analysis/feel.py`,
+graphs fetched by `scripts/fetch_models.py`) read the same EffNet embedding and
+score what the cosine drops — energy, mood, texture. "More sounds like this"
+then ranks on `cos(embedding) − w · mean|feel_rec − feel_seed|`, and the "Match
+the feel" slider on the recommendations screen is `w`. At `w = 0` the order is
+exactly the embedding-only order the app served before the heads shipped, which
+is what makes the slider safe to drag either way; the default is 0.3 and lives
+on the server (`FEEL_DEFAULT` in `server/app.py`) — the web client omits the
+`feel` parameter at that value so the number can be retuned without a redeploy
+of the bundle. The slider position is remembered in `localStorage` and carried
+into Insights, where the math panel shows the seed's and the rec's eleven
+dimensions side by side and the `feel_dist` between them. A track with no feel
+vector yet (a row `scripts/feel_backfill.py` has not reached) is never
+penalized — a partial backfill must not hide tracks — and `surprise` is left
+alone entirely, since "nothing like this" is already a request to leave the
+seed's neighbourhood.
+
 ### SOUND mode
 
 SOUND mode shows what a track actually sounds like rather than where it sits

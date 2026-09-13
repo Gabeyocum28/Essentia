@@ -1,7 +1,7 @@
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { Recommendations } from "./Recommendations";
-import { api } from "../api/client";
+import { api, DEFAULT_FEEL } from "../api/client";
 import { PlayerProvider } from "../player/usePlayer";
 
 vi.mock("../api/client", async () => {
@@ -40,11 +40,20 @@ beforeEach(() => {
   });
 });
 
-test("fetches recommendations with the default feel of 0.5 on load", async () => {
+test("fetches recommendations with the default feel on load", async () => {
   renderRecs();
 
   await waitFor(() => expect(screen.getByText("Track A")).toBeInTheDocument());
-  expect(api.recommend).toHaveBeenCalledWith("42", "energy", 10, 0.5);
+  expect(DEFAULT_FEEL).toBe(0.3);
+  expect(api.recommend).toHaveBeenCalledWith("42", "energy", 10, DEFAULT_FEEL);
+});
+
+test("a stored weight outside the slider's range is clamped on load", async () => {
+  localStorage.setItem("essentia.feel", "42");
+  renderRecs();
+
+  await waitFor(() => expect(screen.getByText("Track A")).toBeInTheDocument());
+  expect(api.recommend).toHaveBeenCalledWith("42", "energy", 10, 2);
 });
 
 test("moving the feel slider triggers a debounced refetch with the new value", async () => {
@@ -74,5 +83,5 @@ test("the insights link carries the current feel value", async () => {
   await waitFor(() => expect(screen.getByText("Track A")).toBeInTheDocument());
 
   const link = screen.getByText("See the math ✦") as HTMLAnchorElement;
-  expect(link.getAttribute("href")).toBe("/insights/42/energy?feel=0.5");
+  expect(link.getAttribute("href")).toBe(`/insights/42/energy?feel=${DEFAULT_FEEL}`);
 });

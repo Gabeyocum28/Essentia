@@ -408,10 +408,10 @@ def test_repeat_requests_do_not_re_read_the_whole_corpus(client, seeded_corpus, 
     """Re-parsing every feature blob per request is what made /recommend 25s.
 
     The cold embedding matrix now comes from one store.base_matrix() query
-    instead of a per-track store.get_many_features() fetch, so the first
-    request's "whole matrix" read shows up there; get_many_features is only
-    hit for the feel matrix (which has no bulk query of its own) and for
-    tracks analyzed after that base read.
+    instead of a per-track store.get_many_features() fetch, and the feel
+    matrix has a projection of its own (store.get_many_feel), so the generic
+    per-track feature read is only hit for tracks analyzed after that base
+    read.
     """
     base_reads = []
     real_base = store.base_matrix
@@ -421,25 +421,33 @@ def test_repeat_requests_do_not_re_read_the_whole_corpus(client, seeded_corpus, 
     real = store.get_many_features
     monkeypatch.setattr(store, "get_many_features",
                         lambda ids: reads.append(list(ids)) or real(ids))
+    feel_reads = []
+    real_feel = store.get_many_feel
+    monkeypatch.setattr(store, "get_many_feel",
+                        lambda ids: feel_reads.append(list(ids)) or real_feel(ids))
 
     seed = seeded_corpus[0]["track_id"]
     params = {"track_id": seed, "axis": "sounds_like", "limit": 10}
     client.get("/recommend", params=params)
     corpus = sorted(t["track_id"] for t in seeded_corpus)
     assert len(base_reads) == 1, "the first request builds the whole matrix in one query"
-    assert reads == [corpus], "the feel matrix is one bulk read, not one per track"
+    assert reads == [], "the whole matrix is one base_matrix() query, nothing more"
+    assert feel_reads == [corpus], "the feel matrix is one bulk read, not one per track"
 
     base_reads.clear()
     reads.clear()
+    feel_reads.clear()
     client.get("/recommend", params=params)
-    assert base_reads == [] and reads == [], "an unchanged corpus should be read zero times"
+    assert base_reads == [] and reads == [] and feel_reads == [], \
+        "an unchanged corpus should be read zero times"
 
     store.put_track(FIXTURE[5], fake_features(0.5))
     reads.clear()
+    feel_reads.clear()
     client.get("/recommend", params=params)
-    # Once to grow the embedding matrix, once to grow the feel matrix; both
-    # carry the new id alone.
-    assert reads == [[FIXTURE[5]["track_id"]]] * 2, "only the new track is parsed"
+    # One growth read per matrix, each carrying the new id alone.
+    assert reads == [[FIXTURE[5]["track_id"]]], "only the new track is parsed"
+    assert feel_reads == [[FIXTURE[5]["track_id"]]]
 
 
 def test_seed_is_never_recommended_to_itself(client, seeded_corpus):
@@ -1020,9 +1028,11 @@ def test_feel_leaves_surprise_alone(client, feel_corpus):
     assert off == on
 
 
-def test_feel_defaults_to_a_half(client, feel_corpus):
-    explicit = _feel_ids(client, feel=0.5)
-    assert _feel_ids(client) == explicit
+def test_the_server_owns_the_default_feel_weight(client, feel_corpus):
+    """The web client omits `feel` at its own default so this number can be
+    retuned without shipping a bundle; the two must therefore agree."""
+    assert app_module.FEEL_DEFAULT == 0.3
+    assert _feel_ids(client) == _feel_ids(client, feel=app_module.FEEL_DEFAULT)
 
 
 def test_feel_never_leaks_into_a_result_track(client, feel_corpus):

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
-import { api } from "../api/client";
+import { api, clampFeel, loadStoredFeel, storeFeel, FEEL_MAX, FEEL_MIN } from "../api/client";
 import { Artwork } from "../components/Artwork";
 import { TrackRow } from "../components/TrackRow";
 import { Card } from "../components/Card";
@@ -9,19 +9,7 @@ import type { Track } from "../api/types";
 
 type Status = "loading" | "ready" | "error";
 
-const FEEL_KEY = "essentia.feel";
 const FEEL_DEBOUNCE_MS = 250;
-const DEFAULT_FEEL = 0.5;
-
-function loadFeel(): number {
-  try {
-    const raw = localStorage.getItem(FEEL_KEY);
-    const n = raw === null ? NaN : Number(raw);
-    return Number.isFinite(n) ? n : DEFAULT_FEEL;
-  } catch {
-    return DEFAULT_FEEL;
-  }
-}
 
 export function Recommendations() {
   const { id = "", axis = "" } = useParams();
@@ -30,7 +18,7 @@ export function Recommendations() {
 
   const [status, setStatus] = useState<Status>("loading");
   const [results, setResults] = useState<Track[]>([]);
-  const [feel, setFeel] = useState(loadFeel);
+  const [feel, setFeel] = useState(loadStoredFeel);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const run = useCallback(async (feelValue: number) => {
@@ -50,13 +38,10 @@ export function Recommendations() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, axis]);
 
-  const handleFeelChange = (value: number) => {
+  const handleFeelChange = (raw: number) => {
+    const value = clampFeel(raw);
     setFeel(value);
-    try {
-      localStorage.setItem(FEEL_KEY, String(value));
-    } catch {
-      /* localStorage unavailable */
-    }
+    storeFeel(value);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
       void run(value);
@@ -84,8 +69,8 @@ export function Recommendations() {
         <span className="feel-slider-label">Match the feel</span>
         <input
           type="range"
-          min={0}
-          max={2}
+          min={FEEL_MIN}
+          max={FEEL_MAX}
           step={0.1}
           value={feel}
           onChange={(e) => handleFeelChange(Number(e.target.value))}

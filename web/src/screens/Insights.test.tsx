@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { fireEvent } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { Insights } from "./Insights";
-import { api, ApiError } from "../api/client";
+import { api, ApiError, DEFAULT_FEEL } from "../api/client";
 import { PlayerProvider } from "../player/usePlayer";
 import type { VizMap } from "../api/types";
 
@@ -39,10 +39,10 @@ function makeMap(): VizMap {
   };
 }
 
-function renderInsights(id = "seed", axis = "energy") {
+function renderInsights(id = "seed", axis = "energy", query = "") {
   return render(
     <PlayerProvider>
-      <MemoryRouter initialEntries={[`/insights/${id}/${axis}`]}>
+      <MemoryRouter initialEntries={[`/insights/${id}/${axis}${query}`]}>
         <Routes>
           <Route path="/insights/:id/:axis" element={<Insights />} />
         </Routes>
@@ -88,4 +88,49 @@ test("renders the rec strip with seed and recs, and clicking a rec plays it", as
   fireEvent.click(screen.getByRole("button", { name: "Play Rec One" }));
 
   await waitFor(() => expect(playSpy).toHaveBeenCalled());
+});
+
+
+// ---- the feel weight ----
+//
+// Insights has to explain the list the user actually SAW, so the weight it
+// asks the map for must be the one the recommendations screen ranked with.
+// The link from that screen carries ?feel=; a bookmark or a direct load does
+// not, and falling back to the default there would draw a different list.
+
+test("uses the feel weight from the query string", async () => {
+  vi.mocked(api.seed).mockResolvedValue({ track_id: "seed", status: "ready" });
+  vi.mocked(api.vizMap).mockResolvedValue(makeMap());
+  localStorage.setItem("essentia.feel", "1.5");
+
+  renderInsights("seed", "energy", "?feel=0.8");
+  await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 0.8);
+  localStorage.clear();
+});
+
+test("falls back to the stored slider position, then to the default", async () => {
+  vi.mocked(api.seed).mockResolvedValue({ track_id: "seed", status: "ready" });
+  vi.mocked(api.vizMap).mockResolvedValue(makeMap());
+  localStorage.setItem("essentia.feel", "1.5");
+
+  const stored = renderInsights();
+  await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 1.5);
+  stored.unmount();
+
+  localStorage.clear();
+  vi.mocked(api.vizMap).mockClear();
+  renderInsights();
+  await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, DEFAULT_FEEL);
+});
+
+test("a hand-edited weight in the query string is clamped", async () => {
+  vi.mocked(api.seed).mockResolvedValue({ track_id: "seed", status: "ready" });
+  vi.mocked(api.vizMap).mockResolvedValue(makeMap());
+
+  renderInsights("seed", "energy", "?feel=99");
+  await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 2);
 });

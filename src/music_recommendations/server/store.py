@@ -213,6 +213,25 @@ def get_many_features(track_ids: list[str]) -> list[dict | None]:
     return [found.get(t) for t in track_ids]
 
 
+def get_many_feel(track_ids: list[str]) -> list[list[float] | None]:
+    """The feel vector per requested id, in order; None where the row has none.
+
+    A projection of `feel` alone, deliberately NOT get_many_features: the
+    ranking's feel matrix wants eleven floats a row, and the generic read
+    hands back a 1280-int8 embedding per candidate that has to be
+    dequantized to float32 before it can be discarded. Same no-LIVE-filter
+    reasoning as get_many_features -- an id asked for by name is answered.
+    """
+    if not track_ids:
+        return []
+    found = {}
+    for doc in db().tracks.find({"_id": {"$in": track_ids}}, {"feel": 1}):
+        vector = doc.get("feel")
+        if vector is not None:
+            found[doc["_id"]] = [float(v) for v in vector]
+    return [found.get(t) for t in track_ids]
+
+
 def get_analyzed_at(track_id: str) -> datetime | None:
     doc = db().tracks.find_one({"_id": track_id}, {"analyzed_at": 1})
     return doc.get("analyzed_at") if doc else None

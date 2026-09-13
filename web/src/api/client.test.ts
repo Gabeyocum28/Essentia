@@ -1,4 +1,4 @@
-import { api, ApiError, decodeCoords8, previewUrl } from "./client";
+import { api, ApiError, clampFeel, decodeCoords8, DEFAULT_FEEL, loadStoredFeel, previewUrl, storeFeel } from "./client";
 
 function mockFetch(status: number, body: unknown) {
   globalThis.fetch = vi.fn(async () => new Response(JSON.stringify(body), { status,
@@ -117,6 +117,16 @@ test("recommend adds feel when given, omits it otherwise", async () => {
   expect(fetch).toHaveBeenCalledWith("/api/recommend?track_id=1&axis=energy&limit=10", expect.anything());
 });
 
+test("the default weight is omitted so the server owns the number", async () => {
+  mockFetch(200, { seed_track_id: "1", axis: "energy", results: [] });
+  await api.recommend("1", "energy", 10, DEFAULT_FEEL);
+  expect(fetch).toHaveBeenCalledWith("/api/recommend?track_id=1&axis=energy&limit=10", expect.anything());
+
+  mockFetch(200, { points: { ids: [], x: [], y: [], tracks: [] }, seed: {}, recs: [], axis: {} });
+  await api.vizMap("1", "energy", 10, undefined, DEFAULT_FEEL);
+  expect(fetch).toHaveBeenCalledWith("/api/viz/map?track_id=1&axis=energy&limit=10", expect.anything());
+});
+
 test("vizMap adds feel when given, omits it otherwise", async () => {
   mockFetch(200, { points: { ids: [], x: [], y: [], tracks: [] }, seed: {}, recs: [], axis: {} });
   await api.vizMap("1", "energy", 10, "on", 0.5);
@@ -128,4 +138,24 @@ test("vizMap adds feel when given, omits it otherwise", async () => {
   mockFetch(200, { points: { ids: [], x: [], y: [], tracks: [] }, seed: {}, recs: [], axis: {} });
   await api.vizMap("1", "energy");
   expect(fetch).toHaveBeenCalledWith("/api/viz/map?track_id=1&axis=energy&limit=10", expect.anything());
+});
+
+test("clampFeel pins a hand-edited weight to the slider's range", () => {
+  expect(clampFeel("1.2")).toBe(1.2);
+  expect(clampFeel(-5)).toBe(0);
+  expect(clampFeel(99)).toBe(2);
+  expect(clampFeel("nonsense")).toBe(DEFAULT_FEEL);
+  expect(clampFeel(null)).toBe(DEFAULT_FEEL);
+});
+
+test("loadStoredFeel reads, clamps, and falls back to the default", () => {
+  localStorage.clear();
+  expect(loadStoredFeel()).toBe(DEFAULT_FEEL);
+  storeFeel(1.4);
+  expect(loadStoredFeel()).toBe(1.4);
+  localStorage.setItem("essentia.feel", "500");
+  expect(loadStoredFeel()).toBe(2);
+  localStorage.setItem("essentia.feel", "junk");
+  expect(loadStoredFeel()).toBe(DEFAULT_FEEL);
+  localStorage.clear();
 });

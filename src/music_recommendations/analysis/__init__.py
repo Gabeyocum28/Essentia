@@ -25,6 +25,19 @@ __all__ = ["analyze_track", "analyze_tracks", "as_json", "FEATURES_VERSION",
            "METRICS"]
 
 
+_heads_warned = False
+
+
+def _warn_missing_heads(exc: Exception) -> None:
+    """Say once per process that the feel heads are not installed."""
+    global _heads_warned
+    if _heads_warned:
+        return
+    _heads_warned = True
+    print(f"analysis: feel heads unavailable ({exc}); tracks will be "
+          f"analyzed without a feel vector", flush=True)
+
+
 def analyze_tracks(paths: list[Path | str]) -> list[dict | Exception]:
     """Analyze several files in one inference pass; one slot per input path.
 
@@ -64,15 +77,28 @@ def analyze_tracks(paths: list[Path | str]) -> list[dict | Exception]:
         # whole group is scored in one pass per head after the EffNet work is
         # done — eleven small matmuls on top of a decode-and-embed that cost
         # seconds.
-        vectors = feel.feel_vectors(np.stack(means))
+        # A host whose models/ has the EffNet graph but not the eleven head
+        # graphs (an older image, a partial fetch_models.py run) must still
+        # produce embeddings: the feel vector is optional everywhere
+        # downstream -- the store omits the field and the ranking treats a
+        # missing vector as "no penalty" -- so losing the heads costs the
+        # blend, not the analysis. Said once per process, not per group.
+        try:
+            vectors = feel.feel_vectors(np.stack(means))
+        except FileNotFoundError as exc:
+            _warn_missing_heads(exc)
+            vectors = None
         for slot, (i, mean) in enumerate(zip(ready, means)):
-            results[i] = {"embedding": mean, "feel": vectors[slot]}
+            results[i] = {"embedding": mean}
+            if vectors is not None:
+                results[i]["feel"] = vectors[slot]
     return results  # type: ignore[return-value]
 
 
 def analyze_track(mp3_path: Path | str) -> dict:
     """Run EffNet + the feel heads; returns {"embedding": (1280,) float32,
-    "feel": (11,) float32}."""
+    "feel": (11,) float32}. "feel" is omitted when the head graphs are not
+    installed on this host."""
     result = analyze_tracks([mp3_path])[0]
     if isinstance(result, Exception):
         raise result

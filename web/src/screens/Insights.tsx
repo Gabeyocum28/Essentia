@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { api, ApiError } from "../api/client";
+import { api, ApiError, clampFeel, loadStoredFeel } from "../api/client";
 import type { VizMap } from "../api/types";
 import { RecStrip } from "../insights/RecStrip";
 import { Galaxy } from "../insights/Galaxy";
@@ -18,13 +18,16 @@ type Status = "loading" | "ready" | "unanalyzed" | "error";
 type Mode = "GALAXY" | "SOUND" | "PROOF";
 type GalaxyChip = "Explore" | "Walk" | "Tour" | "Topo";
 
-const DEFAULT_FEEL = 0.5;
-
 export function Insights() {
   const { id = "", axis = "" } = useParams();
   const [searchParams] = useSearchParams();
+  // The link from Recommendations carries ?feel=; a bookmark or a direct
+  // load does not, and falling back to the default there would explain a
+  // list the user never saw. The stored value is the slider's last position,
+  // so it is the better fallback -- and clampFeel backstops both against a
+  // hand-edited query string.
   const feelParam = searchParams.get("feel");
-  const feel = feelParam !== null && Number.isFinite(Number(feelParam)) ? Number(feelParam) : DEFAULT_FEEL;
+  const feel = feelParam !== null ? clampFeel(feelParam) : loadStoredFeel();
 
   const [status, setStatus] = useState<Status>("loading");
   const [map, setMap] = useState<VizMap | null>(null);
