@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { analyzeSound, type SoundAnalysis } from "../audio/analyze";
-import { loadTrackAudio } from "../audio/decode";
+import { loadTrackAudio, rememberAnalysis } from "../audio/decode";
 import { soloOff, useSoloBand } from "../audio/soloStore";
 import { usePlayer } from "../player/usePlayer";
 import { BandStrip } from "./BandStrip";
@@ -38,8 +38,12 @@ export function Sound({ track }: Props) {
     (async () => {
       try {
         const audio = await loadTrackAudio(track.track_id, { signal: controller.signal });
-        const result = await analyzeSound(audio.samples, audio.sampleRate);
+        // Re-selecting a rec that's still in the LRU costs nothing.
+        const result =
+          audio.analysis ??
+          (await analyzeSound(audio.samples, audio.sampleRate, { signal: controller.signal }));
         if (cancelled) return;
+        rememberAnalysis(track.track_id, result);
         setAnalysis(result);
         setStatus("ready");
       } catch {
@@ -54,9 +58,11 @@ export function Sound({ track }: Props) {
   }, [track.track_id]);
 
   const isCurrent = nowPlaying?.track_id === track.track_id;
+  // Clicking a spot in a track that isn't playing should start it there, not
+  // at the top — the player seeks once the duration is known.
   const handleSeek = (fraction: number) => {
     if (isCurrent) seek(fraction);
-    else play(track);
+    else play(track, fraction);
   };
 
   return (

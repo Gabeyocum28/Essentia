@@ -8,31 +8,48 @@ import { createBandSolo, type BandSolo } from "./bandSolo";
 import { attachGraph } from "../player/usePlayer";
 
 let chain: BandSolo | null = null;
+let pending: Promise<BandSolo | null> | null = null;
 let band: [number, number] | null = null;
+/** What the user last asked for; applied once the chain exists. */
+let requested: [number, number] | null = null;
 const listeners = new Set<() => void>();
 
 function emit() {
   for (const listener of listeners) listener();
 }
 
-function ensureChain(): BandSolo | null {
-  if (chain) return chain;
-  const graph = attachGraph();
-  if (!graph) return null;
-  chain = createBandSolo(graph.context, graph.source);
-  return chain;
+function ensureChain(): Promise<BandSolo | null> {
+  if (chain) return Promise.resolve(chain);
+  if (!pending) {
+    // Attaching is async: it may first have to move the element onto the
+    // same-origin proxy, or a cross-origin source node would play silence.
+    pending = attachGraph()
+      .then((graph) => {
+        if (!graph) return null;
+        chain = createBandSolo(graph.context, graph.source);
+        return chain;
+      })
+      .finally(() => {
+        pending = null;
+      });
+  }
+  return pending;
 }
 
 /** Solo [lo, hi] Hz. Must be called from a user gesture (Safari). */
-export function soloBand(lo: number, hi: number): void {
-  const solo = ensureChain();
-  if (!solo) return;
-  solo.setBand(lo, hi);
+export async function soloBand(lo: number, hi: number): Promise<void> {
+  requested = [lo, hi];
+  const solo = await ensureChain();
+  // A drag fires many of these; whatever was asked for last wins, and a
+  // soloOff() during the await must not be undone.
+  if (!solo || requested === null) return;
+  solo.setBand(requested[0], requested[1]);
   band = solo.band();
   emit();
 }
 
 export function soloOff(): void {
+  requested = null;
   chain?.clear();
   band = null;
   emit();
@@ -55,6 +72,8 @@ export function useSoloBand(): [number, number] | null {
 /** Test seam: drop the chain so the next solo rebuilds it. */
 export function resetSolo(): void {
   chain = null;
+  pending = null;
+  requested = null;
   band = null;
   emit();
 }

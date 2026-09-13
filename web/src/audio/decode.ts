@@ -4,14 +4,21 @@
 // the server's /preview/{id}/audio proxy.
 
 import { previewAudioUrl } from "../api/client";
+import type { SoundAnalysis } from "./sound";
 
 export interface DecodedAudio {
   samples: Float32Array;
   sampleRate: number;
   duration: number;
+  /** Filled in by `rememberAnalysis` once the worker has run for this track. */
+  analysis?: SoundAnalysis;
 }
 
-/** Small LRU: flipping between a few recs shouldn't refetch or re-decode. */
+/**
+ * Small LRU: flipping between a few recs shouldn't refetch, re-decode or
+ * re-analyze. The analysis rides along with the samples so both are evicted
+ * together and can never disagree about which track they describe.
+ */
 const CACHE_LIMIT = 5;
 const cache = new Map<string, DecodedAudio>();
 
@@ -27,6 +34,12 @@ function remember(id: string, audio: DecodedAudio): DecodedAudio {
     cache.delete(oldest);
   }
   return audio;
+}
+
+/** Attach a finished analysis to this track's cache entry, if it's still there. */
+export function rememberAnalysis(trackId: string, analysis: SoundAnalysis): void {
+  const entry = cache.get(trackId);
+  if (entry) entry.analysis = analysis;
 }
 
 /** Average the channels down to mono; the spectrogram is a mono view. */

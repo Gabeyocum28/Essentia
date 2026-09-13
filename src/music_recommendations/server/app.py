@@ -167,7 +167,9 @@ def preview_audio(track_id: str) -> StreamingResponse:
     try:
         upstream = _open_upstream(url)
     except Exception as exc:  # network flake, 403 on an expired signature, ...
-        raise HTTPException(502, f"upstream preview fetch failed: {exc}") from exc
+        # Logged, not echoed: the exception text can carry the signed CDN URL.
+        print(f"preview audio upstream failed for {track_id}: {exc!r}", flush=True)
+        raise HTTPException(502, "upstream preview fetch failed") from exc
 
     def chunks():
         try:

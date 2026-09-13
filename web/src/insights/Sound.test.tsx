@@ -4,7 +4,7 @@ import { loadTrackAudio } from "../audio/decode";
 import { analyzeSound } from "../audio/analyze";
 import type { Track } from "../api/types";
 
-vi.mock("../audio/decode", () => ({ loadTrackAudio: vi.fn() }));
+vi.mock("../audio/decode", () => ({ loadTrackAudio: vi.fn(), rememberAnalysis: vi.fn() }));
 vi.mock("../audio/analyze", () => ({ analyzeSound: vi.fn() }));
 vi.mock("../player/usePlayer", () => ({
   usePlayer: () => ({
@@ -79,6 +79,33 @@ test("no playhead when this track isn't the one playing", async () => {
   render(<Sound track={TRACK} />);
   await screen.findByLabelText("Mel spectrogram");
   expect(screen.queryByTestId("spectrogram-playhead")).not.toBeInTheDocument();
+});
+
+test("a cached analysis skips the worker entirely", async () => {
+  vi.mocked(loadTrackAudio).mockResolvedValue({
+    samples: new Float32Array(4096),
+    sampleRate: 44100,
+    duration: 30,
+    analysis: ANALYSIS,
+  });
+
+  render(<Sound track={TRACK} />);
+  expect(await screen.findByLabelText("Mel spectrogram")).toBeInTheDocument();
+  expect(analyzeSound).not.toHaveBeenCalled();
+});
+
+test("switching tracks aborts the in-flight load", async () => {
+  const signals: (AbortSignal | undefined)[] = [];
+  vi.mocked(loadTrackAudio).mockImplementation(async (_id, deps) => {
+    signals.push(deps?.signal);
+    return new Promise(() => {}) as unknown as Awaited<ReturnType<typeof loadTrackAudio>>;
+  });
+
+  const view = render(<Sound track={TRACK} />);
+  expect(signals[0]?.aborted).toBe(false);
+  view.rerender(<Sound track={{ ...TRACK, track_id: "other" }} />);
+  expect(signals[0]?.aborted).toBe(true); // the first load is cancelled
+  expect(signals[1]?.aborted).toBe(false); // the new one is live
 });
 
 test("a failed fetch shows an error instead of the panels", async () => {

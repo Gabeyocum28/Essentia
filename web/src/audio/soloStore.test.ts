@@ -5,7 +5,7 @@ vi.mock("../player/usePlayer", () => ({ attachGraph: vi.fn() }));
 
 function fakeGraph() {
   const param = () => ({ value: 0, setTargetAtTime(v: number) { this.value = v; } });
-  const made = { filters: 0, gains: 0 };
+  const made = { filters: 0, gains: 0, disconnects: 0, connects: 0 };
   const context = {
     destination: {},
     currentTime: 0,
@@ -18,7 +18,19 @@ function fakeGraph() {
       return { gain: param(), connect: () => {} };
     },
   };
-  return { made, graph: { context, source: { connect: () => {} } } };
+  const source = {
+    connect: () => {
+      made.connects++;
+    },
+    disconnect: () => {
+      made.disconnects++;
+    },
+  };
+  return { made, graph: { context, source } };
+}
+
+function mockAttach(graph: unknown) {
+  vi.mocked(attachGraph).mockResolvedValue(graph as Awaited<ReturnType<typeof attachGraph>>);
 }
 
 beforeEach(() => {
@@ -26,29 +38,50 @@ beforeEach(() => {
   vi.mocked(attachGraph).mockReset();
 });
 
-test("builds the chain on the first solo and reuses it after", () => {
+test("builds the chain on the first solo and reuses it after", async () => {
   const { made, graph } = fakeGraph();
-  vi.mocked(attachGraph).mockReturnValue(graph as unknown as ReturnType<typeof attachGraph>);
+  mockAttach(graph);
 
-  soloBand(240, 1200);
+  await soloBand(240, 1200);
   expect(currentBand()).toEqual([240, 1200]);
-  soloBand(2000, 6000);
+  await soloBand(2000, 6000);
   expect(currentBand()).toEqual([2000, 6000]);
 
   expect(made.filters).toBe(4); // one graph, not two
-  expect(made.gains).toBe(2);
+  expect(made.gains).toBe(1);
+  expect(attachGraph).toHaveBeenCalledTimes(1);
 });
 
-test("soloOff clears the band", () => {
+test("a burst of solos while attaching builds one chain and applies the last band", async () => {
+  const { made, graph } = fakeGraph();
+  mockAttach(graph);
+
+  await Promise.all([soloBand(100, 200), soloBand(300, 400), soloBand(500, 600)]);
+
+  expect(made.filters).toBe(4);
+  expect(attachGraph).toHaveBeenCalledTimes(1);
+  expect(currentBand()).toEqual([500, 600]);
+});
+
+test("soloOff clears the band", async () => {
   const { graph } = fakeGraph();
-  vi.mocked(attachGraph).mockReturnValue(graph as unknown as ReturnType<typeof attachGraph>);
-  soloBand(240, 1200);
+  mockAttach(graph);
+  await soloBand(240, 1200);
   soloOff();
   expect(currentBand()).toBeNull();
 });
 
-test("no Web Audio means no solo, not a crash", () => {
-  vi.mocked(attachGraph).mockReturnValue(null);
-  soloBand(240, 1200);
+test("soloOff during the attach wins over the in-flight solo", async () => {
+  const { graph } = fakeGraph();
+  mockAttach(graph);
+  const pending = soloBand(240, 1200);
+  soloOff();
+  await pending;
+  expect(currentBand()).toBeNull();
+});
+
+test("no Web Audio means no solo, not a crash", async () => {
+  mockAttach(null);
+  await soloBand(240, 1200);
   expect(currentBand()).toBeNull();
 });
