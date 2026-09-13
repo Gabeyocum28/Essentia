@@ -17,7 +17,7 @@ from pathlib import Path
 
 from concurrent.futures import ThreadPoolExecutor
 
-from music_recommendations.analysis import analyze_track, analyze_tracks
+from music_recommendations.analysis import analyze_tracks
 from music_recommendations.corpus import crawl
 from music_recommendations.server import deezer, store, viz
 
@@ -49,8 +49,16 @@ def download_preview(url: str) -> Path:
     fd, name = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
     path = Path(name)
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        path.write_bytes(resp.read())
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            path.write_bytes(resp.read())
+    except BaseException:
+        # mkstemp already created the file, and the caller only unlinks
+        # previews it was handed back — so a failed fetch (expired preview
+        # token, timeout) used to leave an empty temp file behind for every
+        # failing job, and the crawler retries forever.
+        path.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -110,15 +118,11 @@ def _prepare_safe(track_id: str) -> tuple[dict, Path] | Exception:
 def _analyze(paths: list[Path]) -> list[dict | Exception]:
     """Features (or the failure) per path, in order.
 
-    A lone path goes through `analyze_track`, which is `analyze_tracks`'
-    one-path case, so a single job behaves exactly as it did before groups
-    existed; two or more share one packed inference pass.
+    One path or many, this is `analyze_tracks`: its one-path case is what
+    `analyze_track` already delegates to, so the old single-path branch here
+    was a second way to say the same thing (and a second thing to keep in
+    step when the group path changed).
     """
-    if len(paths) == 1:
-        try:
-            return [analyze_track(paths[0])]
-        except Exception as exc:  # noqa: BLE001 - reported in this path's slot
-            return [exc]
     return analyze_tracks(paths)
 
 

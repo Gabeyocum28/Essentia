@@ -176,6 +176,37 @@ test("an already-proxied element is left alone", async () => {
   expect(el.loads).toBe(loads); // no reload
 });
 
+test("a proxy that never answers times out, restores the src, and rejects", async () => {
+  const { Ctx, created } = stubAudioContext();
+  globalThis.AudioContext = Ctx as unknown as typeof AudioContext;
+  const { result } = renderHook(() => usePlayer(), { wrapper });
+
+  await act(async () => {
+    result.current.play(track("42"));
+  });
+  el.currentTime = 12;
+  // A stalled proxy response: neither `loadedmetadata` nor `error` ever
+  // fires, so without the timeout this await never settles.
+  el.load = () => {
+    el.loads++;
+  };
+
+  vi.useFakeTimers();
+  try {
+    const attaching = attachGraph();
+    const settled = expect(attaching).rejects.toThrow(/timed out/);
+    await vi.advanceTimersByTimeAsync(5000);
+    await settled;
+  } finally {
+    vi.useRealTimers();
+  }
+
+  expect(el.src).toBe("/api/preview/42"); // put back the way it was
+  expect(el.currentTime).toBe(12);
+  expect(created).toHaveLength(0); // no source node over a half-loaded element
+  expect(isGraphAttached()).toBe(false);
+});
+
 test("once attached, play() keeps later tracks on the same-origin proxy", async () => {
   const { Ctx } = stubAudioContext();
   globalThis.AudioContext = Ctx as unknown as typeof AudioContext;

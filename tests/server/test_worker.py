@@ -28,7 +28,7 @@ def analysis_ok(monkeypatch, tmp_path):
     mp3 = tmp_path / "p.mp3"
     mp3.write_bytes(b"mp3")
     monkeypatch.setattr(worker, "download_preview", lambda url: mp3)
-    monkeypatch.setattr(worker, "analyze_track", lambda p: dict(FEATURES))
+    monkeypatch.setattr(worker, "analyze_tracks", lambda paths: [dict(FEATURES) for _ in paths])
 
 
 def test_process_job_analyzes_stores_and_clears_marker(fake_mongo, analysis_ok, monkeypatch):
@@ -47,7 +47,7 @@ def test_process_job_prefers_fresh_deezer_preview_url(fake_mongo, monkeypatch, t
     store.put_track_meta({**TRACK, "preview_url": "http://x/stale.mp3"})
     fresh = {**TRACK, "preview_url": "http://x/fresh.mp3"}
     monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(fresh))
-    monkeypatch.setattr(worker, "analyze_track", lambda p: dict(FEATURES))
+    monkeypatch.setattr(worker, "analyze_tracks", lambda paths: [dict(FEATURES) for _ in paths])
 
     mp3 = tmp_path / "p.mp3"
     mp3.write_bytes(b"mp3")
@@ -679,3 +679,44 @@ def test_downloads_in_a_group_run_in_parallel(fake_mongo, group_ok, monkeypatch,
 
     assert group_ok == [3]
     assert store.corpus_size() == 3
+
+
+def test_download_preview_leaves_no_temp_file_when_the_fetch_fails(monkeypatch,
+                                                                   tmp_path):
+    """mkstemp creates the file before the fetch, and only a preview handed
+    back to the caller is ever unlinked -- so a 403 on an expired preview
+    token used to leak an empty temp file per failing job."""
+    import tempfile
+    import urllib.request
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    def boom(url, timeout=None):
+        raise OSError("403")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+
+    with pytest.raises(OSError):
+        worker.download_preview("http://x/p.mp3")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_preview_keeps_the_file_it_returns(monkeypatch, tmp_path):
+    import contextlib
+    import tempfile
+    import urllib.request
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    @contextlib.contextmanager
+    def fake_urlopen(url, timeout=None):
+        class Resp:
+            def read(self):
+                return b"mp3 bytes"
+        yield Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    path = worker.download_preview("http://x/p.mp3")
+    assert path.read_bytes() == b"mp3 bytes"
+    assert [p.name for p in tmp_path.iterdir()] == [path.name]

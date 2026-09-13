@@ -44,21 +44,52 @@ function isProxySrc(el: HTMLAudioElement, trackId: string): boolean {
   return Boolean(el.src) && el.src.endsWith(previewAudioUrl(trackId));
 }
 
-/** Swap the element onto the same-origin proxy, keeping position and state. */
+/** How long to wait for the proxied media to report metadata before giving up. */
+const PROXY_LOAD_TIMEOUT_MS = 5000;
+
+/** Swap the element onto the same-origin proxy, keeping position and state.
+ *
+ * Rejects if the proxy never answers. Without the timeout the await was
+ * unbounded: a stalled proxy response fires neither `loadedmetadata` nor
+ * `error`, so the solo promise hung forever and every later solo attempt
+ * joined the same dead in-flight attach. On timeout the element is put back
+ * on the src (and position) it had, so ordinary playback survives a failed
+ * SOUND-mode attach. */
 async function moveToProxy(el: HTMLAudioElement, trackId: string): Promise<void> {
   const wasPlaying = !el.paused;
   const position = el.currentTime;
-  el.src = previewAudioUrl(trackId);
-  await new Promise<void>((resolve) => {
-    const done = () => {
-      el.removeEventListener("loadedmetadata", done);
-      el.removeEventListener("error", done);
-      resolve();
-    };
-    el.addEventListener("loadedmetadata", done);
-    el.addEventListener("error", done);
+  const previousSrc = el.src;
+  try {
+    el.src = previewAudioUrl(trackId);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("timed out loading the audio proxy"));
+      }, PROXY_LOAD_TIMEOUT_MS);
+      const cleanup = () => {
+        clearTimeout(timer);
+        el.removeEventListener("loadedmetadata", done);
+        el.removeEventListener("error", done);
+      };
+      const done = () => {
+        cleanup();
+        resolve();
+      };
+      el.addEventListener("loadedmetadata", done);
+      el.addEventListener("error", done);
+      el.load?.();
+    });
+  } catch (err) {
+    el.src = previousSrc;
     el.load?.();
-  });
+    try {
+      el.currentTime = position;
+    } catch {
+      /* not seekable yet; playback just restarts from the top */
+    }
+    if (wasPlaying) void el.play();
+    throw err;
+  }
   try {
     el.currentTime = position;
   } catch {

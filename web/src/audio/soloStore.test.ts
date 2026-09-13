@@ -1,5 +1,5 @@
 import { attachGraph } from "../player/usePlayer";
-import { currentBand, resetSolo, soloBand, soloOff } from "./soloStore";
+import { currentBand, resetSolo, soloBand, soloError, soloOff } from "./soloStore";
 
 vi.mock("../player/usePlayer", () => ({ attachGraph: vi.fn() }));
 
@@ -84,4 +84,33 @@ test("no Web Audio means no solo, not a crash", async () => {
   mockAttach(null);
   await soloBand(240, 1200);
   expect(currentBand()).toBeNull();
+});
+
+test("no Web Audio is not an error message, just no solo", async () => {
+  mockAttach(null);
+  await soloBand(240, 1200);
+  expect(soloError()).toBeNull();
+});
+
+test("a failed attach becomes a message, not an unhandled rejection", async () => {
+  vi.mocked(attachGraph).mockRejectedValue(new Error("timed out loading the audio proxy"));
+
+  await expect(soloBand(240, 1200)).resolves.toBeUndefined();
+  expect(currentBand()).toBeNull();
+  expect(soloError()).toBe("Couldn't enable band solo.");
+
+  // The next attempt gets to try again, and a success clears the message.
+  const { graph } = fakeGraph();
+  mockAttach(graph);
+  await soloBand(240, 1200);
+  expect(soloError()).toBeNull();
+  expect(currentBand()).toEqual([240, 1200]);
+});
+
+test("soloOff clears a failure message too", async () => {
+  vi.mocked(attachGraph).mockRejectedValue(new Error("nope"));
+  await soloBand(240, 1200);
+  expect(soloError()).not.toBeNull();
+  soloOff();
+  expect(soloError()).toBeNull();
 });

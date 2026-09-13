@@ -280,6 +280,12 @@ def _tracks_cached(track_ids: "list[str] | tuple[str, ...]") -> list[dict | None
     None for an id the store does not know. A miss is NOT cached: an id can
     be absent because the worker has not written its metadata yet, and a
     cached None would outlive that by the life of the process.
+
+    A store failure does not raise: the bulk read goes through _safe(), so an
+    Atlas blip degrades to None for every uncached id, which the viz callers
+    turn into id-only track placeholders (_unknown_track). The screen keeps
+    its geometry and loses only the titles, matching the module-wide fallback
+    described in server/CLAUDE.md rather than failing the whole request.
     """
     track_ids = list(track_ids)
     found: dict[str, dict] = {}
@@ -696,9 +702,18 @@ _TOP8_CACHE: "OrderedDict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]" = Ord
 # The MST edge list of the embedding matrix, keyed the same way. Not part of
 # contract/contract.md — see /viz/mst below.
 _MST_CACHE: "OrderedDict[int, tuple[np.ndarray, list[tuple[int, int, float]]]]" = OrderedDict()
+
+# /viz/hubs' two per-row arrays (neighbour counts, mean centrality), keyed by
+# (id(matrix), k) because the count depends on k while the centrality does
+# not — one entry per (subset, k) is simpler than splitting them, and both
+# are one float/int per row (~64 KB at VIZ_MAX) against the subset matrix's
+# ~40 MB. Same identity discipline as the two above: the matrix is stored in
+# the value and re-checked with `is`, so a reused id is a miss.
+_HUBS_CACHE: "OrderedDict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]]" = OrderedDict()
 _CACHE_KEEP = 4
 
-# One lock for all three viz caches (_SUBSET_CACHE, _TOP8_CACHE, _MST_CACHE).
+# One lock for all four viz caches (_SUBSET_CACHE, _TOP8_CACHE, _MST_CACHE,
+# _HUBS_CACHE).
 # Endpoints run on FastAPI's threadpool, and every one of these caches is a
 # read-modify-write (lookup + move_to_end, insert + evict, purge): without
 # this, two concurrent /viz calls could interleave a move_to_end with a
@@ -745,6 +760,53 @@ def _mst(matrix: np.ndarray) -> list[tuple[int, int, float]]:
         while len(_MST_CACHE) > _CACHE_KEEP:
             _MST_CACHE.popitem(last=False)
     return edges
+
+
+def _compute_hub_arrays(matrix: np.ndarray,
+                        neighbor_k: int) -> tuple[np.ndarray, np.ndarray]:
+    """(neighbour counts, mean centrality) per row of the subset matrix.
+
+    Deliberately no `similarity.copy()`: the pairwise matrix is n^2 float32
+    (256 MB at VIZ_MAX), so copying it to blank the diagonal doubled the peak
+    for one number per row. Take the top k+1 per row instead — the self index
+    is always among them, being the row's maximum — and drop the one self
+    entry per row, which is exactly the old top-k-excluding-self set.
+    """
+    rows = len(matrix)
+    similarity = viz.pairwise_cosine(matrix)
+    # kth=neighbor_k is in range: neighbor_k <= rows - 1 by construction.
+    neighbors = np.argpartition(-similarity, neighbor_k, axis=1)[:, :neighbor_k + 1]
+    # Exactly one self index per row (argpartition returns distinct indices).
+    keep = neighbors != np.arange(rows)[:, None]
+    neighbors = neighbors[keep].reshape(rows, neighbor_k)
+    counts = np.bincount(neighbors.ravel(), minlength=rows)
+    centrality = (similarity.sum(axis=1) - np.diag(similarity)) / (rows - 1)
+    return counts, centrality
+
+
+def _hub_arrays(matrix: np.ndarray,
+                neighbor_k: int) -> tuple[np.ndarray, np.ndarray]:
+    """_compute_hub_arrays, memoized per (subset matrix, k).
+
+    The arrays are deterministic in the subset and k, and the Insights screen
+    asks for the same subset repeatedly (the hub list, then the same list with
+    a different limit), so an uncached /viz/hubs paid the O(n^2) argpartition
+    every time — the measured 2.4 s warm.
+    """
+    key = (id(matrix), neighbor_k)
+    with _VIZ_CACHE_LOCK:
+        cached = _HUBS_CACHE.get(key)
+        if cached is not None and cached[0] is matrix:
+            _HUBS_CACHE.move_to_end(key)
+            return cached[1], cached[2]
+    # Outside the lock, like _top8: the argpartition is the expensive part and
+    # a race only costs a duplicate computation.
+    counts, centrality = _compute_hub_arrays(matrix, neighbor_k)
+    with _VIZ_CACHE_LOCK:
+        _HUBS_CACHE[key] = (matrix, counts, centrality)
+        while len(_HUBS_CACHE) > _CACHE_KEEP:
+            _HUBS_CACHE.popitem(last=False)
+    return counts, centrality
 
 
 @app.get("/viz/map")
@@ -948,14 +1010,14 @@ def _purge_viz_caches(matrix_all: np.ndarray) -> None:
     reference to the full matrix it was sliced from, so one stale entry pins
     a whole ~450 MB corpus matrix that _MATRIX_CACHE has already replaced.
     LRU eviction alone does not do this: the stale entry can stay inside the
-    keep window indefinitely if it is never looked up again. _TOP8_CACHE and
-    _MST_CACHE pin subset matrices the same way, so they are purged down to
-    whatever subsets are still cached.
+    keep window indefinitely if it is never looked up again. _TOP8_CACHE,
+    _MST_CACHE and _HUBS_CACHE pin subset matrices the same way, so they are
+    purged down to whatever subsets are still cached.
     """
     for key in [k for k, v in _SUBSET_CACHE.items() if v[0] is not matrix_all]:
         _SUBSET_CACHE.pop(key, None)
     live = [value[2] for value in _SUBSET_CACHE.values()]
-    for cache in (_TOP8_CACHE, _MST_CACHE):
+    for cache in (_TOP8_CACHE, _MST_CACHE, _HUBS_CACHE):
         for key in [k for k, v in cache.items()
                     if not any(v[0] is subset for subset in live)]:
             cache.pop(key, None)
@@ -1277,14 +1339,7 @@ def viz_hubs(track_id: str | None = None,
     if len(ids) < 2:
         raise HTTPException(404, "hubness needs at least two tracks")
     neighbor_k = min(k, len(ids) - 1)
-    similarity = viz.pairwise_cosine(matrix)
-    without_self = similarity.copy()
-    np.fill_diagonal(without_self, -np.inf)
-    neighbors = np.argpartition(
-        -without_self, neighbor_k - 1, axis=1
-    )[:, :neighbor_k]
-    counts = np.bincount(neighbors.ravel(), minlength=len(ids))
-    centrality = (similarity.sum(axis=1) - np.diag(similarity)) / (len(ids) - 1)
+    counts, centrality = _hub_arrays(matrix, neighbor_k)
 
     index = np.arange(len(ids))
     hub_order = np.lexsort((index, -counts))

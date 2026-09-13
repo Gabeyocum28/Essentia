@@ -14,24 +14,35 @@ from __future__ import annotations
 
 import heapq
 import threading
+from collections import OrderedDict
 
 import numpy as np
 
 
 _PAIRWISE_LOCK = threading.RLock()
 _PAIRWISE_CACHE: tuple[np.ndarray, np.ndarray] | None = None
-# (matrix, {k: adjacency}) — the matrix is held in the tuple ON PURPOSE:
-# keying by bare id(matrix) let the old array be garbage-collected after a
-# corpus growth, and a later array reusing the same address would silently
-# serve a graph whose node indices belong to the old, smaller corpus.
-_GRAPH_CACHE: tuple[np.ndarray, dict[int, list[dict[int, float]]]] | None = None
+# (id(matrix), k) -> (matrix, adjacency). The matrix is held in the VALUE ON
+# PURPOSE: keying by bare id(matrix) let the old array be garbage-collected
+# after a corpus growth, and a later array reusing the same address would
+# silently serve a graph whose node indices belong to the old, smaller
+# corpus — so the stored matrix is re-checked with `is` and a reused id is a
+# miss rather than a wrong answer.
+#
+# An LRU dict rather than the single slot this used to be: the seed-anchored
+# subset means two seeds' matrices can both be live at once (a caller
+# alternating between two walks), and a one-entry cache rebuilt the whole
+# k-NN graph on every other request — the measured 1.8 s warm /viz/walk.
+# Bounded at _GRAPH_KEEP, matching app._CACHE_KEEP, because each entry pins
+# its subset matrix.
+_GRAPH_CACHE: "OrderedDict[tuple[int, int], tuple[np.ndarray, list[dict[int, float]]]]" = OrderedDict()
+_GRAPH_KEEP = 4
 
 
 def clear_geometry_cache() -> None:
-    global _PAIRWISE_CACHE, _GRAPH_CACHE
+    global _PAIRWISE_CACHE
     with _PAIRWISE_LOCK:
         _PAIRWISE_CACHE = None
-        _GRAPH_CACHE = None
+        _GRAPH_CACHE.clear()
 
 
 def normalized_rows(matrix: np.ndarray) -> np.ndarray:
@@ -58,6 +69,37 @@ def pairwise_cosine(matrix: np.ndarray) -> np.ndarray:
         return similarity
 
 
+def _build_knn_graph(matrix: np.ndarray, k: int) -> list[dict[int, float]]:
+    """Symmetrized k-NN adjacency (cosine distance) for every row."""
+    n = len(matrix)
+    distance = 1.0 - pairwise_cosine(matrix)
+    adjacency: list[dict[int, float]] = [dict() for _ in range(n)]
+    for i in range(n):
+        candidates = np.argpartition(distance[i], k)[:k + 1]
+        neighbors = [int(j) for j in candidates if j != i]
+        neighbors.sort(key=lambda j: (distance[i, j], j))
+        for j in neighbors[:k]:
+            weight = float(distance[i, j])
+            adjacency[i][j] = min(adjacency[i].get(j, weight), weight)
+            adjacency[j][i] = min(adjacency[j].get(i, weight), weight)
+    return adjacency
+
+
+def _knn_graph(matrix: np.ndarray, k: int) -> list[dict[int, float]]:
+    """_build_knn_graph, memoized per (matrix identity, k)."""
+    key = (id(matrix), k)
+    with _PAIRWISE_LOCK:
+        cached = _GRAPH_CACHE.get(key)
+        if cached is not None and cached[0] is matrix:
+            _GRAPH_CACHE.move_to_end(key)
+            return cached[1]
+        adjacency = _build_knn_graph(matrix, k)
+        _GRAPH_CACHE[key] = (matrix, adjacency)
+        while len(_GRAPH_CACHE) > _GRAPH_KEEP:
+            _GRAPH_CACHE.popitem(last=False)
+        return adjacency
+
+
 def shortest_walk(matrix: np.ndarray, start: int, end: int,
                   k: int = 8) -> tuple[list[int], float, float]:
     """Dijkstra on the symmetrized k-NN graph of normalized embeddings.
@@ -80,25 +122,7 @@ def shortest_walk(matrix: np.ndarray, start: int, end: int,
         return [start], 0.0, 0.0
     k = min(max(int(k), 1), n - 1)
 
-    global _GRAPH_CACHE
-    with _PAIRWISE_LOCK:
-        if _GRAPH_CACHE is None or _GRAPH_CACHE[0] is not matrix:
-            _GRAPH_CACHE = (matrix, {})
-        graphs = _GRAPH_CACHE[1]
-        adjacency = graphs.get(k)
-        if adjacency is None:
-            similarity = pairwise_cosine(matrix)
-            distance = 1.0 - similarity
-            adjacency = [dict() for _ in range(n)]
-            for i in range(n):
-                candidates = np.argpartition(distance[i], k)[:k + 1]
-                neighbors = [int(j) for j in candidates if j != i]
-                neighbors.sort(key=lambda j: (distance[i, j], j))
-                for j in neighbors[:k]:
-                    weight = float(distance[i, j])
-                    adjacency[i][j] = min(adjacency[i].get(j, weight), weight)
-                    adjacency[j][i] = min(adjacency[j].get(i, weight), weight)
-            graphs[k] = adjacency
+    adjacency = _knn_graph(matrix, k)
 
     distances = [float("inf")] * n
     previous = [-1] * n

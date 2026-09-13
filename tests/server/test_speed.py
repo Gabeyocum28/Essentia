@@ -324,3 +324,89 @@ def test_viz_map_rejects_an_unknown_points_mode(client, fake_mongo):
                         {"embedding": [1.0, i / 2.0]})
     r = client.get("/viz/map?track_id=t0&axis=sounds_like&points=sparse")
     assert r.status_code == 422
+
+
+# ---- per-subset caches for the two remaining slow endpoints ----
+
+def test_viz_hubs_computes_the_neighbour_arrays_once_per_subset(client,
+                                                                fake_mongo,
+                                                                monkeypatch):
+    """The O(n^2) argpartition + bincount is deterministic in (subset, k),
+    and the Insights screen asks for the same subset more than once."""
+    monkeypatch.setattr(app_module, "VIZ_MAX", 50)
+    for i in range(20):
+        store.put_track({**TRACK, "track_id": f"t{i}"},
+                        {"embedding": [1.0, i / 19.0]})
+    calls = []
+    real = app_module._compute_hub_arrays
+    monkeypatch.setattr(app_module, "_compute_hub_arrays",
+                        lambda m, k, _f=real: (calls.append(k), _f(m, k))[1])
+
+    first = client.get("/viz/hubs?track_id=t0&k=4&limit=3").json()
+    second = client.get("/viz/hubs?track_id=t0&k=4&limit=3").json()
+    assert first == second
+    assert calls == [4]
+    # A different k is a different answer, so it is a different entry.
+    client.get("/viz/hubs?track_id=t0&k=6&limit=3")
+    assert calls == [4, 6]
+
+
+def test_viz_hubs_counts_match_the_uncached_definition(fake_mongo):
+    """The no-copy top-(k+1)-minus-self is the same set as the old
+    diagonal-blanked top-k."""
+    rng = np.random.default_rng(3)
+    matrix = rng.standard_normal((40, 6)).astype(np.float32)
+    counts, centrality = app_module._compute_hub_arrays(matrix, 5)
+
+    similarity = viz.pairwise_cosine(matrix)
+    without_self = similarity.copy()
+    np.fill_diagonal(without_self, -np.inf)
+    neighbors = np.argpartition(-without_self, 4, axis=1)[:, :5]
+    expected = np.bincount(neighbors.ravel(), minlength=40)
+    assert list(counts) == list(expected)
+    assert np.allclose(
+        centrality,
+        (similarity.sum(axis=1) - np.diag(similarity)) / 39.0, atol=1e-6)
+
+
+def test_viz_walk_builds_the_knn_graph_once_per_subset_and_k(client,
+                                                             fake_mongo,
+                                                             monkeypatch):
+    monkeypatch.setattr(app_module, "VIZ_MAX", 50)
+    for i in range(20):
+        store.put_track({**TRACK, "track_id": f"t{i}"},
+                        {"embedding": [1.0, i / 19.0]})
+    calls = []
+    real = viz._build_knn_graph
+    monkeypatch.setattr(viz, "_build_knn_graph",
+                        lambda m, k, _f=real: (calls.append(k), _f(m, k))[1])
+
+    first = client.get("/viz/walk?from=t0&to=t9&k=4").json()
+    second = client.get("/viz/walk?from=t0&to=t9&k=4").json()
+    assert first == second
+    assert calls == [4]
+    client.get("/viz/walk?from=t0&to=t9&k=6")
+    assert calls == [4, 6]
+
+
+def test_knn_graph_cache_holds_several_subsets_and_is_bounded(monkeypatch):
+    """It used to be a single slot, so a caller alternating between two
+    seeds' subsets rebuilt the graph on every request."""
+    monkeypatch.setattr(viz, "_GRAPH_KEEP", 2)
+    rng = np.random.default_rng(7)
+    a = rng.standard_normal((12, 4)).astype(np.float32)
+    b = rng.standard_normal((12, 4)).astype(np.float32)
+    calls = []
+    real = viz._build_knn_graph
+    monkeypatch.setattr(viz, "_build_knn_graph",
+                        lambda m, k, _f=real: (calls.append(id(m)), _f(m, k))[1])
+
+    viz.shortest_walk(a, 0, 5, k=3)
+    viz.shortest_walk(b, 0, 5, k=3)
+    viz.shortest_walk(a, 0, 5, k=3)   # still cached: both fit
+    assert calls == [id(a), id(b)]
+    assert len(viz._GRAPH_CACHE) == 2
+
+    c = rng.standard_normal((12, 4)).astype(np.float32)
+    viz.shortest_walk(c, 0, 5, k=3)
+    assert len(viz._GRAPH_CACHE) == 2   # bounded; the LRU entry went

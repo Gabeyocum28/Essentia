@@ -14,6 +14,7 @@ def clear_matrix_cache():
     app._UNIT_CACHE.clear()
     app._TOP8_CACHE.clear()
     app._MST_CACHE.clear()
+    app._HUBS_CACHE.clear()
     app._SUBSET_CACHE.clear()
     app._TRACK_META.clear()
     app._VIZ_SNAPSHOT = None
@@ -24,6 +25,7 @@ def clear_matrix_cache():
     app._UNIT_CACHE.clear()
     app._TOP8_CACHE.clear()
     app._MST_CACHE.clear()
+    app._HUBS_CACHE.clear()
     app._SUBSET_CACHE.clear()
     app._TRACK_META.clear()
     app._VIZ_SNAPSHOT = None
