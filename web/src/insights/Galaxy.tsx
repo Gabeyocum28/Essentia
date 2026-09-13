@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { canvasPalette } from "../theme";
 import { applyZoomPan, fitTransform, nearestIndex, toScreen, zoomAbout } from "./geometry";
 import { Artwork } from "../components/Artwork";
 import { usePlayer } from "../player/usePlayer";
@@ -89,6 +90,7 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
 
     let raf = 0;
     const draw = () => {
+      const c = canvasPalette();
       const dpr = window.devicePixelRatio || 1;
       const applied = appliedSizeRef.current;
       if (applied.width !== size.width || applied.height !== size.height || applied.dpr !== dpr) {
@@ -102,7 +104,7 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, size.width, size.height);
-      ctx.fillStyle = "#000";
+      ctx.fillStyle = c.bg;
       ctx.fillRect(0, 0, size.width, size.height);
 
       const cx = size.width / 2;
@@ -110,7 +112,7 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
       const t = applyZoomPan(baseTransform, zoom, pan.x, pan.y, cx, cy);
 
       // Corpus dots
-      ctx.fillStyle = "rgba(255,255,255,.55)";
+      ctx.fillStyle = c.dot;
       for (let i = 0; i < map.points.ids.length; i++) {
         const [sx, sy] = toScreen(t, map.points.x[i], map.points.y[i]);
         ctx.beginPath();
@@ -121,7 +123,7 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
       const [seedSx, seedSy] = toScreen(t, map.seed.x, map.seed.y);
 
       // Spokes seed -> rec
-      ctx.strokeStyle = "rgba(10,132,255,.6)";
+      ctx.strokeStyle = c.accentLine;
       ctx.lineWidth = 1;
       for (const rec of map.recs) {
         const [rsx, rsy] = toScreen(t, rec.x, rec.y);
@@ -135,27 +137,27 @@ export function Galaxy({ map, selectedId, onSelect }: Props) {
       for (const rec of map.recs) {
         const [rsx, rsy] = toScreen(t, rec.x, rec.y);
         if (selectedId === rec.track_id) {
-          ctx.fillStyle = "rgba(10,132,255,.35)";
+          ctx.fillStyle = c.accentSoft;
           ctx.beginPath();
           ctx.arc(rsx, rsy, 11, 0, Math.PI * 2);
           ctx.fill();
         }
-        ctx.fillStyle = "#0A84FF";
+        ctx.fillStyle = c.accent;
         ctx.beginPath();
         ctx.arc(rsx, rsy, 4.5, 0, Math.PI * 2);
         ctx.fill();
       }
 
       // Seed glow + dot
-      ctx.fillStyle = "rgba(255,214,10,.25)";
+      ctx.fillStyle = c.seedSofter;
       ctx.beginPath();
       ctx.arc(seedSx, seedSy, 18, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = "rgba(255,214,10,.6)";
+      ctx.fillStyle = c.seedSoft;
       ctx.beginPath();
       ctx.arc(seedSx, seedSy, 9, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = "#FFD60A";
+      ctx.fillStyle = c.seed;
       ctx.beginPath();
       ctx.arc(seedSx, seedSy, 4, 0, Math.PI * 2);
       ctx.fill();

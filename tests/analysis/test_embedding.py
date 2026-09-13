@@ -72,3 +72,54 @@ def test_effnet_frames_on_tone(tone_wav):
     assert out.shape == (1 + (n_frames - 128) // 62, 1280)
     assert np.isfinite(out).all()
     assert np.abs(out).max() > 0
+
+
+# ---- packing patches from several tracks into the fixed 64-patch batch ----
+
+@needs_effnet
+def test_embed_patch_groups_matches_per_group_results():
+    """Packing must be arithmetic-neutral: what a track's patches embed to
+    does not depend on which other tracks shared the batch with them."""
+    rng = np.random.default_rng(1)
+    groups = [
+        rng.random((28, 128, 96), dtype=np.float32),
+        rng.random((30, 128, 96), dtype=np.float32),
+        rng.random((70, 128, 96), dtype=np.float32),
+    ]
+    packed = embedding.embed_patch_groups(groups)
+    assert len(packed) == len(groups)
+    for g, out in zip(groups, packed):
+        assert out.shape == (len(g), 1280)
+        assert np.allclose(out, embedding.embed_patches(g), atol=1e-4)
+
+
+def test_embed_patch_groups_batches_are_packed(monkeypatch):
+    """66 patches across three tracks: one full batch of 64 plus a remainder
+    of 2 — instead of three mostly-empty batches, as per-track embedding
+    would have produced."""
+    calls = []
+    monkeypatch.setattr(
+        embedding, "_run_batch",
+        lambda chunk: (calls.append(len(chunk)),
+                       np.zeros((len(chunk), 1280), np.float32))[1],
+    )
+    groups = [np.zeros((28, 128, 96), np.float32),
+              np.zeros((28, 128, 96), np.float32),
+              np.zeros((10, 128, 96), np.float32)]
+    out = embedding.embed_patch_groups(groups)
+
+    assert calls == [64, 2]
+    assert [len(o) for o in out] == [28, 28, 10]
+
+
+def test_embed_patch_groups_handles_empty_groups(monkeypatch):
+    """A track too short for one patch still gets a (0, 1280) slot back, in
+    position, so the caller can zip groups to tracks."""
+    monkeypatch.setattr(
+        embedding, "_run_batch",
+        lambda chunk: np.zeros((len(chunk), 1280), np.float32),
+    )
+    out = embedding.embed_patch_groups([np.zeros((0, 128, 96), np.float32),
+                                        np.zeros((3, 128, 96), np.float32)])
+    assert [o.shape for o in out] == [(0, 1280), (3, 1280)]
+    assert embedding.embed_patch_groups([]) == []

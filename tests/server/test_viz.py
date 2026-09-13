@@ -356,19 +356,22 @@ def test_shortest_walk_uses_knn_edges_and_preserves_endpoints():
     assert ambient == pytest.approx(expected_ambient)
 
 
-def test_shortest_walk_graph_cache_pins_matrix_and_evicts_on_new_matrix():
-    # The graph cache must hold the matrix it was built from: a bare id()
-    # key let a freed matrix's address be reused by a successor, silently
-    # serving stale node indices after the corpus grew mid-session.
+def test_shortest_walk_graph_cache_pins_the_matrix_it_was_built_from():
+    # Every entry must hold the matrix it was built from: a bare id() key let
+    # a freed matrix's address be reused by a successor, silently serving
+    # stale node indices after the corpus grew mid-session.
     theta = np.linspace(0, np.pi / 2, 7)
     first = np.column_stack([np.cos(theta), np.sin(theta)])
     viz.shortest_walk(first, 0, 6, k=2)
-    assert viz._GRAPH_CACHE is not None and viz._GRAPH_CACHE[0] is first
+    assert viz._GRAPH_CACHE[(id(first), 2)][0] is first
 
     second = np.column_stack([np.cos(theta[:5]), np.sin(theta[:5])])
     path, _, _ = viz.shortest_walk(second, 0, 4, k=2)
-    assert viz._GRAPH_CACHE[0] is second
+    assert viz._GRAPH_CACHE[(id(second), 2)][0] is second
     assert max(path) < len(second)
+    # Both subsets stay cached: this used to be a single slot, so alternating
+    # between two seeds' subsets rebuilt the graph on every request.
+    assert viz._GRAPH_CACHE[(id(first), 2)][0] is first
 
 
 def test_viz_walk_returns_track_path_and_distance_math(client, seeded_corpus):
@@ -883,6 +886,6 @@ def test_viz_subset_miss_purges_a_superseded_full_matrix(client, fake_mongo,
     assert all(value[0] is not old_matrix
                for value in app_mod._SUBSET_CACHE.values())
     live = [value[2] for value in app_mod._SUBSET_CACHE.values()]
-    for cache in (app_mod._TOP8_CACHE, app_mod._MST_CACHE):
+    for cache in (app_mod._TOP8_CACHE, app_mod._MST_CACHE, app_mod._HUBS_CACHE):
         assert all(any(value[0] is subset for subset in live)
                    for value in cache.values())

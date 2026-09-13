@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { canvasPalette } from "../theme";
 import { api } from "../api/client";
 import { fitTransform, nearestIndex, toScreen } from "./geometry";
 import { Artwork } from "../components/Artwork";
@@ -122,6 +123,9 @@ export function Walk({ map, selectedId, onSelect }: Props) {
     if (!canvas || size.width === 0 || size.height === 0) return;
 
     let raf = 0;
+    // Read once per effect, not per frame: canvasPalette() is a dozen
+    // getComputedStyle() calls, and draw() is on requestAnimationFrame.
+    const c = canvasPalette();
     const draw = () => {
       const dpr = window.devicePixelRatio || 1;
       const applied = appliedSizeRef.current;
@@ -135,10 +139,10 @@ export function Walk({ map, selectedId, onSelect }: Props) {
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.fillStyle = "#000";
+      ctx.fillStyle = c.bg;
       ctx.fillRect(0, 0, size.width, size.height);
 
-      ctx.fillStyle = "rgba(255,255,255,.55)";
+      ctx.fillStyle = c.dot;
       for (let i = 0; i < map.points.ids.length; i++) {
         const [sx, sy] = toScreen(transform, map.points.x[i], map.points.y[i]);
         ctx.beginPath();
@@ -149,23 +153,23 @@ export function Walk({ map, selectedId, onSelect }: Props) {
       for (const rec of map.recs) {
         const [sx, sy] = toScreen(transform, rec.x, rec.y);
         if (selectedId === rec.track_id) {
-          ctx.fillStyle = "rgba(10,132,255,.35)";
+          ctx.fillStyle = c.accentSoft;
           ctx.beginPath();
           ctx.arc(sx, sy, 11, 0, Math.PI * 2);
           ctx.fill();
         }
-        ctx.fillStyle = "#0A84FF";
+        ctx.fillStyle = c.accent;
         ctx.beginPath();
         ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
         ctx.fill();
       }
 
       const [seedSx, seedSy] = toScreen(transform, map.seed.x, map.seed.y);
-      ctx.fillStyle = "rgba(255,214,10,.6)";
+      ctx.fillStyle = c.seedSoft;
       ctx.beginPath();
       ctx.arc(seedSx, seedSy, 9, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = "#FFD60A";
+      ctx.fillStyle = c.seed;
       ctx.beginPath();
       ctx.arc(seedSx, seedSy, 4, 0, Math.PI * 2);
       ctx.fill();
@@ -175,7 +179,7 @@ export function Walk({ map, selectedId, onSelect }: Props) {
 
       if (from) {
         const [sx, sy] = toScreen(transform, from.x, from.y);
-        ctx.strokeStyle = "#FFD60A";
+        ctx.strokeStyle = c.seed;
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(sx, sy, 8, 0, Math.PI * 2);
@@ -195,7 +199,7 @@ export function Walk({ map, selectedId, onSelect }: Props) {
         ctx.stroke();
         ctx.restore();
 
-        ctx.strokeStyle = "#0A84FF";
+        ctx.strokeStyle = c.accent;
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(tsx, tsy, 8, 0, Math.PI * 2);
@@ -203,7 +207,7 @@ export function Walk({ map, selectedId, onSelect }: Props) {
       }
 
       if (walk && walk.path.length > 0) {
-        ctx.strokeStyle = "#FFD60A";
+        ctx.strokeStyle = c.seed;
         ctx.lineWidth = 2;
         ctx.beginPath();
         const shown = walk.path.slice(0, revealCount);
@@ -215,7 +219,7 @@ export function Walk({ map, selectedId, onSelect }: Props) {
         ctx.stroke();
         for (const step of shown) {
           const [sx, sy] = toScreen(transform, step.x, step.y);
-          ctx.fillStyle = "#FFD60A";
+          ctx.fillStyle = c.seed;
           ctx.beginPath();
           ctx.arc(sx, sy, 3.5, 0, Math.PI * 2);
           ctx.fill();

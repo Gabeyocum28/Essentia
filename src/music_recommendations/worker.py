@@ -15,7 +15,9 @@ import urllib.request
 import wave
 from pathlib import Path
 
-from music_recommendations.analysis import analyze_track
+from concurrent.futures import ThreadPoolExecutor
+
+from music_recommendations.analysis import analyze_tracks
 from music_recommendations.corpus import crawl
 from music_recommendations.server import deezer, store, viz
 
@@ -23,6 +25,14 @@ CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "300000"))
 CORPUS_BYTES_CAP = int(os.environ.get("CORPUS_BYTES_CAP", str(450 * 1024 * 1024)))
 CRAWL_INTERVAL_S = float(os.environ.get("CRAWL_INTERVAL_S", "60"))
 MAX_QUEUED = 200          # don't flood the queue; the worker drains ~12 tracks/min
+
+# Embed jobs are claimed in groups so their patches can share one 64-patch
+# inference batch: a 30 s preview is 28 patches, so three tracks fill a
+# batch that one track would have left 56% zero padding. Three is also the
+# download fan-out, which keeps the network wait roughly the length of the
+# slowest preview instead of the sum of three.
+GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "3"))
+DOWNLOAD_THREADS = int(os.environ.get("DOWNLOAD_THREADS", "3"))
 FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"
 _last_crawl = 0.0
 
@@ -39,8 +49,16 @@ def download_preview(url: str) -> Path:
     fd, name = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
     path = Path(name)
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        path.write_bytes(resp.read())
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            path.write_bytes(resp.read())
+    except BaseException:
+        # mkstemp already created the file, and the caller only unlinks
+        # previews it was handed back — so a failed fetch (expired preview
+        # token, timeout) used to leave an empty temp file behind for every
+        # failing job, and the crawler retries forever.
+        path.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -62,39 +80,112 @@ def _fresh_track(track_id: str) -> dict | None:
         return None
 
 
-def process_job(track_id: str) -> bool:
-    """Analyze one queued track. True on success; logs and swallows failures
-    so one bad track never kills the loop.
+def _fail_embed(track_id: str, exc: Exception) -> None:
+    """Mark one embed job failed and say why.
 
     A failure marks the job document `state="failed"` with an `error`
     string (store.fail_job) instead of clearing it: a cleared marker looked
     the same as a job that never ran, so a track with a permanently broken
-    preview would just get silently re-queued and fail forever. Success
-    still clears the marker (clear_embed_marker) so the track can be
+    preview would just get silently re-queued and fail forever.
+    """
+    print(f"[worker] {track_id}: FAILED  {exc}", flush=True)
+    try:
+        store.fail_job(f"embed:{track_id}", f"{type(exc).__name__}: {exc}")
+    except Exception:  # noqa: BLE001 - a store blip must not kill the group
+        pass
+
+
+def _prepare(track_id: str) -> tuple[dict, Path]:
+    """Fresh metadata plus the downloaded preview. Raises on either failure.
+
+    Runs on a pool thread: it does nothing but Deezer I/O and a file write,
+    so several tracks' previews arrive in about the time the slowest one
+    takes rather than the sum of all of them.
+    """
+    track = _fresh_track(track_id)
+    if track is None:
+        raise ValueError("no metadata in the store or on Deezer")
+    return track, download_preview(track["preview_url"])
+
+
+def _prepare_safe(track_id: str) -> tuple[dict, Path] | Exception:
+    try:
+        return _prepare(track_id)
+    except Exception as exc:  # noqa: BLE001 - reported per track by the caller
+        return exc
+
+
+def _analyze(paths: list[Path]) -> list[dict | Exception]:
+    """Features (or the failure) per path, in order.
+
+    One path or many, this is `analyze_tracks`: its one-path case is what
+    `analyze_track` already delegates to, so the old single-path branch here
+    was a second way to say the same thing (and a second thing to keep in
+    step when the group path changed).
+    """
+    return analyze_tracks(paths)
+
+
+def process_jobs(track_ids: list[str]) -> int:
+    """Analyze a group of queued tracks together; returns how many were
+    stored. Logs and swallows every failure, so one bad track costs only its
+    own job and never kills the loop.
+
+    The group exists for the inference batch: EffNet's graph is frozen at 64
+    patches and one 30 s preview is 28 of them, so tracks analyzed alone pay
+    full price for mostly-empty batches. Downloads are issued in parallel for
+    the same reason -- the group is only as fast as its slowest step.
+
+    Success clears the embed marker (clear_embed_marker) so the track can be
     re-analyzed later (e.g. a features-version bump).
     """
+    if not track_ids:
+        return 0
+    started = time.monotonic()
+    ready: list[tuple[str, dict, Path]] = []
+    stored = 0
     try:
-        track = _fresh_track(track_id)
-        if track is None:
-            print(f"[worker] {track_id}: no metadata in the store or on Deezer", flush=True)
-            store.fail_job(f"embed:{track_id}", "no metadata in the store or on Deezer")
-            return False
-        mp3 = download_preview(track["preview_url"])
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS) as pool:
+            prepared = list(pool.map(_prepare_safe, track_ids))
+        for track_id, outcome in zip(track_ids, prepared):
+            if isinstance(outcome, Exception):
+                _fail_embed(track_id, outcome)
+                continue
+            track, mp3 = outcome
+            ready.append((track_id, track, mp3))
+
+        paths = [mp3 for _, _, mp3 in ready]
         try:
-            features = _to_plain(analyze_track(mp3))
-        finally:
+            results = _analyze(paths) if paths else []
+        except Exception as exc:  # noqa: BLE001 - a dead graph fails the group
+            results = [exc] * len(paths)
+
+        for (track_id, track, _mp3), features in zip(ready, results):
+            try:
+                if isinstance(features, Exception):
+                    raise features
+                store.put_track(track, _to_plain(features))
+                store.clear_embed_marker(track_id)
+            except Exception as exc:  # noqa: BLE001 - one track, one failure
+                _fail_embed(track_id, exc)
+                continue
+            stored += 1
+            print(f"[worker] {track_id}: analyzed  {track['artist']} - {track['title']}", flush=True)
+        return stored
+    finally:
+        for _, _, mp3 in ready:
             mp3.unlink(missing_ok=True)
-        store.put_track(track, features)
-        store.clear_embed_marker(track_id)
-        print(f"[worker] {track_id}: analyzed  {track['artist']} - {track['title']}", flush=True)
-        return True
-    except Exception as exc:
-        print(f"[worker] {track_id}: FAILED  {exc}", flush=True)
-        try:
-            store.fail_job(f"embed:{track_id}", f"{type(exc).__name__}: {exc}")
-        except Exception:
-            pass
-        return False
+        elapsed = time.monotonic() - started
+        # Throughput is what was actually STORED, not what was claimed: a
+        # group where two of three downloads 403'd is not doing 12/min.
+        rate = stored / elapsed * 60 if elapsed > 0 else 0.0
+        print(f"[worker] group of {len(track_ids)}: {stored} stored in {elapsed:.1f}s "
+              f"({rate:.1f} tracks/min)", flush=True)
+
+
+def process_job(track_id: str) -> bool:
+    """One queued track: the one-element case of process_jobs."""
+    return process_jobs([track_id]) == 1
 
 
 def _write_wav(samples: "np.ndarray", sample_rate: int) -> Path:
@@ -358,10 +449,55 @@ def crawl_step() -> int:
     return n
 
 
+def _claim_group() -> tuple[list[str], tuple[str, str] | None]:
+    """Claim up to GROUP_SIZE embed jobs in one go.
+
+    Returns the claimed track ids plus, if the claim that ended the group
+    was not an embed job, that job -- it has already been taken off the
+    queue, so the caller must run it rather than drop it. Only the first
+    claim blocks; the rest are non-blocking, so a lone queued track is never
+    delayed waiting for company that isn't coming.
+    """
+    job = store.dequeue_job(timeout=5)
+    if not job:
+        return [], None
+    kind, payload = job
+    if kind != "embed":
+        return [], job
+    track_ids = [payload]
+    while len(track_ids) < GROUP_SIZE:
+        try:
+            job = store.dequeue_job(timeout=0)
+        except Exception as exc:  # noqa: BLE001 - keep what is already claimed
+            print(f"[worker] group claim error {exc}", flush=True)
+            break
+        if not job:
+            break
+        kind, payload = job
+        if kind != "embed":
+            return track_ids, job
+        track_ids.append(payload)
+    return track_ids, None
+
+
+def _run_job(job: tuple[str, str]) -> None:
+    """Route one non-embed job (today: attribution)."""
+    kind, payload = job
+    if kind == "embed":
+        process_job(payload)
+        return
+    seed_id, _, rec_id = payload.partition("|")
+    if seed_id and rec_id:
+        process_attribution(seed_id, rec_id)
+    else:
+        print(f"[worker] bad attribution job {payload!r}", flush=True)
+
+
 def _tick() -> None:
-    """One loop iteration: sweep stale claims, then dequeue and process a
-    job, if there is one. When there is none, crawl for more corpus --
-    rate-limited so we don't hammer Deezer while idle.
+    """One loop iteration: sweep stale claims, then claim and process a
+    group of embed jobs (or a single attribution job), if there is any work.
+    When there is none, crawl for more corpus -- rate-limited so we don't
+    hammer Deezer while idle.
 
     The process_* helpers never raise, but store.dequeue_job (and
     requeue_stale) can (a transient connection error while polling Atlas)
@@ -373,8 +509,8 @@ def _tick() -> None:
     except Exception as exc:
         print(f"[worker] requeue_stale error {exc}", flush=True)
     try:
-        job = store.dequeue_job(timeout=5)
-        if not job:
+        group, leftover = _claim_group()
+        if not group and leftover is None:
             global _last_crawl, _crawl_backoff_s
             if time.monotonic() - _last_crawl >= _crawl_backoff_s:
                 _last_crawl = time.monotonic()
@@ -387,15 +523,10 @@ def _tick() -> None:
                 except Exception as exc:  # noqa: BLE001 - Deezer flakes must not kill the loop
                     print(f"[worker] crawl error {exc}", flush=True)
             return
-        kind, payload = job
-        if kind == "embed":
-            process_job(payload)
-        else:
-            seed_id, _, rec_id = payload.partition("|")
-            if seed_id and rec_id:
-                process_attribution(seed_id, rec_id)
-            else:
-                print(f"[worker] bad attribution job {payload!r}", flush=True)
+        if group:
+            process_jobs(group)
+        if leftover is not None:
+            _run_job(leftover)
     except Exception as exc:
         print(f"[worker] queue error {exc}, retrying in 5s", flush=True)
         time.sleep(5)

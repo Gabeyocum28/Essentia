@@ -21,6 +21,21 @@ tracks with 30 s previews. Design: `Essencia_design_spec.md`.
 Production is built into the API image by `deploy/Dockerfile` and served
 at `/` by the FastAPI app (`web/dist`).
 
+### SOUND mode
+
+SOUND mode shows what a track actually sounds like rather than where it sits
+in feature space: a mel spectrogram (96 bands, FFT 2048 / hop 1024, 70 dB
+window — the same recipe as the iOS view), a self-similarity matrix of the
+pooled mel frames (bright off-diagonal blocks are restated material), and a
+band-solo strip you drag to hear only one range of frequencies. All of it is
+computed in the browser, in a worker, from the decoded preview.
+
+Ordinary playback still uses `GET /preview/{id}`, a 302 to Deezer's CDN, so
+the mp3 bytes never touch our host. Only SOUND mode needs the raw samples —
+a cross-origin stream decodes to silence through a `MediaElementSource` —
+so the audio is proxied through `GET /preview/{id}/audio` only once a solo
+is asked for.
+
 ## Deploy
 
 The API and worker run as a Docker Compose stack on the Oracle VM, behind

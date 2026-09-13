@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import { Artwork } from "../components/Artwork";
+import { Card } from "../components/Card";
+import { Skeleton } from "../components/Skeleton";
 import type { Axis, Track } from "../api/types";
 
 type Status = "loading" | "ready" | "unanalyzed" | "error";
@@ -42,16 +44,31 @@ export function Seed() {
 
   return (
     <div className="screen seed-screen">
-      <div className="seed-header">
-        <Artwork url={track?.artwork_url} size={160} />
+      <Card className="seed-header">
+        <Artwork url={track?.artwork_url} size={200} />
         <div className="seed-header-info">
+          <div className="seed-eyebrow">Seed</div>
           <div className="seed-title">{track?.title ?? id}</div>
           {track && <div className="seed-artist">{track.artist}</div>}
           {track && <div className="seed-album">{track.album}</div>}
+          {!track && (
+            <>
+              <Skeleton width={180} height={14} />
+              <Skeleton width={120} height={12} />
+            </>
+          )}
         </div>
-      </div>
+      </Card>
 
-      {status === "loading" && <p className="hint">Analyzing track…</p>}
+      {status === "loading" && (
+        <>
+          <p className="hint">Analyzing track…</p>
+          <div className="axis-list">
+            <Skeleton height={72} radius={16} />
+            <Skeleton height={72} radius={16} />
+          </div>
+        </>
+      )}
 
       {status === "unanalyzed" && (
         <div className="error-box">

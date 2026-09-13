@@ -24,7 +24,7 @@ export function TrackRow({ track, onSelect, showScore }: Props) {
       >
         ▶
       </button>
-      <Artwork url={track.artwork_url} size={44} />
+      <Artwork url={track.artwork_url} size={56} />
       <button
         type="button"
         className="track-row-info"

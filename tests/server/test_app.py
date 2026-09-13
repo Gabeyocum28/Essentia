@@ -471,6 +471,122 @@ def test_preview_survives_store_being_down(monkeypatch, deezer_previews):
     assert r.status_code == 302
 
 
+# ---- GET /preview/{id}/audio: the same-origin mp3 stream for web SOUND mode ----
+
+
+class _FakeUpstream:
+    """Minimal stand-in for urlopen's response: chunked reads, closes once."""
+
+    def __init__(self, payload: bytes, length: "int | None" = None):
+        self._buf = payload
+        self._pos = 0
+        self.closed = False
+        # urlopen's response exposes the upstream headers here; a CDN that
+        # reports a length is what lets the <audio> element seek.
+        self.headers = {} if length is None else {"Content-Length": str(length)}
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = self._buf[self._pos:self._pos + n] if n and n > 0 else self._buf[self._pos:]
+        self._pos += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_preview_audio_streams_the_mp3_bytes(client, deezer_previews, monkeypatch):
+    payload = b"ID3" + bytes(200_000)
+    opened = []
+
+    def fake_open(url):
+        opened.append(url)
+        return _FakeUpstream(payload)
+
+    monkeypatch.setattr(app_module, "_open_upstream", fake_open)
+
+    r = client.get("/preview/721063/audio")
+    assert r.status_code == 200
+    assert r.content == payload
+    assert r.headers["content-type"] == "audio/mpeg"
+    assert r.headers["cache-control"] == "private, max-age=600"
+    assert opened == ["https://cdnt-preview.dzcdn.net/721063.mp3?hdnea=exp=999"]
+
+
+def test_preview_audio_is_never_gzipped(client, deezer_previews, monkeypatch):
+    """An mp3 is already compressed. Worse, GZipMiddleware would drop the
+    Content-Length and the element would lose the ability to seek."""
+    payload = b"ID3" + bytes(200_000)  # well over GZipMiddleware's minimum_size
+    monkeypatch.setattr(app_module, "_open_upstream",
+                        lambda url: _FakeUpstream(payload, length=len(payload)))
+
+    r = client.get("/preview/721063/audio", headers={"accept-encoding": "gzip"})
+    assert r.status_code == 200
+    assert r.headers["content-encoding"] == "identity"
+    # Byte-identical to what the upstream handed us, not a gzip stream.
+    assert r.content == payload
+
+
+def test_preview_audio_forwards_the_length_and_allows_ranges(client, deezer_previews, monkeypatch):
+    payload = b"ID3" + bytes(4_000)
+    monkeypatch.setattr(app_module, "_open_upstream",
+                        lambda url: _FakeUpstream(payload, length=len(payload)))
+
+    r = client.get("/preview/721063/audio")
+    assert r.headers["content-length"] == str(len(payload))
+    assert r.headers["accept-ranges"] == "bytes"
+
+
+def test_preview_audio_without_an_upstream_length_omits_accept_ranges(
+    client, deezer_previews, monkeypatch,
+):
+    """No length means no seeking to claim -- advertising ranges we cannot
+    serve would be worse than staying quiet."""
+    monkeypatch.setattr(app_module, "_open_upstream", lambda url: _FakeUpstream(b"mp3"))
+
+    r = client.get("/preview/721063/audio")
+    assert r.status_code == 200
+    assert "accept-ranges" not in r.headers
+    assert r.headers["content-encoding"] == "identity"
+
+
+def test_preview_audio_closes_the_upstream_response(client, deezer_previews, monkeypatch):
+    upstream = _FakeUpstream(b"mp3")
+    monkeypatch.setattr(app_module, "_open_upstream", lambda url: upstream)
+    assert client.get("/preview/721063/audio").content == b"mp3"
+    assert upstream.closed
+
+
+def test_preview_audio_404s_when_deezer_has_no_preview(client, monkeypatch):
+    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", lambda t: None)
+    assert client.get("/preview/nope/audio").status_code == 404
+
+
+def test_preview_audio_502s_when_the_upstream_fetch_fails(client, deezer_previews, monkeypatch):
+    def boom(url):
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(app_module, "_open_upstream", boom)
+    r = client.get("/preview/721063/audio")
+    assert r.status_code == 502
+    # Fixed message: the exception text can carry the signed CDN URL.
+    assert r.json()["detail"] == "upstream preview fetch failed"
+    assert "connection reset" not in r.text
+
+
+def test_preview_audio_wins_over_the_spa_fallback(deezer_previews, monkeypatch, tmp_path, fake_mongo):
+    """`audio` has no dot, so the SPA catch-all would serve index.html for it
+    if the route were not declared first."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html><body>spa</body></html>")
+    monkeypatch.setenv("WEB_DIST", str(dist))
+    monkeypatch.setattr(app_module, "_open_upstream", lambda url: _FakeUpstream(b"mp3"))
+
+    r = TestClient(app_module.app).get("/preview/721063/audio")
+    assert r.headers["content-type"] == "audio/mpeg"
+    assert r.content == b"mp3"
+
+
 def test_recommend_serves_this_servers_preview_urls(client, seeded_corpus):
     body = client.get(
         f"/recommend?track_id={seeded_corpus[0]['track_id']}&axis=sounds_like"
@@ -595,6 +711,27 @@ def test_cold_matrix_uses_base_matrix(fake_mongo, monkeypatch):
     ids, matrix = app_module._cold_matrix(("a", "b"), "embedding")
     assert ids == ["a", "b"] and matrix.shape == (2, 2)
     assert calls == []          # one matrix read, no per-track fetches
+
+
+def test_corpus_matrix_stays_float32_as_the_corpus_grows(fake_mongo):
+    """store.base_matrix() hands back float32; _vector() parses float64. The
+    growth branch vstacked the two, which upcast the WHOLE corpus matrix on
+    the first newly-analyzed track and doubled its memory."""
+    import numpy as np
+
+    for tid, vec in (("a", [1.0, 0.0]), ("b", [0.0, 1.0])):
+        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec})
+    app_module._corpus_matrix(("a", "b"), "embedding", "cosine", False)
+    assert app_module._MATRIX_CACHE["embedding"].matrix.dtype == np.float32
+
+    # One more track: the growth path, not a cold rebuild.
+    store.put_track({**FIXTURE[0], "track_id": "c"}, {"embedding": [0.5, 0.5]})
+    ids, matrix, _ = app_module._corpus_matrix(("a", "b", "c"), "embedding",
+                                               "cosine", False)
+    assert ids == ["a", "b", "c"]
+    assert app_module._MATRIX_CACHE["embedding"].matrix.dtype == np.float32
+    assert matrix.dtype == np.float32
+    assert np.allclose(matrix[2], [0.5, 0.5], atol=1e-2)
 
 
 def test_seed_returns_502_when_analysis_fails(client, fake_mongo, monkeypatch, tmp_path):

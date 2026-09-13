@@ -12,17 +12,26 @@ export function MathPanel({ rec }: Props) {
   return (
     <div className="math-panel">
       {math.metric === "cosine" ? (
-        <p className="mono math-panel-line">
-          cos = {math.dot.toFixed(4)} / ({math.seed_norm.toFixed(4)} · {math.rec_norm.toFixed(4)}) ={" "}
-          {cos.toFixed(4)}
-        </p>
+        <>
+          <span className="math-panel-key">similarity</span>
+          <p className="mono math-panel-line">
+            cos = {math.dot.toFixed(4)} / ({math.seed_norm.toFixed(4)} · {math.rec_norm.toFixed(4)}) ={" "}
+            {cos.toFixed(4)}
+          </p>
+        </>
       ) : (
         math.distance != null && (
-          <p className="mono math-panel-line">distance = {math.distance.toFixed(4)}</p>
+          <>
+            <span className="math-panel-key">metric</span>
+            <p className="mono math-panel-line">distance = {math.distance.toFixed(4)}</p>
+          </>
         )
       )}
       {math.centrality != null && (
-        <p className="mono math-panel-line">centrality = {math.centrality.toFixed(4)}</p>
+        <>
+          <span className="math-panel-key">graph</span>
+          <p className="mono math-panel-line">centrality = {math.centrality.toFixed(4)}</p>
+        </>
       )}
     </div>
   );

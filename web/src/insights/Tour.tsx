@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { canvasPalette } from "../theme";
 import { api } from "../api/client";
 import { fitTransform, toScreen } from "./geometry";
 import { givensFrame, project } from "./tourMath";
@@ -92,6 +93,9 @@ export function Tour({ map, seedId, recIds, selectedId }: Props) {
     let raf = 0;
     let lastTime = performance.now();
     let cancelled = false;
+    // Read once per effect, not per frame: canvasPalette() is a dozen
+    // getComputedStyle() calls, and this runs at 60 fps.
+    const c = canvasPalette();
 
     const draw = (now: number) => {
       if (cancelled) return;
@@ -114,14 +118,14 @@ export function Tour({ map, seedId, recIds, selectedId }: Props) {
         appliedSizeRef.current = { width: size.width, height: size.height, dpr };
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.fillStyle = "#000";
+      ctx.fillStyle = c.bg;
       ctx.fillRect(0, 0, size.width, size.height);
 
       const frame = givensFrame(tRef.current);
       const { x, y } = project(tour.coords, frame);
       const t = fitTransform([-radius, radius], [-radius, radius], size.width, size.height, PAD);
 
-      ctx.fillStyle = "rgba(255,255,255,.7)";
+      ctx.fillStyle = c.dotBright;
       for (let i = 0; i < x.length; i++) {
         if (i === seedIdx || recSet.has(tour.ids[i])) continue;
         const [sx, sy] = toScreen(t, x[i], y[i]);
@@ -134,12 +138,12 @@ export function Tour({ map, seedId, recIds, selectedId }: Props) {
         if (!recSet.has(tour.ids[i]) || i === seedIdx) continue;
         const [sx, sy] = toScreen(t, x[i], y[i]);
         if (selectedId === tour.ids[i]) {
-          ctx.fillStyle = "rgba(10,132,255,.35)";
+          ctx.fillStyle = c.accentSoft;
           ctx.beginPath();
           ctx.arc(sx, sy, 9, 0, Math.PI * 2);
           ctx.fill();
         }
-        ctx.fillStyle = "#0A84FF";
+        ctx.fillStyle = c.accent;
         ctx.beginPath();
         ctx.arc(sx, sy, 4, 0, Math.PI * 2);
         ctx.fill();
@@ -147,11 +151,11 @@ export function Tour({ map, seedId, recIds, selectedId }: Props) {
 
       if (seedIdx !== undefined) {
         const [sx, sy] = toScreen(t, x[seedIdx], y[seedIdx]);
-        ctx.fillStyle = "rgba(255,214,10,.6)";
+        ctx.fillStyle = c.seedSoft;
         ctx.beginPath();
         ctx.arc(sx, sy, 7, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = "#FFD60A";
+        ctx.fillStyle = c.seed;
         ctx.beginPath();
         ctx.arc(sx, sy, 3.5, 0, Math.PI * 2);
         ctx.fill();

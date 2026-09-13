@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { canvasPalette } from "../theme";
 import { api } from "../api/client";
 import { gaussianCurve, scaleBars } from "./histogram";
 import { Artwork } from "../components/Artwork";
@@ -143,6 +144,7 @@ export function Proof({ seedId, recIds }: Props) {
   useEffect(() => {
     if (!hist || size.width === 0 || size.height === 0) return;
     const canvas = canvasRef.current;
+    const c = canvasPalette();
     if (!canvas) return;
 
     const dpr = window.devicePixelRatio || 1;
@@ -153,7 +155,7 @@ export function Proof({ seedId, recIds }: Props) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = "#000";
+    ctx.fillStyle = c.bg;
     ctx.fillRect(0, 0, size.width, size.height);
 
     const innerW = size.width - PAD_X * 2;
@@ -171,7 +173,7 @@ export function Proof({ seedId, recIds }: Props) {
     const barW = innerW / hist.bins.length;
 
     // Cyan bars: the actual score histogram.
-    ctx.fillStyle = "#64D2FF";
+    ctx.fillStyle = c.cyan;
     hist.bins.forEach((x, i) => {
       const h = barHeights[i];
       const sx = xToScreen(x) - (barW * 0.8) / 2;
@@ -191,7 +193,7 @@ export function Proof({ seedId, recIds }: Props) {
     ctx.stroke();
 
     // Yellow ticks at each rec score.
-    ctx.strokeStyle = "#FFD60A";
+    ctx.strokeStyle = c.seed;
     ctx.lineWidth = 2;
     for (const rawScore of hist.rec_scores) {
       const score = Math.min(1, Math.max(-1, rawScore));
@@ -232,7 +234,7 @@ export function Proof({ seedId, recIds }: Props) {
       </div>
       <p className="mono proof-caption">seed&apos;s recs sit at the {percentile}th percentile</p>
 
-      <p className="mono">Nothing like this · raw vs corrected scores</p>
+      <p className="mono proof-section-title">Nothing like this · raw vs corrected scores</p>
       <div className="proof-corrected-list">
         <div className="proof-corrected-header mono">
           <span className="proof-corrected-header-title" />

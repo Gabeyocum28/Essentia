@@ -14,24 +14,44 @@ from __future__ import annotations
 
 import heapq
 import threading
+from collections import OrderedDict
 
 import numpy as np
 
 
 _PAIRWISE_LOCK = threading.RLock()
-_PAIRWISE_CACHE: tuple[np.ndarray, np.ndarray] | None = None
-# (matrix, {k: adjacency}) — the matrix is held in the tuple ON PURPOSE:
-# keying by bare id(matrix) let the old array be garbage-collected after a
-# corpus growth, and a later array reusing the same address would silently
-# serve a graph whose node indices belong to the old, smaller corpus.
-_GRAPH_CACHE: tuple[np.ndarray, dict[int, list[dict[int, float]]]] | None = None
+# id(matrix) -> (matrix, similarity), same identity-keyed shape as
+# _GRAPH_CACHE below (the matrix is in the value so a recycled id() is a miss,
+# not a wrong answer) and for the same reason: with a seed-anchored subset a
+# caller alternating between two seeds thrashed the single slot this used to
+# be, recomputing a dense n×n every other request.
+#
+# Both caches here are bounded by VIZ_MAX on the subset they hold, and
+# neither is reachable from app's _purge_viz_caches — app clears them only
+# through clear_geometry_cache().
+_PAIRWISE_CACHE: "OrderedDict[int, tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+_PAIRWISE_KEEP = 2
+# (id(matrix), k) -> (matrix, adjacency). The matrix is held in the VALUE ON
+# PURPOSE: keying by bare id(matrix) let the old array be garbage-collected
+# after a corpus growth, and a later array reusing the same address would
+# silently serve a graph whose node indices belong to the old, smaller
+# corpus — so the stored matrix is re-checked with `is` and a reused id is a
+# miss rather than a wrong answer.
+#
+# An LRU dict rather than the single slot this used to be: the seed-anchored
+# subset means two seeds' matrices can both be live at once (a caller
+# alternating between two walks), and a one-entry cache rebuilt the whole
+# k-NN graph on every other request — the measured 1.8 s warm /viz/walk.
+# Bounded at _GRAPH_KEEP, matching app._CACHE_KEEP, because each entry pins
+# its subset matrix.
+_GRAPH_CACHE: "OrderedDict[tuple[int, int], tuple[np.ndarray, list[dict[int, float]]]]" = OrderedDict()
+_GRAPH_KEEP = 4
 
 
 def clear_geometry_cache() -> None:
-    global _PAIRWISE_CACHE, _GRAPH_CACHE
     with _PAIRWISE_LOCK:
-        _PAIRWISE_CACHE = None
-        _GRAPH_CACHE = None
+        _PAIRWISE_CACHE.clear()
+        _GRAPH_CACHE.clear()
 
 
 def normalized_rows(matrix: np.ndarray) -> np.ndarray:
@@ -48,14 +68,50 @@ def pairwise_cosine(matrix: np.ndarray) -> np.ndarray:
     remains a small-corpus visualization primitive — bounded by VIZ_MAX on
     the seed-anchored subset — rather than a ranking dependency.
     """
-    global _PAIRWISE_CACHE
+    key = id(matrix)
     with _PAIRWISE_LOCK:
-        if _PAIRWISE_CACHE is not None and _PAIRWISE_CACHE[0] is matrix:
-            return _PAIRWISE_CACHE[1]
+        cached = _PAIRWISE_CACHE.get(key)
+        if cached is not None and cached[0] is matrix:
+            _PAIRWISE_CACHE.move_to_end(key)
+            return cached[1]
         unit = normalized_rows(matrix)
         similarity = np.clip(unit @ unit.T, -1.0, 1.0)
-        _PAIRWISE_CACHE = (matrix, similarity)
+        _PAIRWISE_CACHE[key] = (matrix, similarity)
+        _PAIRWISE_CACHE.move_to_end(key)
+        while len(_PAIRWISE_CACHE) > _PAIRWISE_KEEP:
+            _PAIRWISE_CACHE.popitem(last=False)
         return similarity
+
+
+def _build_knn_graph(matrix: np.ndarray, k: int) -> list[dict[int, float]]:
+    """Symmetrized k-NN adjacency (cosine distance) for every row."""
+    n = len(matrix)
+    distance = 1.0 - pairwise_cosine(matrix)
+    adjacency: list[dict[int, float]] = [dict() for _ in range(n)]
+    for i in range(n):
+        candidates = np.argpartition(distance[i], k)[:k + 1]
+        neighbors = [int(j) for j in candidates if j != i]
+        neighbors.sort(key=lambda j: (distance[i, j], j))
+        for j in neighbors[:k]:
+            weight = float(distance[i, j])
+            adjacency[i][j] = min(adjacency[i].get(j, weight), weight)
+            adjacency[j][i] = min(adjacency[j].get(i, weight), weight)
+    return adjacency
+
+
+def _knn_graph(matrix: np.ndarray, k: int) -> list[dict[int, float]]:
+    """_build_knn_graph, memoized per (matrix identity, k)."""
+    key = (id(matrix), k)
+    with _PAIRWISE_LOCK:
+        cached = _GRAPH_CACHE.get(key)
+        if cached is not None and cached[0] is matrix:
+            _GRAPH_CACHE.move_to_end(key)
+            return cached[1]
+        adjacency = _build_knn_graph(matrix, k)
+        _GRAPH_CACHE[key] = (matrix, adjacency)
+        while len(_GRAPH_CACHE) > _GRAPH_KEEP:
+            _GRAPH_CACHE.popitem(last=False)
+        return adjacency
 
 
 def shortest_walk(matrix: np.ndarray, start: int, end: int,
@@ -80,25 +136,7 @@ def shortest_walk(matrix: np.ndarray, start: int, end: int,
         return [start], 0.0, 0.0
     k = min(max(int(k), 1), n - 1)
 
-    global _GRAPH_CACHE
-    with _PAIRWISE_LOCK:
-        if _GRAPH_CACHE is None or _GRAPH_CACHE[0] is not matrix:
-            _GRAPH_CACHE = (matrix, {})
-        graphs = _GRAPH_CACHE[1]
-        adjacency = graphs.get(k)
-        if adjacency is None:
-            similarity = pairwise_cosine(matrix)
-            distance = 1.0 - similarity
-            adjacency = [dict() for _ in range(n)]
-            for i in range(n):
-                candidates = np.argpartition(distance[i], k)[:k + 1]
-                neighbors = [int(j) for j in candidates if j != i]
-                neighbors.sort(key=lambda j: (distance[i, j], j))
-                for j in neighbors[:k]:
-                    weight = float(distance[i, j])
-                    adjacency[i][j] = min(adjacency[i].get(j, weight), weight)
-                    adjacency[j][i] = min(adjacency[j].get(i, weight), weight)
-            graphs[k] = adjacency
+    adjacency = _knn_graph(matrix, k)
 
     distances = [float("inf")] * n
     previous = [-1] * n
@@ -158,37 +196,70 @@ def project_2d(matrix: np.ndarray) -> np.ndarray:
     return xy
 
 
+# Rows per pass of the covariance accumulation. Bounds the float64 working
+# copy (2048 x 1280 x 8 B = 21 MB) while the normalized matrix itself stays
+# float32; the seam does not change the answer, only the summation order.
+_PCA_BLOCK = 2048
+
+
 def project_top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """(n, d) -> (coords8 (n, 8) float64, variance fractions (8,) float64).
 
     Same row-normalization, mean-centering, and per-component sign-fixing
-    rule as project_2d, extended to all 8 components — columns 0 and 1 are
-    numerically identical to project_2d's output (same SVD, same sign
-    convention), so one SVD serves /viz/map, /viz/walk, and /viz/tour.
+    rule as project_2d, extended to all 8 components — columns 0 and 1 agree
+    with project_2d's output to float noise (same components as the thin
+    SVD, computed via the 1280×1280 covariance: 7× faster at 8k rows),
+    so one decomposition serves /viz/map, /viz/walk, and /viz/tour.
 
-    variance[i] is s_i^2 over the FULL spectrum of the thin SVD (all
-    min(n, d) singular values), not just the top 8, per T2.1's talking
-    point ("Top-8 PCs hold 37.4% of variance").
+    Covariance rather than a thin SVD because d is fixed at 1280 while n
+    grows: `Xc.T @ Xc` is (d, d) whatever n is, and its eigenvectors ARE the
+    SVD's right singular vectors with eigenvalues s^2, so `Xc @ V[:, :k]`
+    reproduces `U[:, :k] * s[:k]` to float noise. Accumulated in float64 in
+    row blocks — a float32 gram loses too much on 8k nearly-parallel rows,
+    and a float64 copy of the whole matrix is 82 MB.
+
+    variance[i] is s_i^2 over the FULL spectrum (all d eigenvalues, the
+    zeros included), not just the top 8, per T2.1's talking point ("Top-8
+    PCs hold 37.4% of variance").
 
     d < 8 corpora (including the fixture-sized ones in tests) pad the
     unused columns with zeros rather than erroring.
     """
-    matrix = np.asarray(matrix, dtype=float)
+    matrix = np.asarray(matrix)
     n = matrix.shape[0]
     if n < 2:
         return np.zeros((n, 8)), np.zeros(8)
+    d = int(matrix.shape[1])
 
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    unit = matrix / np.where(norms == 0.0, 1.0, norms)
-    centered = unit - unit.mean(axis=0)
+    unit = np.asarray(matrix, dtype=np.float32)
+    norms = np.linalg.norm(unit, axis=1, keepdims=True)
+    unit = unit / np.where(norms == 0.0, np.float32(1.0), norms)
+    # float64 mean: the centering is what the covariance sees, so the one
+    # quantity every block shares is worth carrying at full precision.
+    mean = unit.mean(axis=0, dtype=np.float64)
 
-    u, s, vt = np.linalg.svd(centered, full_matrices=False)
-    total_variance = float(np.sum(s ** 2))
-    k = min(8, u.shape[1])
-    coords = u[:, :k] * s[:k]
+    def blocks():
+        for start in range(0, n, _PCA_BLOCK):
+            stop = min(start + _PCA_BLOCK, n)
+            yield start, stop, unit[start:stop].astype(np.float64) - mean
+
+    covariance = np.zeros((d, d))
+    for _, _, block in blocks():
+        covariance += block.T @ block
+
+    # eigh returns ascending eigenvalues; reverse for descending components.
+    values, vectors = np.linalg.eigh(covariance)
+    values = np.clip(values[::-1], 0.0, None)
+    vectors = vectors[:, ::-1]
+
+    k = min(8, n, d)
+    coords = np.empty((n, k))
+    for start, stop, block in blocks():
+        coords[start:stop] = block @ vectors[:, :k]
 
     # Fix the sign convention per component: make each component's
     # largest-magnitude coordinate positive (same rule as project_2d).
+    # eigh's sign is arbitrary, exactly as the SVD's was.
     for col in range(k):
         peak = np.argmax(np.abs(coords[:, col]))
         if coords[peak, col] < 0:
@@ -197,9 +268,10 @@ def project_top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if k < 8:
         coords = np.hstack([coords, np.zeros((n, 8 - k))])
 
+    total_variance = float(values.sum())
     variance = np.zeros(8)
     if total_variance > 0.0:
-        variance[:k] = (s[:k] ** 2) / total_variance
+        variance[:k] = values[:k] / total_variance
     return coords, variance
 
 

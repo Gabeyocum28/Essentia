@@ -1,6 +1,14 @@
 import { act, render, screen } from "@testing-library/react";
 import { WhySimilar, hz } from "./WhySimilar";
 import { api } from "../api/client";
+import { soloBand, soloOff, useSoloBand, useSoloError } from "../audio/soloStore";
+
+vi.mock("../audio/soloStore", () => ({
+  soloBand: vi.fn(),
+  soloOff: vi.fn(),
+  useSoloBand: vi.fn(() => null),
+  useSoloError: vi.fn(() => null),
+}));
 
 vi.mock("../api/client", async () => {
   const actual = await vi.importActual<typeof import("../api/client")>("../api/client");
@@ -16,6 +24,10 @@ vi.mock("../api/client", async () => {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.mocked(api.vizAttribute).mockReset();
+  vi.mocked(soloBand).mockReset();
+  vi.mocked(soloOff).mockReset();
+  vi.mocked(useSoloBand).mockReturnValue(null);
+  vi.mocked(useSoloError).mockReturnValue(null);
 });
 
 afterEach(() => {
@@ -71,6 +83,51 @@ test("shows the error message when the worker fails", async () => {
     await Promise.resolve();
   });
   expect(screen.getByText("boom")).toBeInTheDocument();
+});
+
+test("clicking a bar solos that band; clicking the soloed one turns solo off", async () => {
+  vi.mocked(api.vizAttribute).mockResolvedValueOnce({
+    status: "ready",
+    base: 0.5,
+    bands: [
+      { lo_hz: 20, hi_hz: 240, delta: 0.1 },
+      { lo_hz: 240, hi_hz: 1200, delta: 0.4 },
+    ],
+  });
+  const view = render(<WhySimilar seedId="seed" recId="rec" />);
+  await act(async () => {
+    await Promise.resolve();
+  });
+
+  await act(async () => {
+    screen.getByRole("button", { name: "Solo 240 to 1.2k Hz" }).click();
+  });
+  expect(soloBand).toHaveBeenCalledWith(240, 1200);
+
+  // With that band soloed, the same bar is the "off" switch.
+  vi.mocked(useSoloBand).mockReturnValue([240, 1200]);
+  view.rerender(<WhySimilar seedId="seed" recId="rec" />);
+  await act(async () => {
+    screen.getByRole("button", { name: "Solo 240 to 1.2k Hz" }).click();
+  });
+  expect(soloOff).toHaveBeenCalled();
+});
+
+test("a failed band-solo attach is reported under the bars", async () => {
+  vi.mocked(api.vizAttribute).mockResolvedValue({
+    status: "ready",
+    bands: [{ lo_hz: 20, hi_hz: 240, delta: 0.1 }],
+  });
+  vi.mocked(useSoloError).mockReturnValue("Couldn't enable band solo.");
+
+  render(<WhySimilar seedId="seed" recId="rec" />);
+  await act(async () => {
+    await Promise.resolve();
+  });
+
+  // The bars are still there -- the attribution worked, only the audio didn't.
+  expect(screen.getByText("20 / 240")).toBeInTheDocument();
+  expect(screen.getByText("Couldn't enable band solo.")).toBeInTheDocument();
 });
 
 describe("hz", () => {

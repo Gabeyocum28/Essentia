@@ -8,6 +8,14 @@ export function Player() {
 
   return (
     <div className="player-bar">
+      {nowPlaying.artwork_url && (
+        <div
+          className="player-backdrop"
+          aria-hidden="true"
+          style={{ backgroundImage: `url(${nowPlaying.artwork_url})` }}
+        />
+      )}
+      <div className="player-scrim" aria-hidden="true" />
       <div className="player-progress" style={{ width: `${Math.min(1, Math.max(0, progress)) * 100}%` }} />
       <div className="player-row">
         <Artwork url={nowPlaying.artwork_url} size={44} />
