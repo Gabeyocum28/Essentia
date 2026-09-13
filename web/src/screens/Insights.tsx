@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import type { VizMap } from "../api/types";
 import { RecStrip } from "../insights/RecStrip";
@@ -18,8 +18,13 @@ type Status = "loading" | "ready" | "unanalyzed" | "error";
 type Mode = "GALAXY" | "SOUND" | "PROOF";
 type GalaxyChip = "Explore" | "Walk" | "Tour" | "Topo";
 
+const DEFAULT_FEEL = 0.5;
+
 export function Insights() {
   const { id = "", axis = "" } = useParams();
+  const [searchParams] = useSearchParams();
+  const feelParam = searchParams.get("feel");
+  const feel = feelParam !== null && Number.isFinite(Number(feelParam)) ? Number(feelParam) : DEFAULT_FEEL;
 
   const [status, setStatus] = useState<Status>("loading");
   const [map, setMap] = useState<VizMap | null>(null);
@@ -45,7 +50,7 @@ export function Insights() {
         setStatus("unanalyzed");
         return;
       }
-      const mapResult = await api.vizMap(id, axis);
+      const mapResult = await api.vizMap(id, axis, 10, undefined, feel);
       setMap(mapResult);
       setStatus("ready");
     } catch (err) {
@@ -55,7 +60,7 @@ export function Insights() {
         setStatus("error");
       }
     }
-  }, [id, axis]);
+  }, [id, axis, feel]);
 
   useEffect(() => {
     void run();
@@ -103,7 +108,7 @@ export function Insights() {
 
           {selectedRec && (
             <>
-              <MathPanel rec={selectedRec} />
+              <MathPanel rec={selectedRec} feelKeys={map.feel_keys} />
               {mode === "PROOF" && (
                 <WhySimilar seedId={map.seed.track_id} recId={selectedRec.track_id} />
               )}
@@ -159,7 +164,7 @@ export function Insights() {
 
           {mode === "PROOF" && (
             <>
-              <Proof seedId={id} recIds={recIds} />
+              <Proof seedId={id} recIds={recIds} feel={feel} />
               <Extremes seedId={id} recIds={recIds} />
             </>
           )}

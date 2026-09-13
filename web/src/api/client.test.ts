@@ -106,3 +106,26 @@ test("an empty rec list omits the param rather than sending recs=", async () => 
   await api.vizMst("42", []);
   expect(fetch).toHaveBeenCalledWith("/api/viz/mst?track_id=42", expect.anything());
 });
+
+test("recommend adds feel when given, omits it otherwise", async () => {
+  mockFetch(200, { seed_track_id: "1", axis: "energy", results: [] });
+  await api.recommend("1", "energy", 10, 0.5);
+  expect(fetch).toHaveBeenCalledWith("/api/recommend?track_id=1&axis=energy&limit=10&feel=0.5", expect.anything());
+
+  mockFetch(200, { seed_track_id: "1", axis: "energy", results: [] });
+  await api.recommend("1", "energy");
+  expect(fetch).toHaveBeenCalledWith("/api/recommend?track_id=1&axis=energy&limit=10", expect.anything());
+});
+
+test("vizMap adds feel when given, omits it otherwise", async () => {
+  mockFetch(200, { points: { ids: [], x: [], y: [], tracks: [] }, seed: {}, recs: [], axis: {} });
+  await api.vizMap("1", "energy", 10, "on", 0.5);
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/viz/map?track_id=1&axis=energy&limit=10&correction=on&feel=0.5",
+    expect.anything(),
+  );
+
+  mockFetch(200, { points: { ids: [], x: [], y: [], tracks: [] }, seed: {}, recs: [], axis: {} });
+  await api.vizMap("1", "energy");
+  expect(fetch).toHaveBeenCalledWith("/api/viz/map?track_id=1&axis=energy&limit=10", expect.anything());
+});

@@ -48,10 +48,10 @@ export const api = {
   search: (query: string) => request<{ results: T.Track[] }>(`/search${q({ q: query })}`),
   seed: (track_id: string) => request<T.SeedResponse>("/seed", { method: "POST", body: JSON.stringify({ track_id }) }),
   axes: () => request<{ axes: T.Axis[] }>("/axes"),
-  recommend: (track_id: string, axis: string, limit = 10) =>
-    request<T.RecommendResponse>(`/recommend${q({ track_id, axis, limit })}`),
-  vizMap: (track_id: string, axis: string, limit = 10, correction?: "on" | "off") =>
-    request<T.VizMap>(`/viz/map${q({ track_id, axis, limit, correction })}`),
+  recommend: (track_id: string, axis: string, limit = 10, feel?: number) =>
+    request<T.RecommendResponse>(`/recommend${q({ track_id, axis, limit, feel })}`),
+  vizMap: (track_id: string, axis: string, limit = 10, correction?: "on" | "off", feel?: number) =>
+    request<T.VizMap>(`/viz/map${q({ track_id, axis, limit, correction, feel })}`),
   vizWalk: (from: string, to: string, k = 8) => request<T.VizWalk>(`/viz/walk${q({ from, to, k })}`),
   vizHistogram: (track_id: string) => request<T.VizHistogram>(`/viz/histogram${q({ track_id })}`),
   vizHubs: (track_id?: string, recs?: string[]) =>
