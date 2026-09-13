@@ -29,12 +29,16 @@ def test_removed_modules_are_gone():
 
 
 @needs_effnet
-def test_analyze_track_returns_only_embedding(tone_wav):
+def test_analyze_track_returns_the_embedding_and_the_feel_vector(tone_wav):
     feats = analyze_track(tone_wav)
-    assert set(feats) == {"embedding"}
+    assert set(feats) == {"embedding", "feel"}
     assert feats["embedding"].shape == (1280,)
+    assert feats["feel"].shape == (11,)
+    assert float(feats["feel"].min()) >= 0.0
+    assert float(feats["feel"].max()) <= 1.0
     js = as_json(feats)
     assert len(js["embedding"]) == 1280 and isinstance(js["embedding"][0], float)
+    assert len(js["feel"]) == 11 and isinstance(js["feel"][0], float)
 
 
 @needs_effnet
@@ -46,7 +50,34 @@ def test_analyze_tracks_keeps_a_bad_path_from_sinking_the_group(tone_wav, tmp_pa
 
     assert isinstance(out[1], Exception)
     for feats in (out[0], out[2]):
-        assert set(feats) == {"embedding"}
+        assert set(feats) == {"embedding", "feel"}
         assert feats["embedding"].shape == (1280,)
+        assert feats["feel"].shape == (11,)
     assert np.allclose(out[0]["embedding"], analyze_track(tone_wav)["embedding"],
                        atol=1e-4)
+
+
+@needs_effnet
+def test_missing_feel_heads_cost_the_blend_not_the_analysis(tone_wav, monkeypatch,
+                                                            capsys):
+    """A host with the EffNet graph but no head graphs (an older image, a
+    partial fetch_models.py run) must still produce embeddings: `feel` is
+    optional everywhere downstream -- the store omits the field, the ranking
+    treats a missing vector as no penalty -- so the group comes back without
+    it rather than failing."""
+    from music_recommendations import analysis
+    from music_recommendations.analysis import feel as feel_mod
+
+    def no_heads(_embeddings):
+        raise FileNotFoundError("models/mood_happy.pb missing")
+
+    monkeypatch.setattr(feel_mod, "feel_vectors", no_heads)
+    monkeypatch.setattr(analysis, "_heads_warned", False)
+
+    out = analyze_tracks([tone_wav, tone_wav])
+    assert [set(f) for f in out] == [{"embedding"}, {"embedding"}]
+    assert out[0]["embedding"].shape == (1280,)
+    # One warning for the process, not one per group or per track.
+    assert capsys.readouterr().out.count("feel heads unavailable") == 1
+    analyze_tracks([tone_wav])
+    assert "feel heads unavailable" not in capsys.readouterr().out

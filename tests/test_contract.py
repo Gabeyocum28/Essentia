@@ -34,9 +34,21 @@ def test_track_fields():
     }
 
 
-def test_feature_keys_embedding_only():
+def test_feature_keys_are_the_embedding_and_the_feel_vector():
     f = _features()
-    assert f.FEATURE_KEYS == {"embedding": 1280}
+    assert f.FEATURE_KEYS == {"embedding": 1280, "feel": 11}
+
+
+def test_feel_dimension_matches_the_head_table():
+    """The contract states the width; analysis owns the names. If a head is
+    added or dropped without the contract moving, this is where it shows."""
+    from music_recommendations.analysis.feel import FEEL_KEYS
+    f = _features()
+    assert len(FEEL_KEYS) == f.FEATURE_KEYS["feel"]
+    assert FEEL_KEYS == [
+        "danceable", "happy", "sad", "aggressive", "relaxed", "party",
+        "acoustic", "electronic", "bright", "tonal", "instrumental",
+    ]
 
 
 def test_fixture_thirty_contract_tracks():

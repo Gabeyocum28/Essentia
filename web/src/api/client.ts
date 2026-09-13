@@ -32,6 +32,50 @@ const q = (params: Record<string, string | number | undefined>) =>
 // drops the param entirely rather than sending an empty list.
 const recList = (recs?: string[]) => (recs && recs.length ? recs.join(",") : undefined);
 
+// ---- the feel weight ----
+//
+// The DEFAULT lives on the SERVER (app.py's FEEL_DEFAULT). This constant is
+// only what the slider starts at and what a missing stored value falls back
+// to; `feelParam` below OMITS the query parameter when the value equals it,
+// so a change on the server takes effect without shipping a new bundle.
+export const DEFAULT_FEEL = 0.3;
+export const FEEL_MIN = 0;
+export const FEEL_MAX = 2;
+export const FEEL_STORAGE_KEY = "essentia.feel";
+
+/** A user-supplied weight, clamped to the slider's range; DEFAULT_FEEL if unusable. */
+export function clampFeel(value: unknown): number {
+  // Number(null) and Number("") are both 0, which would read a missing value
+  // as "turn the blend off" rather than as "use the default".
+  if (value === null || value === undefined || value === "") return DEFAULT_FEEL;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_FEEL;
+  return Math.min(FEEL_MAX, Math.max(FEEL_MIN, n));
+}
+
+/** The weight the user last chose on the Recommendations slider. */
+export function loadStoredFeel(): number {
+  try {
+    const raw = localStorage.getItem(FEEL_STORAGE_KEY);
+    return raw === null ? DEFAULT_FEEL : clampFeel(raw);
+  } catch {
+    return DEFAULT_FEEL;
+  }
+}
+
+export function storeFeel(value: number): void {
+  try {
+    localStorage.setItem(FEEL_STORAGE_KEY, String(value));
+  } catch {
+    /* localStorage unavailable (private mode, blocked site data) */
+  }
+}
+
+// undefined at the default, so `q` drops the param and the server's own
+// FEEL_DEFAULT is what answers.
+const feelParam = (feel?: number) =>
+  feel === undefined || feel === DEFAULT_FEEL ? undefined : feel;
+
 export const previewUrl = (trackId: string) => `${BASE}/preview/${trackId}`;
 
 // Same-origin mp3 bytes, for SOUND mode only: decodeAudioData needs the
@@ -48,10 +92,10 @@ export const api = {
   search: (query: string) => request<{ results: T.Track[] }>(`/search${q({ q: query })}`),
   seed: (track_id: string) => request<T.SeedResponse>("/seed", { method: "POST", body: JSON.stringify({ track_id }) }),
   axes: () => request<{ axes: T.Axis[] }>("/axes"),
-  recommend: (track_id: string, axis: string, limit = 10) =>
-    request<T.RecommendResponse>(`/recommend${q({ track_id, axis, limit })}`),
-  vizMap: (track_id: string, axis: string, limit = 10, correction?: "on" | "off") =>
-    request<T.VizMap>(`/viz/map${q({ track_id, axis, limit, correction })}`),
+  recommend: (track_id: string, axis: string, limit = 10, feel?: number) =>
+    request<T.RecommendResponse>(`/recommend${q({ track_id, axis, limit, feel: feelParam(feel) })}`),
+  vizMap: (track_id: string, axis: string, limit = 10, correction?: "on" | "off", feel?: number) =>
+    request<T.VizMap>(`/viz/map${q({ track_id, axis, limit, correction, feel: feelParam(feel) })}`),
   vizWalk: (from: string, to: string, k = 8) => request<T.VizWalk>(`/viz/walk${q({ from, to, k })}`),
   vizHistogram: (track_id: string) => request<T.VizHistogram>(`/viz/histogram${q({ track_id })}`),
   vizHubs: (track_id?: string, recs?: string[]) =>

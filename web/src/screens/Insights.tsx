@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
-import { api, ApiError } from "../api/client";
+import { useParams, useSearchParams } from "react-router-dom";
+import { api, ApiError, clampFeel, loadStoredFeel } from "../api/client";
 import type { VizMap } from "../api/types";
 import { RecStrip } from "../insights/RecStrip";
 import { Galaxy } from "../insights/Galaxy";
@@ -20,6 +20,14 @@ type GalaxyChip = "Explore" | "Walk" | "Tour" | "Topo";
 
 export function Insights() {
   const { id = "", axis = "" } = useParams();
+  const [searchParams] = useSearchParams();
+  // The link from Recommendations carries ?feel=; a bookmark or a direct
+  // load does not, and falling back to the default there would explain a
+  // list the user never saw. The stored value is the slider's last position,
+  // so it is the better fallback -- and clampFeel backstops both against a
+  // hand-edited query string.
+  const feelParam = searchParams.get("feel");
+  const feel = feelParam !== null ? clampFeel(feelParam) : loadStoredFeel();
 
   const [status, setStatus] = useState<Status>("loading");
   const [map, setMap] = useState<VizMap | null>(null);
@@ -45,7 +53,7 @@ export function Insights() {
         setStatus("unanalyzed");
         return;
       }
-      const mapResult = await api.vizMap(id, axis);
+      const mapResult = await api.vizMap(id, axis, 10, undefined, feel);
       setMap(mapResult);
       setStatus("ready");
     } catch (err) {
@@ -55,7 +63,7 @@ export function Insights() {
         setStatus("error");
       }
     }
-  }, [id, axis]);
+  }, [id, axis, feel]);
 
   useEffect(() => {
     void run();
@@ -103,7 +111,7 @@ export function Insights() {
 
           {selectedRec && (
             <>
-              <MathPanel rec={selectedRec} />
+              <MathPanel rec={selectedRec} feelKeys={map.feel_keys} />
               {mode === "PROOF" && (
                 <WhySimilar seedId={map.seed.track_id} recId={selectedRec.track_id} />
               )}
@@ -159,7 +167,7 @@ export function Insights() {
 
           {mode === "PROOF" && (
             <>
-              <Proof seedId={id} recIds={recIds} />
+              <Proof seedId={id} recIds={recIds} feel={feel} />
               <Extremes seedId={id} recIds={recIds} />
             </>
           )}
