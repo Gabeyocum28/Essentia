@@ -92,7 +92,7 @@ app.add_middleware(_CaptureBaseURL)
 # (both are plain ASGI wrappers, so neither hops tasks). minimum_size keeps
 # it off the small responses -- /preview's 302 above all -- where the header
 # and CPU cost more than the bytes saved.
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 
 def _base() -> str:
@@ -708,6 +708,14 @@ def viz_map(track_id: str, axis: str,
     only draws the galaxy needs, and the per-point track dicts are ~2 MB of
     the 2.1 MB response at VIZ_MAX rows. Default stays "full" so existing
     clients are untouched.
+
+    The rec list here is drawn from the viz SNAPSHOT, so it can lag
+    /recommend by up to VIZ_REFRESH_S: a track analyzed inside the refresh
+    window has no row to be positioned at, and every client reads rec.x and
+    rec.y unconditionally, so it is skipped and the next-best candidate
+    takes its place (the list is still `limit` long). It appears at the next
+    refresh. /recommend itself is unaffected — it always ranks and returns
+    over the live matrix.
     """
     blended_weights = BLENDED_AXES.get(axis)
     if blended_weights is None and axis not in AXIS_FEATURES:
@@ -723,6 +731,22 @@ def viz_map(track_id: str, axis: str,
                                             want_correction=False)
     if track_id not in emb_ids:
         raise HTTPException(404, f"track {track_id} not in corpus")
+
+    # Ranked on the live matrix, drawn on the SNAPSHOT: the ranking must be
+    # the one /recommend just served, while the projection must reuse the
+    # subset/PCA the other Insights endpoints already hold. Taken before the
+    # ranking so a candidate the snapshot predates can be FILTERED OUT of
+    # the list (see the docstring) rather than forcing a refresh -- one
+    # newly crawled track landing in someone's top ten would otherwise
+    # rebuild the snapshot and cold-start every derived cache.
+    snapshot_ids, snapshot_matrix = _viz_snapshot(require=track_id,
+                                                  live=(emb_ids, emb_matrix))
+    snapshot_id_set = set(snapshot_ids)
+    # Every row the snapshot is missing is a candidate the loop below may
+    # skip, so ask the ranking for that many more: the list stays `limit`
+    # long whenever there are older candidates left to fill it. rank() sorts
+    # the whole column regardless of `limit`, so a wider ask is free.
+    skippable = max(0, len(emb_ids) - len(snapshot_id_set))
 
     from music_recommendations.server import rank as rank_mod
 
@@ -749,7 +773,7 @@ def viz_map(track_id: str, axis: str,
         seed_vec = _vector(seed_features, feature_key)
         similarity = _similarity(feature_key, matrix, seed_vec, metric)
         order = rank_mod.rank(seed_vec, matrix, direction=direction,
-                              limit=limit + 1, metric=metric,
+                              limit=limit + 1 + skippable, metric=metric,
                               correction=correction, similarity=similarity)
 
     emb_id_set = set(emb_ids)
@@ -757,6 +781,10 @@ def viz_map(track_id: str, axis: str,
     for idx in order:
         rec_id = ids[idx]
         if rec_id == track_id or rec_id not in emb_id_set:
+            continue
+        # Before the limit truncation, so the list is still `limit` long and
+        # every entry has a row to be positioned at.
+        if rec_id not in snapshot_id_set:
             continue
         if blended_weights is not None:
             row = emb_at.get(rec_id)
@@ -779,16 +807,6 @@ def viz_map(track_id: str, axis: str,
         if len(recs) == limit:
             break
 
-    # Projected on the SNAPSHOT, ranked on the live matrix: the ranking must
-    # be the one /recommend just served, while the projection must reuse the
-    # subset/PCA the other Insights endpoints already hold. The seed and
-    # every rec are `require`d, so a track analyzed inside the window is
-    # still drawn -- clients read rec.x/rec.y unconditionally, and a rec
-    # without a position would put NaN through their bounds math.
-    snapshot_ids, snapshot_matrix = _viz_snapshot(
-        require=[track_id, *(rec["track_id"] for rec in recs)],
-        live=(emb_ids, emb_matrix),
-    )
     # The points/projection are seed-anchored, not the whole corpus: recs
     # (e.g. `surprise`'s far neighbours) are drawn even when they fall
     # outside the nearest-VIZ_MAX ring, via extra_ids.
@@ -892,6 +910,40 @@ def _purge_viz_caches(matrix_all: np.ndarray) -> None:
             cache.pop(key, None)
 
 
+# (matrix, row norms) for whatever matrix _seed_cosine last saw. One float
+# per row, so this is ~30 KB at 8k tracks against the matrix's ~40 MB.
+_ROW_NORMS: "tuple[np.ndarray, np.ndarray] | None" = None
+
+
+def _seed_cosine(matrix_all: np.ndarray, seed_row: int) -> np.ndarray:
+    """One seed row against every row, cosine, without a unit matrix.
+
+    Deliberately NOT _similarity: that fills _UNIT_CACHE, which is a single
+    slot holding the LIVE matrix for /recommend. Calling it here on the
+    snapshot matrix evicted the live one, so /recommend and every subset
+    miss took turns re-normalizing a whole corpus (1.2 GB of allocation
+    each at 230k rows) to serve the other. Dividing the raw matrix-vector
+    product by the row norms is the same number, and the norms are one
+    float per row, cached beside the matrix they belong to.
+    """
+    global _ROW_NORMS
+
+    seed_vec = np.asarray(matrix_all[seed_row], dtype=np.float32)
+    seed_norm = float(np.linalg.norm(seed_vec))
+    unit_seed = seed_vec / (seed_norm or 1.0)
+
+    with _VIZ_CACHE_LOCK:
+        cached = _ROW_NORMS
+    if cached is not None and cached[0] is matrix_all:
+        norms = cached[1]
+    else:
+        norms = np.linalg.norm(matrix_all, axis=1)
+        with _VIZ_CACHE_LOCK:
+            _ROW_NORMS = (matrix_all, norms)
+
+    return (matrix_all @ unit_seed) / np.where(norms == 0.0, 1.0, norms)
+
+
 def _viz_subset(seed_id: str | None,
                 extra_ids: "list[str] | tuple[str, ...]" = (),
                 corpus: "tuple[list[str], np.ndarray] | None" = None,
@@ -933,7 +985,7 @@ def _viz_subset(seed_id: str | None,
         rows = set(range(min(n, VIZ_MAX)))
     else:
         seed_row = ids_all.index(seed_id)
-        sims = _similarity("embedding", matrix_all, matrix_all[seed_row], "cosine")
+        sims = _seed_cosine(matrix_all, seed_row)
         keep = min(n, VIZ_MAX)
         nearest = np.argpartition(-sims, keep - 1)[:keep] if keep < n else np.arange(n)
         rows = set(nearest.tolist()) | {seed_row}
@@ -1015,7 +1067,7 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
     it (/viz/map ranks on it), so the growth check does not repeat that
     caller's corpus_ids read.
     """
-    global _VIZ_SNAPSHOT
+    global _VIZ_SNAPSHOT, _ROW_NORMS
 
     # Read live first: this is also the call that appends newly analyzed rows
     # to _MATRIX_CACHE, and it is the cheap part (only new ids are parsed).
@@ -1033,9 +1085,15 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
             missing = any(t in live_ids and t not in held for t in wanted)
             if fresh and small_growth and not missing:
                 return snap_ids, snap_matrix
+        # Two threads can miss together and both store a snapshot; benign,
+        # since both store the same live (ids, matrix) pair and the loser's
+        # write is identical to the winner's. The lock is here for the
+        # OrderedDict mutations in _purge_viz_caches, not for exclusivity.
         _VIZ_SNAPSHOT = (time.monotonic(), ids, matrix)
         # The derived caches belong to the superseded matrix; drop them now
         # rather than letting them pin it until the LRU happens to evict.
+        # _ROW_NORMS holds a strong reference to the old matrix too.
+        _ROW_NORMS = None
         _purge_viz_caches(matrix)
     return ids, matrix
 

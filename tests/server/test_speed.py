@@ -152,22 +152,67 @@ def test_viz_map_draws_a_seed_analyzed_after_the_snapshot(client, fake_mongo,
     assert "fresh" in body["points"]["ids"]
 
 
-def test_viz_map_draws_a_rec_analyzed_after_the_snapshot(client, fake_mongo,
+def test_viz_map_skips_a_rec_analyzed_after_the_snapshot(client, fake_mongo,
                                                          monkeypatch):
-    """Every client reads rec.x/rec.y unconditionally, so a rec the snapshot
-    predates must still get a position rather than be left undrawn."""
+    """A rec the snapshot predates has no row to be drawn at, and every
+    client reads rec.x/rec.y unconditionally. It is filtered out of the list
+    rather than forcing a refresh -- and the list is still `limit` long,
+    because the filter runs before the truncation."""
     monkeypatch.setattr(app_module, "VIZ_MAX", 50)
     for i in range(30):
         store.put_track({**TRACK, "track_id": f"t{i}"},
                         {"embedding": [1.0, 5.0 + i]})
     client.get("/viz/tour?track_id=t0")
-    # A near-duplicate of the seed, so it ranks first on sounds_like.
+    before = app_module._VIZ_SNAPSHOT
+    # A near-duplicate of the seed, so it would otherwise rank first.
     store.put_track({**TRACK, "track_id": "twin"}, {"embedding": [1.0, 5.0]})
+
+    recommended = client.get(
+        "/recommend?track_id=t0&axis=sounds_like&limit=3").json()["results"]
+    assert recommended[0]["track_id"] == "twin"    # /recommend is unaffected
+
     body = client.get("/viz/map?track_id=t0&axis=sounds_like&limit=3").json()
-    assert body["recs"][0]["track_id"] == "twin"
+    assert "twin" not in {rec["track_id"] for rec in body["recs"]}
+    assert len(body["recs"]) == 3                  # still a full list
     assert all(isinstance(rec["x"], float) and isinstance(rec["y"], float)
                for rec in body["recs"])
-    assert "twin" in body["points"]["ids"]
+    assert "twin" not in body["points"]["ids"]
+    # ... and no refresh happened: the snapshot is the same matrix object.
+    assert app_module._VIZ_SNAPSHOT[2] is before[2]
+
+
+def test_viz_subset_does_not_touch_the_unit_cache(fake_mongo, monkeypatch):
+    """_UNIT_CACHE is a single slot holding the LIVE matrix for /recommend.
+    Normalizing the snapshot matrix through it evicted the live one, so the
+    two paths took turns re-normalizing a whole corpus for each other."""
+    monkeypatch.setattr(app_module, "VIZ_MAX", 3)
+    vecs = {"a": [1, 0], "b": [0.9, 0.1], "c": [0.7, 0.3],
+            "d": [0.5, 0.5], "e": [0, 1]}
+    for tid, v in vecs.items():
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+    monkeypatch.setattr(app_module, "_similarity", lambda *a, **k: (
+        _ for _ in ()).throw(AssertionError("_viz_subset used _UNIT_CACHE")))
+    ids, matrix = app_module._viz_subset("c")
+    assert set(ids) == {"b", "c", "d"}             # the same nearest set
+    assert matrix.shape == (3, 2)
+    assert app_module._UNIT_CACHE == {}
+
+
+def test_seed_cosine_matches_a_normalized_dot_and_caches_row_norms(fake_mongo):
+    rng = np.random.default_rng(3)
+    m = rng.standard_normal((12, 5)).astype(np.float32)
+    unit = m / np.linalg.norm(m, axis=1, keepdims=True)
+    got = app_module._seed_cosine(m, 4)
+    assert np.allclose(got, unit @ unit[4], atol=1e-6)
+    assert app_module._ROW_NORMS[0] is m
+    assert app_module._ROW_NORMS[1].shape == (12,)
+
+
+def test_seed_cosine_survives_a_zero_row(fake_mongo):
+    m = np.array([[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    got = app_module._seed_cosine(m, 0)
+    assert np.all(np.isfinite(got))
+    assert got[0] == pytest.approx(1.0) and got[1] == pytest.approx(0.0)
 
 
 # ---- track metadata cache ----
@@ -209,7 +254,10 @@ def test_recommend_fetches_tracks_in_one_batch(client, fake_mongo, monkeypatch):
         AssertionError("per-track fetch")))
     r = client.get("/recommend?track_id=t0&axis=sounds_like&limit=3")
     assert r.status_code == 200
-    assert len(r.json()["results"]) == 3
+    results = r.json()["results"]
+    assert len(results) == 3
+    assert all(t["title"] == TRACK["title"] for t in results)   # real metadata
+    assert all(t["artist"] == TRACK["artist"] for t in results)
     assert len(calls) == 1
 
 
