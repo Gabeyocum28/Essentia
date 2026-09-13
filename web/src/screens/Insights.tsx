@@ -11,6 +11,7 @@ import { Proof } from "../insights/Proof";
 import { Extremes } from "../insights/Extremes";
 import { MathPanel } from "../insights/MathPanel";
 import { WhySimilar } from "../insights/WhySimilar";
+import { Sound } from "../insights/Sound";
 
 type Status = "loading" | "ready" | "unanalyzed" | "error";
 type Mode = "GALAXY" | "SOUND" | "PROOF";
@@ -135,9 +136,7 @@ export function Insights() {
             </>
           )}
 
-          {mode === "SOUND" && (
-            <p className="hint">Spectrogram, self-similarity and band solo are not in the web app yet.</p>
-          )}
+          {mode === "SOUND" && <Sound track={selectedRec ?? map.seed} />}
 
           {mode === "PROOF" && (
             <>

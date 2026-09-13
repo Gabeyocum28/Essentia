@@ -34,6 +34,10 @@ const recList = (recs?: string[]) => (recs && recs.length ? recs.join(",") : und
 
 export const previewUrl = (trackId: string) => `${BASE}/preview/${trackId}`;
 
+// Same-origin mp3 bytes, for SOUND mode only: decodeAudioData needs the
+// bytes, and the plain preview URL 302s to a CDN with no CORS header.
+export const previewAudioUrl = (trackId: string) => `${BASE}/preview/${trackId}/audio`;
+
 export function decodeCoords8(b64: string, n: number): Float32Array[] {
   const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
   const all = new Float32Array(bytes.buffer, bytes.byteOffset, n * 8);

@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
+import { formatHz } from "../audio/mel";
+import { soloBand, soloOff, useSoloBand } from "../audio/soloStore";
 import type { VizAttribution } from "../api/types";
 
 interface Props {
@@ -13,14 +15,12 @@ const POLL_MS = 1500;
 const TIMEOUT_MS = 60_000;
 
 /** Formats a frequency in Hz as e.g. "240" or "1.2k". */
-export function hz(n: number): string {
-  if (n < 1000) return String(Math.round(n));
-  return `${(n / 1000).toFixed(1)}k`;
-}
+export const hz = formatHz;
 
 export function WhySimilar({ seedId, recId }: Props) {
   const [phase, setPhase] = useState<Phase>("pending");
   const [data, setData] = useState<VizAttribution | null>(null);
+  const solo = useSoloBand();
 
   useEffect(() => {
     setPhase("pending");
@@ -91,22 +91,37 @@ export function WhySimilar({ seedId, recId }: Props) {
     <div className="why-similar">
       {data.base !== undefined && <p className="mono why-similar-base">base cos {data.base.toFixed(4)}</p>}
       <div className="why-similar-bars">
-        {bands.map((band, i) => (
-          <div key={`${band.lo_hz}-${band.hi_hz}`} className="why-similar-bar-col">
-            <div
-              className="why-similar-bar"
-              style={{
-                height: `${Math.max(0, band.delta) / peak * 100}%`,
-                opacity: i === topIdx ? 1 : 0.45,
-              }}
-            />
-            <div className="mono why-similar-bar-label">
-              {hz(band.lo_hz)} / {hz(band.hi_hz)}
-            </div>
-          </div>
-        ))}
+        {bands.map((band, i) => {
+          const soloed = solo !== null && solo[0] === band.lo_hz && solo[1] === band.hi_hz;
+          return (
+            <button
+              type="button"
+              key={`${band.lo_hz}-${band.hi_hz}`}
+              className={`why-similar-bar-col${soloed ? " why-similar-bar-col-solo" : ""}`}
+              aria-pressed={soloed}
+              aria-label={`Solo ${hz(band.lo_hz)} to ${hz(band.hi_hz)} Hz`}
+              onClick={() => (soloed ? soloOff() : soloBand(band.lo_hz, band.hi_hz))}
+            >
+              <div
+                className="why-similar-bar"
+                style={{
+                  height: `${Math.max(0, band.delta) / peak * 100}%`,
+                  opacity: soloed || i === topIdx ? 1 : 0.45,
+                }}
+              />
+              <div className="mono why-similar-bar-label">
+                {hz(band.lo_hz)} / {hz(band.hi_hz)}
+              </div>
+            </button>
+          );
+        })}
       </div>
-      <p className="hint why-similar-note">Band solo playback is iOS-only for now.</p>
+      <div className="why-similar-note">
+        <span className="hint">Tap a band to hear only that band.</span>
+        <button type="button" className="why-similar-solo-off" onClick={soloOff} disabled={solo === null}>
+          Solo off
+        </button>
+      </div>
     </div>
   );
 }

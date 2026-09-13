@@ -471,6 +471,78 @@ def test_preview_survives_store_being_down(monkeypatch, deezer_previews):
     assert r.status_code == 302
 
 
+# ---- GET /preview/{id}/audio: the same-origin mp3 stream for web SOUND mode ----
+
+
+class _FakeUpstream:
+    """Minimal stand-in for urlopen's response: chunked reads, closes once."""
+
+    def __init__(self, payload: bytes):
+        self._buf = payload
+        self._pos = 0
+        self.closed = False
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = self._buf[self._pos:self._pos + n] if n and n > 0 else self._buf[self._pos:]
+        self._pos += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_preview_audio_streams_the_mp3_bytes(client, deezer_previews, monkeypatch):
+    payload = b"ID3" + bytes(200_000)
+    opened = []
+
+    def fake_open(url):
+        opened.append(url)
+        return _FakeUpstream(payload)
+
+    monkeypatch.setattr(app_module, "_open_upstream", fake_open)
+
+    r = client.get("/preview/721063/audio")
+    assert r.status_code == 200
+    assert r.content == payload
+    assert r.headers["content-type"] == "audio/mpeg"
+    assert r.headers["cache-control"] == "private, max-age=600"
+    assert opened == ["https://cdnt-preview.dzcdn.net/721063.mp3?hdnea=exp=999"]
+
+
+def test_preview_audio_closes_the_upstream_response(client, deezer_previews, monkeypatch):
+    upstream = _FakeUpstream(b"mp3")
+    monkeypatch.setattr(app_module, "_open_upstream", lambda url: upstream)
+    assert client.get("/preview/721063/audio").content == b"mp3"
+    assert upstream.closed
+
+
+def test_preview_audio_404s_when_deezer_has_no_preview(client, monkeypatch):
+    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", lambda t: None)
+    assert client.get("/preview/nope/audio").status_code == 404
+
+
+def test_preview_audio_502s_when_the_upstream_fetch_fails(client, deezer_previews, monkeypatch):
+    def boom(url):
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(app_module, "_open_upstream", boom)
+    assert client.get("/preview/721063/audio").status_code == 502
+
+
+def test_preview_audio_wins_over_the_spa_fallback(deezer_previews, monkeypatch, tmp_path, fake_mongo):
+    """`audio` has no dot, so the SPA catch-all would serve index.html for it
+    if the route were not declared first."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html><body>spa</body></html>")
+    monkeypatch.setenv("WEB_DIST", str(dist))
+    monkeypatch.setattr(app_module, "_open_upstream", lambda url: _FakeUpstream(b"mp3"))
+
+    r = TestClient(app_module.app).get("/preview/721063/audio")
+    assert r.headers["content-type"] == "audio/mpeg"
+    assert r.content == b"mp3"
+
+
 def test_recommend_serves_this_servers_preview_urls(client, seeded_corpus):
     body = client.get(
         f"/recommend?track_id={seeded_corpus[0]['track_id']}&axis=sounds_like"
