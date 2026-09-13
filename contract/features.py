@@ -19,5 +19,8 @@ AXES = [
 # analyze_track(mp3_path) -> dict with exactly these keys.
 FEATURE_KEYS = {
     "embedding": 1280,   # Discogs-EffNet penultimate layer, patch-mean
+    "feel": 11,          # eleven classifier heads on that embedding, each a
+                         # probability in [0, 1]; see analysis/feel.FEEL_KEYS
+                         # for the dimension order
 }
 # Arrays are 1-D float lists/ndarrays of the stated length.

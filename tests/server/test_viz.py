@@ -930,3 +930,76 @@ def test_viz_subset_miss_purges_a_superseded_full_matrix(client, fake_mongo,
     for cache in (app_mod._TOP8_CACHE, app_mod._MST_CACHE, app_mod._HUBS_CACHE):
         assert all(any(value[0] is subset for subset in live)
                    for value in cache.values())
+
+
+# ---- /viz/map: the feel comparison behind the score ----
+
+FEEL_DIM = 11
+
+
+def _feel_track(track_id: str, title: str, theta: float,
+                feel: float | None) -> None:
+    v = [0.0] * 1280
+    v[0], v[1] = float(np.cos(theta)), float(np.sin(theta))
+    features = {"embedding": v}
+    if feel is not None:
+        features["feel"] = [feel] * FEEL_DIM
+    store.put_track({**TRACK, "track_id": track_id, "title": title,
+                     "artist": f"Artist {track_id}"}, features)
+
+
+@pytest.fixture
+def feel_corpus(fake_mongo):
+    _feel_track("s", "So What", 0.0, 0.5)
+    _feel_track("near", "Blue in Green", 0.30, 1.0)
+    _feel_track("feely", "All Blues", 0.45, 0.5)
+    _feel_track("blank", "Flamenco Sketches", 0.60, None)
+
+
+def _map(client, **params):
+    return client.get("/viz/map", params={"track_id": "s", "axis": "sounds_like",
+                                          **params}).json()
+
+
+def test_viz_map_names_the_eleven_feel_dimensions(client, feel_corpus):
+    """The math panel labels the bars from this, rather than keeping its own
+    copy of an order that lives in analysis/registry.HEADS."""
+    body = _map(client)
+    assert body["feel_keys"] == [
+        "danceable", "happy", "sad", "aggressive", "relaxed", "party",
+        "acoustic", "electronic", "bright", "tonal", "instrumental",
+    ]
+
+
+def test_viz_map_rec_math_carries_the_feel_comparison(client, feel_corpus):
+    math = {rec["track_id"]: rec["math"] for rec in _map(client)["recs"]}
+    assert math["near"]["feel_dist"] == pytest.approx(0.5, abs=1e-3)
+    assert math["near"]["feel"]["seed"] == [0.5] * FEEL_DIM
+    assert math["near"]["feel"]["rec"] == [1.0] * FEEL_DIM
+    assert math["feely"]["feel_dist"] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_viz_map_math_says_nothing_where_there_is_no_vector(client, feel_corpus):
+    math = {rec["track_id"]: rec["math"] for rec in _map(client)["recs"]}
+    assert math["blank"]["feel_dist"] is None
+    assert math["blank"]["feel"] is None
+
+
+def test_viz_map_reports_the_feel_comparison_even_at_zero_weight(client, feel_corpus):
+    """The slider is meant to be turned back down and still explain itself."""
+    math = {rec["track_id"]: rec["math"] for rec in _map(client, feel=0)["recs"]}
+    assert math["near"]["feel_dist"] == pytest.approx(0.5, abs=1e-3)
+
+
+def test_viz_map_ranking_follows_the_feel_weight(client, feel_corpus):
+    assert _viz_rec_ids(client, feel=0)[0] == "near"
+    assert _viz_rec_ids(client, feel=2)[0] == "feely"
+
+
+def test_viz_map_surprise_math_has_the_feel_keys_but_no_comparison(client, feel_corpus):
+    """feel is a sounds_like idea; surprise still answers the same shape."""
+    body = client.get("/viz/map", params={"track_id": "s", "axis": "surprise",
+                                          "feel": 2}).json()
+    for rec in body["recs"]:
+        assert rec["math"]["feel_dist"] is None
+        assert rec["math"]["feel"] is None

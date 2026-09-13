@@ -33,6 +33,7 @@ from typing import Literal, NamedTuple
 
 from contract.features import AXES
 from music_recommendations.analysis import analyze_track, frontend
+from music_recommendations.analysis.feel import FEEL_KEYS
 from music_recommendations.analysis.schema import METRICS
 from music_recommendations.server import deezer, dedupe, store, viz
 from music_recommendations.server.axes import AXIS_FEATURES, BLENDED_AXES
@@ -588,6 +589,128 @@ def _similarity(feature_key: str, matrix: np.ndarray, seed_vec: np.ndarray,
     return unit @ rank_mod.normalize(np.asarray(seed_vec, dtype=np.float32))
 
 
+# ---- feel: the second half of "sounds like this" ----
+#
+# Embedding cosine ranks by STYLE. It cannot tell a hushed solo take from a
+# full-band blast of the same idiom, because both sit in the same corner of
+# Discogs space. The feel vector (eleven classifier heads, analysis/feel.py)
+# carries exactly what the cosine drops: energy, mood, texture. The blend is
+#
+#     blended = cos(embedding) - w * mean|feel_rec - feel_seed|
+#
+# a straight subtraction rather than a percentile blend (_blended) because
+# both terms are already on the same scale: a cosine in [-1, 1] against a
+# mean absolute difference of probabilities in [0, 1]. w == 0 reproduces the
+# embedding-only order EXACTLY, which is what makes the slider safe to ship.
+
+FEEL_DEFAULT = 0.5
+FEEL_MAX = 3.0
+
+
+class _FeelRows(NamedTuple):
+    """The feel vectors of one ranking's rows, lined up with its matrix."""
+    distance: np.ndarray   # (n,) mean |rec - seed|, 0.0 where feel is missing
+    rows: np.ndarray       # (n, 11) aligned vectors, zeros where missing
+    present: np.ndarray    # (n,) bool -- whether that row has a feel vector
+    seed: np.ndarray       # (11,) the seed's own vector
+
+
+# The alignment between the embedding matrix's rows and the feel matrix's is
+# pure bookkeeping over two id lists, but it is O(corpus) and would otherwise
+# be rebuilt on every request. Both matrices are held IN the tuple and
+# re-checked with `is` -- the same discipline as _UNIT_CACHE: a bare id() lets
+# the array it named be freed and a later array at the same address would be
+# served someone else's alignment. Either matrix growing (a crawl, a backfill)
+# hands back a new object and invalidates this for free.
+_FEEL_ALIGN_CACHE: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+_FEEL_ALIGN_LOCK = threading.Lock()
+# Rows still waiting on scripts/feel_backfill.py are a deploy-time fact, not a
+# per-request one: say it once per process rather than on every /recommend.
+_FEEL_MISSING_LOGGED = False
+
+
+def _feel_alignment(ids: list[str], matrix: np.ndarray, feel_ids: list[str],
+                    feel_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(rows, present) for `ids`, drawn from the feel matrix's own id subset."""
+    global _FEEL_ALIGN_CACHE, _FEEL_MISSING_LOGGED
+
+    with _FEEL_ALIGN_LOCK:
+        cached = _FEEL_ALIGN_CACHE
+        if (cached is not None and cached[0] is matrix
+                and cached[1] is feel_matrix):
+            return cached[2], cached[3]
+
+    at = {track_id: row for row, track_id in enumerate(feel_ids)}
+    take = np.array([at.get(track_id, -1) for track_id in ids], dtype=np.int64)
+    present = take >= 0
+    width = feel_matrix.shape[1] if feel_matrix.ndim == 2 else 0
+    rows = np.zeros((len(ids), width), dtype=np.float32)
+    if width and present.any():
+        rows[present] = np.asarray(feel_matrix, dtype=np.float32)[take[present]]
+
+    missing = int(len(ids) - present.sum())
+    if missing and not _FEEL_MISSING_LOGGED:
+        _FEEL_MISSING_LOGGED = True
+        print(f"feel: {missing} of {len(ids)} corpus rows have no feel vector "
+              f"and rank unpenalized — run scripts/feel_backfill.py")
+
+    with _FEEL_ALIGN_LOCK:
+        _FEEL_ALIGN_CACHE = (matrix, feel_matrix, rows, present)
+    return rows, present
+
+
+def _feel_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
+               seed_features: dict) -> _FeelRows | None:
+    """The feel penalty for every row of `matrix`, or None if it cannot apply.
+
+    None when the seed itself has no feel vector, or nothing in the corpus
+    does: a partial backfill must never hide tracks, so the absence of the
+    number means "no penalty", not "rank last".
+    """
+    seed = seed_features.get("feel")
+    if seed is None or not ids:
+        return None
+    # euclidean is nominal here -- no correction is asked for, so the metric
+    # only ever reaches rank.centrality, which this never calls. The distance
+    # below is a mean ABSOLUTE difference, chosen over L2 so one wildly
+    # different dimension cannot dominate the other ten.
+    feel_ids, feel_matrix, _ = _corpus_matrix(corpus, "feel", "euclidean",
+                                              want_correction=False)
+    if not feel_ids:
+        return None
+    rows, present = _feel_alignment(ids, matrix, feel_ids, feel_matrix)
+    seed_vec = np.asarray(seed, dtype=np.float32).ravel()
+    if rows.shape[1] != seed_vec.shape[0]:
+        return None
+    distance = np.abs(rows - seed_vec).mean(axis=1)
+    distance[~present] = 0.0
+    return _FeelRows(distance.astype(np.float32), rows, present, seed_vec)
+
+
+def _feel_blend(axis: str, weight: float, similarity: np.ndarray,
+                feel: _FeelRows | None) -> np.ndarray:
+    """`similarity` minus the feel penalty, on sounds_like only.
+
+    surprise is deliberately untouched: "nothing like this" is already a
+    request to leave the seed's neighbourhood, and penalizing a different
+    feel there would pull the answers back towards it.
+    """
+    if axis != "sounds_like" or feel is None or not weight:
+        return similarity
+    return similarity - weight * feel.distance
+
+
+def _feel_math(feel: _FeelRows | None, index: int) -> dict:
+    """The math-panel half: the two vectors and the distance between them."""
+    if feel is None or not feel.present[index]:
+        return {"feel_dist": None, "feel": None}
+    return {
+        "feel_dist": round(float(feel.distance[index]), 4),
+        "feel": {"seed": [round(float(v), 4) for v in feel.seed],
+                 "rec": [round(float(v), 4) for v in feel.rows[index]]},
+    }
+
+
 def _percentile(values: np.ndarray) -> np.ndarray:
     """Each score as "better than X% of the corpus", 0-100.
 
@@ -765,7 +888,11 @@ def _rec_track(track_id: str) -> dict:
 
 @app.get("/recommend")
 def recommend(track_id: str, axis: str,
-              limit: int = Query(10, ge=1, le=50)) -> dict:
+              limit: int = Query(10, ge=1, le=50),
+              feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX)) -> dict:
+    """`feel` weights the eleven-dimension feel penalty on sounds_like.
+    0 is the embedding-only order this endpoint served before the heads
+    shipped; it is ignored on every other axis."""
     if axis not in AXIS_FEATURES and axis not in BLENDED_AXES:
         raise HTTPException(400, f"unknown axis {axis!r}")
 
@@ -802,14 +929,22 @@ def recommend(track_id: str, axis: str,
         # replacements to draw on; rank() sorts the whole column regardless
         # of `limit`, so asking for more is free.
         similarity = _similarity(feature_key, matrix, seed_vec, metric)
+        # The blend is what is RANKED and what is REPORTED: a result whose
+        # score was not the number it was sorted by would read as an
+        # out-of-order list in the client.
+        blended = _feel_blend(
+            axis, feel,
+            similarity,
+            _feel_rows(corpus, ids, matrix, seed_features) if feel else None,
+        )
         order = rank_mod.rank(
             seed_vec, matrix, direction=direction, limit=_scan_width(limit),
-            metric=metric, correction=correction, similarity=similarity,
+            metric=metric, correction=correction, similarity=blended,
         )
         chosen = _take(order, ids, track_id, limit,
                        _Collapse(track_id, matrix, _unit_rows(feature_key, matrix)))
         results = [
-            {**_rec_track(ids[idx]), "score": float(similarity[idx])}
+            {**_rec_track(ids[idx]), "score": float(blended[idx])}
             for idx in chosen
         ]
 
@@ -945,7 +1080,8 @@ def _hub_arrays(matrix: np.ndarray,
 def viz_map(track_id: str, axis: str,
             limit: int = Query(10, ge=1, le=50),
             correction: Literal["on", "off"] = "on",
-            points: Literal["full", "compact"] = "full") -> dict:
+            points: Literal["full", "compact"] = "full",
+            feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX)) -> dict:
     """Everything the wow screen needs in one payload: the whole corpus as 2D
     points, the seed, and the recs with the actual numbers behind each score.
 
@@ -1009,6 +1145,7 @@ def viz_map(track_id: str, axis: str,
         # percentile so the blend can be shown as the sum it is.
         emb_at = {tid: i for i, tid in enumerate(emb_ids)}
         metric, matrix, correction = "cosine", emb_matrix, None
+        feel_rows = None
     else:
         feature_key, direction = AXIS_FEATURES[axis]
         metric = METRICS.get(feature_key, "cosine")
@@ -1017,6 +1154,11 @@ def viz_map(track_id: str, axis: str,
                                                  want_correction=use_correction)
         seed_vec = _vector(seed_features, feature_key)
         similarity = _similarity(feature_key, matrix, seed_vec, metric)
+        # Computed even at feel=0, unlike /recommend: the math panel shows the
+        # per-dimension comparison whether or not it is currently weighted,
+        # and that is the whole point of a slider you can turn back down.
+        feel_rows = _feel_rows(corpus, ids, matrix, seed_features)
+        similarity = _feel_blend(axis, feel, similarity, feel_rows)
         order = rank_mod.rank(seed_vec, matrix, direction=direction,
                               limit=_scan_width(limit) + skippable, metric=metric,
                               correction=correction, similarity=similarity)
@@ -1054,12 +1196,15 @@ def viz_map(track_id: str, axis: str,
                 key: round(float(values[idx]), 1)
                 for key, values in parts.items()
             }
+            math.update(_feel_math(None, idx))
         else:
             score = float(similarity[idx])
             math = viz.score_math(
                 seed_vec, matrix[idx], metric,
                 float(correction[idx]) if correction is not None else None,
             )
+            math.update(_feel_math(feel_rows if axis == "sounds_like" else None,
+                                   idx))
         recs.append({"track_id": rec_id, "score": score, "math": math})
         if len(recs) == limit:
             break
@@ -1120,6 +1265,10 @@ def viz_map(track_id: str, axis: str,
         "seed": seed,
         "recs": recs,
         "axis": axis_info,
+        # Sent rather than hardcoded in the client: the dimension order is
+        # analysis/registry.HEADS' insertion order, and a client with its own
+        # copy of the list would mislabel every bar the day a head moves.
+        "feel_keys": list(FEEL_KEYS),
     }
 
 

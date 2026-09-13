@@ -770,3 +770,36 @@ def test_download_preview_keeps_the_file_it_returns(monkeypatch, tmp_path):
     path = worker.download_preview("http://x/p.mp3")
     assert path.read_bytes() == b"mp3 bytes"
     assert [p.name for p in tmp_path.iterdir()] == [path.name]
+
+
+# ---- feel: the worker scores new tracks as it analyzes them ----
+
+FEEL = [0.1] * 11
+
+
+def test_process_job_stores_the_feel_vector_analysis_returned(fake_mongo, monkeypatch,
+                                                              tmp_path):
+    """New tracks must not need the backfill: analyze_tracks returns feel
+    alongside the embedding and the worker persists both."""
+    mp3 = tmp_path / "p.mp3"
+    mp3.write_bytes(b"mp3")
+    monkeypatch.setattr(worker, "download_preview", lambda url: mp3)
+    monkeypatch.setattr(worker, "analyze_tracks",
+                        lambda paths: [{**FEATURES, "feel": list(FEEL)}
+                                       for _ in paths])
+    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
+    store.enqueue_embed("42")
+
+    assert worker.process_job("42") is True
+    assert store.get_features("42")["feel"] == pytest.approx(FEEL, abs=1e-4)
+
+
+def test_process_job_survives_analysis_without_feel(fake_mongo, analysis_ok,
+                                                    monkeypatch):
+    """An older analysis path (or a mocked one) that returns the embedding
+    alone must still store the track, just without a feel vector."""
+    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
+    store.enqueue_embed("42")
+
+    assert worker.process_job("42") is True
+    assert "feel" not in store.get_features("42")

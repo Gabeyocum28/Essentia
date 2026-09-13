@@ -29,12 +29,16 @@ def test_removed_modules_are_gone():
 
 
 @needs_effnet
-def test_analyze_track_returns_only_embedding(tone_wav):
+def test_analyze_track_returns_the_embedding_and_the_feel_vector(tone_wav):
     feats = analyze_track(tone_wav)
-    assert set(feats) == {"embedding"}
+    assert set(feats) == {"embedding", "feel"}
     assert feats["embedding"].shape == (1280,)
+    assert feats["feel"].shape == (11,)
+    assert float(feats["feel"].min()) >= 0.0
+    assert float(feats["feel"].max()) <= 1.0
     js = as_json(feats)
     assert len(js["embedding"]) == 1280 and isinstance(js["embedding"][0], float)
+    assert len(js["feel"]) == 11 and isinstance(js["feel"][0], float)
 
 
 @needs_effnet
@@ -46,7 +50,8 @@ def test_analyze_tracks_keeps_a_bad_path_from_sinking_the_group(tone_wav, tmp_pa
 
     assert isinstance(out[1], Exception)
     for feats in (out[0], out[2]):
-        assert set(feats) == {"embedding"}
+        assert set(feats) == {"embedding", "feel"}
         assert feats["embedding"].shape == (1280,)
+        assert feats["feel"].shape == (11,)
     assert np.allclose(out[0]["embedding"], analyze_track(tone_wav)["embedding"],
                        atol=1e-4)

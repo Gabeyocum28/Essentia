@@ -19,6 +19,7 @@ def clear_matrix_cache():
     app._TRACK_META.clear()
     app._VIZ_SNAPSHOT = None
     app._ROW_NORMS = None
+    app._FEEL_ALIGN_CACHE = None
     viz.clear_geometry_cache()
     yield
     app._MATRIX_CACHE.clear()
@@ -30,6 +31,7 @@ def clear_matrix_cache():
     app._TRACK_META.clear()
     app._VIZ_SNAPSHOT = None
     app._ROW_NORMS = None
+    app._FEEL_ALIGN_CACHE = None
     viz.clear_geometry_cache()
 
 

@@ -37,7 +37,7 @@ def analyze_tracks(paths: list[Path | str]) -> list[dict | Exception]:
     """
     # Imported here, not at module scope: importing TensorFlow costs ~1 s,
     # and a caller that only wants FEATURES_VERSION or METRICS should not pay.
-    from . import embedding, frontend
+    from . import embedding, feel, frontend
 
     results: list[dict | Exception | None] = [None] * len(paths)
     ready: list[int] = []
@@ -58,13 +58,21 @@ def analyze_tracks(paths: list[Path | str]) -> list[dict | Exception]:
             results[i] = exc
 
     if ready:
-        for i, frames in zip(ready, embedding.embed_patch_groups(patch_groups)):
-            results[i] = {"embedding": frames.mean(axis=0).astype(np.float32)}
+        means = [frames.mean(axis=0).astype(np.float32)
+                 for frames in embedding.embed_patch_groups(patch_groups)]
+        # The eleven heads read the mean embedding, not the audio, so the
+        # whole group is scored in one pass per head after the EffNet work is
+        # done — eleven small matmuls on top of a decode-and-embed that cost
+        # seconds.
+        vectors = feel.feel_vectors(np.stack(means))
+        for slot, (i, mean) in enumerate(zip(ready, means)):
+            results[i] = {"embedding": mean, "feel": vectors[slot]}
     return results  # type: ignore[return-value]
 
 
 def analyze_track(mp3_path: Path | str) -> dict:
-    """Run EffNet; returns {"embedding": (1280,) float32}."""
+    """Run EffNet + the feel heads; returns {"embedding": (1280,) float32,
+    "feel": (11,) float32}."""
     result = analyze_tracks([mp3_path])[0]
     if isinstance(result, Exception):
         raise result

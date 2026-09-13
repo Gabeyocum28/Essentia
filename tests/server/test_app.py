@@ -410,7 +410,8 @@ def test_repeat_requests_do_not_re_read_the_whole_corpus(client, seeded_corpus, 
     The cold embedding matrix now comes from one store.base_matrix() query
     instead of a per-track store.get_many_features() fetch, so the first
     request's "whole matrix" read shows up there; get_many_features is only
-    hit for tracks analyzed after that base read.
+    hit for the feel matrix (which has no bulk query of its own) and for
+    tracks analyzed after that base read.
     """
     base_reads = []
     real_base = store.base_matrix
@@ -424,8 +425,9 @@ def test_repeat_requests_do_not_re_read_the_whole_corpus(client, seeded_corpus, 
     seed = seeded_corpus[0]["track_id"]
     params = {"track_id": seed, "axis": "sounds_like", "limit": 10}
     client.get("/recommend", params=params)
+    corpus = sorted(t["track_id"] for t in seeded_corpus)
     assert len(base_reads) == 1, "the first request builds the whole matrix in one query"
-    assert reads == [], "no per-track fetches when the base matrix covers everyone"
+    assert reads == [corpus], "the feel matrix is one bulk read, not one per track"
 
     base_reads.clear()
     reads.clear()
@@ -435,7 +437,9 @@ def test_repeat_requests_do_not_re_read_the_whole_corpus(client, seeded_corpus, 
     store.put_track(FIXTURE[5], fake_features(0.5))
     reads.clear()
     client.get("/recommend", params=params)
-    assert reads == [[FIXTURE[5]["track_id"]]], "only the new track is parsed"
+    # Once to grow the embedding matrix, once to grow the feel matrix; both
+    # carry the new id alone.
+    assert reads == [[FIXTURE[5]["track_id"]]] * 2, "only the new track is parsed"
 
 
 def test_seed_is_never_recommended_to_itself(client, seeded_corpus):
@@ -928,3 +932,135 @@ def test_absolute_and_double_slash_paths_cannot_escape_web_dist(monkeypatch, tmp
         r = c.get("//etc/hostname")
         assert r.status_code == 200
         assert r.text.endswith("spa</body></html>")
+
+
+# ---- /recommend: the feel blend ----
+#
+# The embedding ranks by style; the eleven-dimension feel vector carries
+# energy, mood and texture. `feel` weights the second against the first:
+#
+#     blended = cos(embedding) - feel * mean|feel_rec - feel_seed|
+#
+# The corpus below is built so the two disagree on purpose. "near" is the
+# closest thing in embedding space but feels nothing like the seed; "feely"
+# sits further out in style and matches the seed's feel exactly. Which of
+# them wins is entirely the slider's decision.
+
+FEEL_DIM = FEATURE_KEYS["feel"]
+
+
+def _feeling(theta: float, feel: float | None) -> dict:
+    """A unit embedding at `theta` radians from the seed, plus a flat feel
+    vector (or none at all, for a row the backfill has not reached)."""
+    features = _angled(theta)
+    if feel is not None:
+        features["feel"] = [feel] * FEEL_DIM
+    return features
+
+
+# id, title, angle from the seed, every feel dimension's value
+FEEL_CORPUS = [
+    ("s",     "So What",           0.00, 0.5),
+    ("near",  "Blue in Green",     0.30, 1.0),   # cos 0.955, feel distance 0.5
+    ("feely", "All Blues",         0.45, 0.5),   # cos 0.900, feel distance 0.0
+    ("blank", "Flamenco Sketches", 0.60, None),  # no feel vector at all
+]
+
+
+@pytest.fixture
+def feel_corpus(fake_mongo):
+    for i, (track_id, title, theta, feel) in enumerate(FEEL_CORPUS):
+        store.put_track({"track_id": track_id, "title": title,
+                         "artist": f"Artist {i}", "album": "Kind of Blue",
+                         "artwork_url": "u"},
+                        _feeling(theta, feel))
+    return FEEL_CORPUS
+
+
+def _feel_ids(client, **params):
+    body = client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
+                                            **params}).json()
+    return [t["track_id"] for t in body["results"]]
+
+
+def test_feel_zero_is_the_embedding_only_order(client, feel_corpus):
+    """The slider must be safe to turn off: at 0 the endpoint answers exactly
+    what it answered before the heads existed, closest cosine first."""
+    assert _feel_ids(client, feel=0) == ["near", "feely", "blank"]
+
+
+def test_a_closer_feel_outranks_a_closer_embedding(client, feel_corpus):
+    # "near" leads by 0.055 of cosine and trails by 0.5 of feel distance, so
+    # any weight above ~0.11 should flip them.
+    order = _feel_ids(client, feel=2)
+    assert order[0] == "feely"
+    assert order.index("feely") < order.index("near")
+    assert _feel_ids(client, feel=0).index("near") < _feel_ids(client, feel=0).index("feely")
+
+
+def test_a_row_without_feel_is_never_penalized(client, feel_corpus):
+    """A partial backfill must not hide tracks: no vector means no penalty,
+    so "blank" keeps the place its cosine earned it."""
+    scores = {t["track_id"]: t["score"] for t in
+              client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
+                                               "feel": 2}).json()["results"]}
+    # atol covers the int8 round trip the embedding makes through the store.
+    assert scores["blank"] == pytest.approx(math.cos(0.60), abs=2e-3)
+    assert scores["feely"] == pytest.approx(math.cos(0.45), abs=2e-3)
+    assert scores["near"] == pytest.approx(math.cos(0.30) - 2 * 0.5, abs=2e-3)
+
+
+def test_feel_leaves_surprise_alone(client, feel_corpus):
+    """"Nothing like this" is already a request to leave the neighbourhood;
+    penalizing a different feel there would pull it back."""
+    off = client.get("/recommend", params={"track_id": "s", "axis": "surprise",
+                                           "feel": 0}).json()["results"]
+    on = client.get("/recommend", params={"track_id": "s", "axis": "surprise",
+                                          "feel": 3}).json()["results"]
+    assert off == on
+
+
+def test_feel_defaults_to_a_half(client, feel_corpus):
+    explicit = _feel_ids(client, feel=0.5)
+    assert _feel_ids(client) == explicit
+
+
+def test_feel_never_leaks_into_a_result_track(client, feel_corpus):
+    """FEATURE_KEYS gained a key; TRACK_FIELDS did not."""
+    body = client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
+                                            "feel": 1.0}).json()
+    for track in body["results"]:
+        assert set(track) == set(TRACK_FIELDS) | {"score"}
+
+
+def test_feel_weight_is_bounded(client, feel_corpus):
+    assert client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
+                                            "feel": -1}).status_code == 422
+    assert client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
+                                            "feel": 99}).status_code == 422
+
+
+def test_the_feel_alignment_is_cached_across_requests(client, feel_corpus, monkeypatch):
+    """The id -> row map over two matrices is O(corpus); rebuilding it per
+    request would put the corpus back in the request path."""
+    builds = []
+    real = app_module._feel_alignment
+    monkeypatch.setattr(app_module, "_feel_alignment",
+                        lambda *a: (builds.append(1), real(*a))[1])
+    params = {"track_id": "s", "axis": "sounds_like", "feel": 1.0}
+    client.get("/recommend", params=params)
+    client.get("/recommend", params=params)
+    assert len(builds) == 2, "the helper is still consulted"
+    # ...but the expensive half runs once: the second call is a cache hit.
+    assert app_module._FEEL_ALIGN_CACHE is not None
+
+
+def test_a_seed_without_feel_ranks_on_the_embedding_alone(client, feel_corpus):
+    """"blank" has no vector of its own, so there is nothing to compare
+    against and every candidate must rank unpenalized."""
+    body = client.get("/recommend", params={"track_id": "blank",
+                                            "axis": "sounds_like",
+                                            "feel": 3}).json()
+    scores = [t["score"] for t in body["results"]]
+    assert all(score > 0 for score in scores)
+    assert scores == sorted(scores, reverse=True)

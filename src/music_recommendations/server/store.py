@@ -2,7 +2,9 @@
 
   tracks  _id=track_id, title, artist, album, artwork_url,
           embedding (int8 bytes), scale (float), features_version, analyzed_at
-          -- the last four are absent until the track is analyzed.
+          -- the last four are absent until the track is analyzed --
+          and feel (11 floats), absent until the track is scored by the
+          classification heads (see scripts/feel_backfill.py).
   jobs    _id="embed:{id}" | "attr:{seed}:{rec}", kind, state, claimed_at,
           attempts, error, created_at  (+ track_id or seed_id/rec_id)
   cache   _id="preview:{id}" | "attr:{seed}:{rec}", value, expires_at (TTL)
@@ -121,15 +123,39 @@ def _meta(track: dict) -> dict:
 LIVE = {"analyzed_at": {"$exists": True}, "duplicate_of": {"$exists": False}}
 
 
+# The feel vector is eleven probabilities in [0, 1], stored as plain BSON
+# doubles rather than quantized like the embedding: 11 numbers is ~90 bytes a
+# row, and rounding them to four decimals keeps the document small while
+# staying far finer than the heads themselves are calibrated.
+FEEL_DP = 4
+
+
+def _feel(features: dict) -> list[float] | None:
+    """The feel vector as short floats, or None if this analysis has none."""
+    value = features.get("feel")
+    if value is None:
+        return None
+    return [round(float(v), FEEL_DP)
+            for v in np.asarray(value, dtype=np.float32).ravel()]
+
+
 def put_track(track: dict, features: dict) -> None:
-    """Upsert contract fields plus the analyzed embedding."""
+    """Upsert contract fields plus the analyzed embedding (and feel, if any).
+
+    `feel` is optional on the way in: rows analyzed before the heads shipped
+    have none until scripts/feel_backfill.py runs, and the ranking treats a
+    missing vector as "no penalty" rather than hiding the track.
+    """
     ensure_indexes()
     data, scale = to_int8(np.asarray(features["embedding"], dtype=np.float32))
+    fields = {**_meta(track), "embedding": data, "scale": float(scale),
+              "features_version": int(features.get(VERSION_KEY, 0))}
+    feel = _feel(features)
+    if feel is not None:
+        fields["feel"] = feel
     db().tracks.update_one(
         {"_id": track["track_id"]},
-        {"$set": {**_meta(track), "embedding": data, "scale": float(scale),
-                  "features_version": int(features.get(VERSION_KEY, 0))},
-         "$currentDate": {"analyzed_at": True}},
+        {"$set": fields, "$currentDate": {"analyzed_at": True}},
         upsert=True,
     )
 
@@ -153,16 +179,24 @@ def get_many_tracks(track_ids: list[str]) -> list[dict | None]:
     return [found.get(t) for t in track_ids]
 
 
+# What every feature read projects. `feel` is included but never required:
+# _features() omits the key entirely when the row has not been scored, which
+# is exactly what app.py's _rows_for tests for.
+_FEATURE_FIELDS = {"embedding": 1, "scale": 1, "features_version": 1, "feel": 1}
+
+
 def _features(doc: dict | None) -> dict | None:
     if not doc or doc.get("embedding") is None:
         return None
-    return {"embedding": from_int8(doc["embedding"], doc["scale"]).tolist(),
-            VERSION_KEY: doc.get("features_version", 0)}
+    out = {"embedding": from_int8(doc["embedding"], doc["scale"]).tolist(),
+           VERSION_KEY: doc.get("features_version", 0)}
+    if doc.get("feel") is not None:
+        out["feel"] = [float(v) for v in doc["feel"]]
+    return out
 
 
 def get_features(track_id: str) -> dict | None:
-    return _features(db().tracks.find_one({"_id": track_id},
-                                          {"embedding": 1, "scale": 1, "features_version": 1}))
+    return _features(db().tracks.find_one({"_id": track_id}, _FEATURE_FIELDS))
 
 
 def get_many_features(track_ids: list[str]) -> list[dict | None]:
@@ -175,8 +209,7 @@ def get_many_features(track_ids: list[str]) -> list[dict | None]:
     if not track_ids:
         return []
     found = {d["_id"]: _features(d) for d in
-             db().tracks.find({"_id": {"$in": track_ids}},
-                              {"embedding": 1, "scale": 1, "features_version": 1})}
+             db().tracks.find({"_id": {"$in": track_ids}}, _FEATURE_FIELDS)}
     return [found.get(t) for t in track_ids]
 
 

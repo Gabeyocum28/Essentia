@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pymongo
+import pytest
 
 from music_recommendations.analysis import FEATURES_VERSION
 from music_recommendations.server import store
@@ -360,3 +361,60 @@ def test_data_size_bytes_falls_back_when_the_cluster_listing_fails(monkeypatch):
     own.client = _AngryClient()
     monkeypatch.setattr(store, "db", lambda: own)
     assert store.data_size_bytes() == 8
+
+
+# ---- feel: eleven probabilities per track, optional on the way in ----
+
+FEEL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.05, 0.95]
+
+
+def test_put_track_stores_the_feel_vector(fake_mongo):
+    store.put_track(TRACK, {**FEATURES, "feel": FEEL})
+    doc = fake_mongo.tracks.find_one({"_id": "42"})
+    assert doc["feel"] == pytest.approx(FEEL, abs=1e-4)
+
+
+def test_stored_feel_is_rounded_to_four_places(fake_mongo):
+    """Eleven full doubles a row is the kind of thing that quietly doubles a
+    free-tier cluster; four places is far finer than the heads resolve."""
+    store.put_track(TRACK, {**FEATURES, "feel": [0.123456789] * 11})
+    assert fake_mongo.tracks.find_one({"_id": "42"})["feel"] == [0.1235] * 11
+
+
+def test_put_track_without_feel_writes_no_field(fake_mongo):
+    """Rows analyzed before the heads shipped, and the corpus the backfill
+    has not reached yet: the key is absent, not null."""
+    store.put_track(TRACK, FEATURES)
+    assert "feel" not in fake_mongo.tracks.find_one({"_id": "42"})
+
+
+def test_put_track_without_feel_leaves_an_existing_vector_alone(fake_mongo):
+    store.put_track(TRACK, {**FEATURES, "feel": FEEL})
+    store.put_track(TRACK, FEATURES)
+    assert fake_mongo.tracks.find_one({"_id": "42"})["feel"] is not None
+
+
+def test_get_features_returns_the_feel_vector(fake_mongo):
+    store.put_track(TRACK, {**FEATURES, "feel": FEEL})
+    got = store.get_features("42")
+    assert set(got) == {"embedding", "feel", "_features_version"}
+    assert got["feel"] == pytest.approx(FEEL, abs=1e-4)
+
+
+def test_get_features_omits_feel_when_the_row_has_none(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    assert "feel" not in store.get_features("42")
+
+
+def test_get_many_features_carries_feel_per_row(fake_mongo):
+    store.put_track(TRACK, {**FEATURES, "feel": FEEL})
+    store.put_track({**TRACK, "track_id": "43"}, FEATURES)
+    got = store.get_many_features(["42", "43", "nope"])
+    assert got[0]["feel"] == pytest.approx(FEEL, abs=1e-4)
+    assert "feel" not in got[1]
+    assert got[2] is None
+
+
+def test_feel_accepts_a_numpy_vector(fake_mongo):
+    store.put_track(TRACK, {**FEATURES, "feel": np.asarray(FEEL, dtype=np.float32)})
+    assert store.get_features("42")["feel"] == pytest.approx(FEEL, abs=1e-4)
