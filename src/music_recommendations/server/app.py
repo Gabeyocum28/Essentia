@@ -7,6 +7,7 @@ Routes:
   GET  /axes         -- list available recommendation axes
   GET  /recommend    -- ranked, scored tracks for a seed + axis
   GET  /preview/{id} -- 302 to a freshly signed Deezer preview (not contract)
+  GET  /preview/{id}/audio -- same-origin mp3 stream for the web SOUND mode
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import numpy as np
 from collections import OrderedDict
 from contextvars import ContextVar
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.requests import Request
 from typing import Literal, NamedTuple
@@ -135,6 +136,54 @@ def preview(track_id: str) -> RedirectResponse:
         raise HTTPException(404, f"no preview available for track {track_id}")
     return RedirectResponse(url, status_code=302,
                             headers={"Cache-Control": "no-store"})
+
+
+_AUDIO_CHUNK = 64 * 1024
+
+
+def _open_upstream(url: str):
+    """Open the upstream preview URL. Its own function so tests can stub it."""
+    return urllib.request.urlopen(url, timeout=10)
+
+
+@app.get("/preview/{track_id}/audio")
+def preview_audio(track_id: str) -> StreamingResponse:
+    """Stream the Deezer preview mp3 through this server, same-origin.
+
+    Used ONLY by the web SOUND mode, which needs the raw bytes: a browser
+    cannot read samples out of a cross-origin mp3 (decodeAudioData wants the
+    bytes, and Deezer's CDN sends no CORS header), so the spectrogram and
+    self-similarity views must fetch the audio from our own origin. Ordinary
+    playback still uses the 302 above, which keeps 480 KB per play off this
+    host; this route costs that much only when someone opens SOUND mode.
+
+    Cached privately for 10 minutes -- comfortably inside the ~15-minute
+    life of the signed upstream URL, and long enough that flipping between
+    recs doesn't refetch.
+    """
+    url = _fresh_preview(track_id)
+    if url is None:
+        raise HTTPException(404, f"no preview available for track {track_id}")
+    try:
+        upstream = _open_upstream(url)
+    except Exception as exc:  # network flake, 403 on an expired signature, ...
+        raise HTTPException(502, f"upstream preview fetch failed: {exc}") from exc
+
+    def chunks():
+        try:
+            while True:
+                chunk = upstream.read(_AUDIO_CHUNK)
+                if not chunk:
+                    return
+                yield chunk
+        finally:
+            upstream.close()
+
+    return StreamingResponse(
+        chunks(),
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "private, max-age=600"},
+    )
 
 _FIXTURE_PATH = Path(__file__).parents[3] / "contract" / "fixture.json"
 
