@@ -95,13 +95,22 @@ actor APIClient {
         ], as: VizHistogram.self)
     }
 
-    func vizHubs() async throws -> VizHubs {
-        try await get("viz/hubs", as: VizHubs.self)
+    /// GET /viz/hubs?track_id=...&recs=... — whole-corpus hub tracks, narrowed
+    /// to the seed's subset when a seed and its recs are supplied.
+    func vizHubs(seed: String? = nil, recs: [String] = []) async throws -> VizHubs {
+        var query: [URLQueryItem] = []
+        if let seed { query.append(URLQueryItem(name: "track_id", value: seed)) }
+        if !recs.isEmpty { query.append(URLQueryItem(name: "recs", value: recs.joined(separator: ","))) }
+        return try await get("viz/hubs", query: query, as: VizHubs.self)
     }
 
-    /// GET /viz/tour — 8-d PCA coordinates over the seed's subset for the Grand Tour.
-    func vizTour() async throws -> VizTour {
-        try await get("viz/tour", as: VizTour.self)
+    /// GET /viz/tour?track_id=...&recs=... — 8-d PCA coordinates over the
+    /// seed's subset for the Grand Tour.
+    func vizTour(seed: String? = nil, recs: [String] = []) async throws -> VizTour {
+        var query: [URLQueryItem] = []
+        if let seed { query.append(URLQueryItem(name: "track_id", value: seed)) }
+        if !recs.isEmpty { query.append(URLQueryItem(name: "recs", value: recs.joined(separator: ","))) }
+        return try await get("viz/tour", query: query, as: VizTour.self)
     }
 
     /// GET /viz/attribute — per-band occlusion attribution for one pair.
@@ -113,18 +122,26 @@ actor APIClient {
         ], as: VizAttribution.self)
     }
 
-    /// GET /viz/mst — minimum spanning tree over cosine distance (H0 barcode).
-    func vizMST() async throws -> VizMST {
-        try await get("viz/mst", as: VizMST.self)
+    /// GET /viz/mst?track_id=...&recs=... — minimum spanning tree over cosine
+    /// distance (H0 barcode), narrowed to the seed's subset when supplied.
+    func vizMST(seed: String? = nil, recs: [String] = []) async throws -> VizMST {
+        var query: [URLQueryItem] = []
+        if let seed { query.append(URLQueryItem(name: "track_id", value: seed)) }
+        if !recs.isEmpty { query.append(URLQueryItem(name: "recs", value: recs.joined(separator: ","))) }
+        return try await get("viz/mst", query: query, as: VizMST.self)
     }
 
-    /// GET /viz/extremes?pc=...&limit=... — what a principal component sounds
-    /// like: its most negative and most positive tracks.
-    func vizExtremes(pc: Int, limit: Int = 4) async throws -> VizExtremesResponse {
-        try await get("viz/extremes", query: [
+    /// GET /viz/extremes?pc=...&limit=...&track_id=...&recs=... — what a
+    /// principal component sounds like: its most negative and most positive
+    /// tracks, narrowed to the seed's subset when supplied.
+    func vizExtremes(pc: Int, limit: Int = 4, seed: String? = nil, recs: [String] = []) async throws -> VizExtremesResponse {
+        var query = [
             URLQueryItem(name: "pc", value: String(pc)),
             URLQueryItem(name: "limit", value: String(limit)),
-        ], as: VizExtremesResponse.self)
+        ]
+        if let seed { query.append(URLQueryItem(name: "track_id", value: seed)) }
+        if !recs.isEmpty { query.append(URLQueryItem(name: "recs", value: recs.joined(separator: ","))) }
+        return try await get("viz/extremes", query: query, as: VizExtremesResponse.self)
     }
 
     // MARK: - Transport
