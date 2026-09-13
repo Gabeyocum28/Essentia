@@ -17,12 +17,15 @@ function param(initial = 0): StubParam {
 function stubContext() {
   const filters: { type: string; frequency: StubParam; Q: StubParam; connect: unknown }[] = [];
   const gains: { gain: StubParam; connect: unknown }[] = [];
+  /** Every connect/disconnect in order, e.g. ["source", "destination"]. */
   const connections: [string, string][] = [];
+  const disconnections: [string, string][] = [];
   const names = new Map<object, string>();
   const name = (node: object) => names.get(node) ?? "unknown";
+  const label = (to: object) => (to === context.destination ? "destination" : name(to));
 
   const connect = (from: object) => (to: object) => {
-    connections.push([name(from), to === context.destination ? "destination" : name(to)]);
+    connections.push([name(from), label(to)]);
   };
 
   const context = {
@@ -44,23 +47,34 @@ function stubContext() {
     },
   };
 
-  const source = { connect: (_to: object) => {} };
+  const source = {
+    connect: (_to: object) => {},
+    disconnect: (to: object) => {
+      disconnections.push([name(source), label(to)]);
+    },
+  };
   source.connect = connect(source);
   names.set(source, "source");
 
-  return { context: context as unknown as AudioGraphContext, source, filters, gains, connections };
+  return {
+    context: context as unknown as AudioGraphContext,
+    source,
+    filters,
+    gains,
+    connections,
+    disconnections,
+  };
 }
 
-test("builds the filter chain once, wired to destination twice", () => {
+test("builds the filter chain once, alongside the graph's direct connection", () => {
   const { context, source, filters, gains, connections } = stubContext();
   createBandSolo(context, source);
 
   expect(filters).toHaveLength(4);
-  expect(gains).toHaveLength(2);
+  expect(gains).toHaveLength(1); // no bypass gain: the direct source -> destination is the bypass
   expect(filters.map((f) => f.type)).toEqual(["highpass", "highpass", "lowpass", "lowpass"]);
   for (const f of filters) expect(f.Q.value).toBeCloseTo(SOLO_Q, 6);
 
-  // source -> hp -> hp -> lp -> lp -> bandGain -> destination, plus the bypass.
   expect(connections).toEqual([
     ["source", "filter0"],
     ["filter0", "filter1"],
@@ -68,38 +82,37 @@ test("builds the filter chain once, wired to destination twice", () => {
     ["filter2", "filter3"],
     ["filter3", "gain0"],
     ["gain0", "destination"],
-    ["source", "gain1"],
-    ["gain1", "destination"],
   ]);
 });
 
-test("starts bypassed: band gain 0, bypass gain 1", () => {
-  const { context, source, gains } = stubContext();
+test("starts silent on the filter path, leaving the direct connection audible", () => {
+  const { context, source, gains, disconnections } = stubContext();
   const solo = createBandSolo(context, source);
   expect(gains[0].gain.value).toBe(0);
-  expect(gains[1].gain.value).toBe(1);
+  expect(disconnections).toEqual([]);
   expect(solo.band()).toBeNull();
 });
 
-test("setBand updates all four filter frequencies and opens the band path", () => {
-  const { context, source, filters, gains } = stubContext();
+test("setBand updates all four filter frequencies and takes over from the direct path", () => {
+  const { context, source, filters, gains, disconnections } = stubContext();
   const solo = createBandSolo(context, source);
   solo.setBand(240, 1200);
 
   expect(filters.map((f) => f.frequency.value)).toEqual([240, 240, 1200, 1200]);
   expect(gains[0].gain.value).toBe(1);
-  expect(gains[1].gain.value).toBe(0);
+  expect(disconnections).toEqual([["source", "destination"]]);
   expect(solo.band()).toEqual([240, 1200]);
 });
 
-test("setBand re-tunes the same nodes rather than building more", () => {
-  const { context, source, filters, gains } = stubContext();
+test("setBand re-tunes the same nodes rather than building more, and disconnects once", () => {
+  const { context, source, filters, gains, disconnections } = stubContext();
   const solo = createBandSolo(context, source);
   solo.setBand(240, 1200);
   solo.setBand(2000, 6000);
   expect(filters).toHaveLength(4);
-  expect(gains).toHaveLength(2);
+  expect(gains).toHaveLength(1);
   expect(filters.map((f) => f.frequency.value)).toEqual([2000, 2000, 6000, 6000]);
+  expect(disconnections).toHaveLength(1);
 });
 
 test("a reversed or degenerate range is normalized", () => {
@@ -111,12 +124,20 @@ test("a reversed or degenerate range is normalized", () => {
   expect(solo.band()).toEqual([500, 501]);
 });
 
-test("clear() bypasses the filters again", () => {
-  const { context, source, gains } = stubContext();
+test("clear() mutes the filters and restores the direct connection", () => {
+  const { context, source, gains, connections } = stubContext();
   const solo = createBandSolo(context, source);
   solo.setBand(240, 1200);
   solo.clear();
   expect(gains[0].gain.value).toBe(0);
-  expect(gains[1].gain.value).toBe(1);
+  expect(connections.at(-1)).toEqual(["source", "destination"]);
   expect(solo.band()).toBeNull();
+});
+
+test("clear() on an already-bypassed chain doesn't double-connect", () => {
+  const { context, source, connections } = stubContext();
+  const solo = createBandSolo(context, source);
+  const before = connections.length;
+  solo.clear();
+  expect(connections).toHaveLength(before);
 });

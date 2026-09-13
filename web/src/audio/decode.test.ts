@@ -1,4 +1,5 @@
-import { clearAudioCache, loadTrackAudio, toMono } from "./decode";
+import { clearAudioCache, loadTrackAudio, rememberAnalysis, toMono } from "./decode";
+import type { SoundAnalysis } from "./sound";
 
 function stubBuffer(channels: number[][], sampleRate = 44100): AudioBuffer {
   return {
@@ -59,6 +60,31 @@ test("a non-ok response throws", async () => {
   await expect(loadTrackAudio("nope", { context: stubContext(stubBuffer([[0]])) })).rejects.toThrow(
     /404/,
   );
+});
+
+test("a remembered analysis comes back with the cached samples", async () => {
+  const context = stubContext(stubBuffer([[1, 0]]));
+  const analysis = { frameCount: 3 } as unknown as SoundAnalysis;
+
+  await loadTrackAudio("721063", { context });
+  rememberAnalysis("721063", analysis);
+
+  const again = await loadTrackAudio("721063", { context });
+  expect(again.analysis).toBe(analysis);
+  expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+});
+
+test("an evicted track loses its analysis with its samples", async () => {
+  const context = stubContext(stubBuffer([[1, 0]]));
+  await loadTrackAudio("a", { context });
+  rememberAnalysis("a", { frameCount: 3 } as unknown as SoundAnalysis);
+  for (const id of ["b", "c", "d", "e", "f"]) await loadTrackAudio(id, { context });
+
+  expect((await loadTrackAudio("a", { context })).analysis).toBeUndefined();
+});
+
+test("remembering an analysis for an uncached track is a no-op", () => {
+  expect(() => rememberAnalysis("never-loaded", {} as SoundAnalysis)).not.toThrow();
 });
 
 test("toMono averages channels", () => {

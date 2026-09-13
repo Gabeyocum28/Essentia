@@ -29,7 +29,10 @@ export interface BandSolo {
   band(): [number, number] | null;
 }
 
-type AnyNode = { connect(destination: unknown): unknown };
+type AnyNode = {
+  connect(destination: unknown): unknown;
+  disconnect(destination?: unknown): unknown;
+};
 
 function setParam(param: AudioParam, value: number, now: number) {
   // setTargetAtTime where available: a step on a filter frequency during
@@ -39,8 +42,13 @@ function setParam(param: AudioParam, value: number, now: number) {
 }
 
 /**
- * Builds `source -> [hp, hp, lp, lp] -> bandGain -> destination` alongside
- * `source -> bypassGain -> destination`. Solo off = bypass 1, band 0.
+ * Builds `source -> [hp, hp, lp, lp] -> bandGain -> destination` beside the
+ * direct `source -> destination` connection the graph already has.
+ *
+ * That direct connection is the audible default and stays the only live path
+ * until `setBand`, which disconnects it and opens the band gain; `clear()`
+ * puts it back. Muting the filter path rather than disconnecting it keeps the
+ * filters' internal state warm, so re-soloing doesn't thump.
  */
 export function createBandSolo(context: AudioGraphContext, source: AnyNode): BandSolo {
   const hp1 = context.createBiquadFilter();
@@ -48,7 +56,6 @@ export function createBandSolo(context: AudioGraphContext, source: AnyNode): Ban
   const lp1 = context.createBiquadFilter();
   const lp2 = context.createBiquadFilter();
   const bandGain = context.createGain();
-  const bypassGain = context.createGain();
 
   for (const hp of [hp1, hp2]) {
     hp.type = "highpass";
@@ -61,7 +68,6 @@ export function createBandSolo(context: AudioGraphContext, source: AnyNode): Ban
     lp.frequency.value = 20000;
   }
   bandGain.gain.value = 0;
-  bypassGain.gain.value = 1;
 
   source.connect(hp1);
   hp1.connect(hp2);
@@ -70,10 +76,8 @@ export function createBandSolo(context: AudioGraphContext, source: AnyNode): Ban
   lp2.connect(bandGain);
   bandGain.connect(context.destination);
 
-  source.connect(bypassGain);
-  bypassGain.connect(context.destination);
-
   let current: [number, number] | null = null;
+  let directConnected = true; // the graph wired source -> destination
 
   return {
     setBand(lo: number, hi: number) {
@@ -85,13 +89,19 @@ export function createBandSolo(context: AudioGraphContext, source: AnyNode): Ban
       setParam(lp1.frequency, high, now);
       setParam(lp2.frequency, high, now);
       setParam(bandGain.gain, 1, now);
-      setParam(bypassGain.gain, 0, now);
+      if (directConnected) {
+        source.disconnect(context.destination);
+        directConnected = false;
+      }
       current = [low, high];
     },
     clear() {
       const now = context.currentTime ?? 0;
       setParam(bandGain.gain, 0, now);
-      setParam(bypassGain.gain, 1, now);
+      if (!directConnected) {
+        source.connect(context.destination);
+        directConnected = true;
+      }
       current = null;
     },
     band: () => current,

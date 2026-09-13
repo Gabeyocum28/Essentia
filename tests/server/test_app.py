@@ -526,7 +526,11 @@ def test_preview_audio_502s_when_the_upstream_fetch_fails(client, deezer_preview
         raise OSError("connection reset")
 
     monkeypatch.setattr(app_module, "_open_upstream", boom)
-    assert client.get("/preview/721063/audio").status_code == 502
+    r = client.get("/preview/721063/audio")
+    assert r.status_code == 502
+    # Fixed message: the exception text can carry the signed CDN URL.
+    assert r.json()["detail"] == "upstream preview fetch failed"
+    assert "connection reset" not in r.text
 
 
 def test_preview_audio_wins_over_the_spa_fallback(deezer_previews, monkeypatch, tmp_path, fake_mongo):
