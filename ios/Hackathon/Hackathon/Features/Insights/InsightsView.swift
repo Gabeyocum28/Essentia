@@ -102,7 +102,7 @@ final class InsightsModel {
         do {
             try await loadPrimaryMap()
             histogram = try? await api.vizHistogram(trackID: seed.trackID)
-            hubs = try? await api.vizHubs()
+            hubs = try? await api.vizHubs(seed: seed.trackID, recs: map?.recs.map(\.trackID) ?? [])
             proofMap = try? await api.vizMap(
                 trackID: seed.trackID, axis: "surprise", correction: true
             )
@@ -311,7 +311,7 @@ final class InsightsModel {
     func loadTourIfNeeded() async {
         guard tour == nil, tourError == nil else { return }
         do {
-            tour = try await api.vizTour()
+            tour = try await api.vizTour(seed: seed.trackID, recs: map?.recs.map(\.trackID) ?? [])
         } catch {
             tourError = "The grand tour could not be loaded."
         }
@@ -321,7 +321,7 @@ final class InsightsModel {
         await loadTourIfNeeded()
         guard mst == nil, topoError == nil else { return }
         do {
-            mst = try await api.vizMST()
+            mst = try await api.vizMST(seed: seed.trackID, recs: map?.recs.map(\.trackID) ?? [])
         } catch {
             topoError = "The topology graph could not be loaded."
         }
@@ -330,7 +330,7 @@ final class InsightsModel {
     func loadExtremesIfNeeded(pc: Int) async {
         guard extremesByPC[pc] == nil, extremesErrors[pc] == nil else { return }
         do {
-            extremesByPC[pc] = try await api.vizExtremes(pc: pc, limit: 4)
+            extremesByPC[pc] = try await api.vizExtremes(pc: pc, limit: 4, seed: seed.trackID, recs: map?.recs.map(\.trackID) ?? [])
         } catch {
             extremesErrors[pc] = "unavailable"
         }
