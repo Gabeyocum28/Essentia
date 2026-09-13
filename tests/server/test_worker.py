@@ -515,7 +515,7 @@ def test_tick_crawls_only_when_idle_and_rate_limited(fake_mongo, monkeypatch):
     assert crawls == [1]                                            # second tick inside the interval
     store.enqueue_embed("busy")
     monkeypatch.setattr(worker.store, "dequeue_job", lambda timeout=5: ("embed", "busy"))
-    monkeypatch.setattr(worker, "process_job", lambda tid: True)
+    monkeypatch.setattr(worker, "process_jobs", lambda tids: len(tids))
     worker._last_crawl = 0.0
     worker._tick()
     assert crawls == [1]                                            # busy tick never crawls
@@ -526,3 +526,156 @@ def test_crawl_step_stops_at_the_byte_cap(fake_mongo, monkeypatch):
     monkeypatch.setattr(worker.store, "data_size_bytes", lambda: 11)
     monkeypatch.setattr(worker.crawl, "from_charts", lambda *a, **k: _tracks(["1"]))
     assert worker.crawl_step() == 0
+
+
+# ---- embed jobs are claimed and analyzed in groups ----
+
+@pytest.fixture
+def group_ok(monkeypatch, tmp_path):
+    """Queue-independent stubs for a grouped tick: a temp mp3 for every
+    download, and an analyze_tracks that reports how many paths it got."""
+    mp3 = tmp_path / "p.mp3"
+    mp3.write_bytes(b"mp3")
+    monkeypatch.setattr(worker, "download_preview", lambda url: mp3)
+    monkeypatch.setattr(worker.deezer, "get_track",
+                        lambda t: {**TRACK, "track_id": t})
+    calls = []
+    monkeypatch.setattr(worker, "analyze_tracks",
+                        lambda paths: (calls.append(len(paths)),
+                                       [dict(FEATURES) for _ in paths])[1])
+    return calls
+
+
+def _queue_embeds(*ids):
+    for tid in ids:
+        store.put_track_meta({**TRACK, "track_id": tid})
+        store.enqueue_embed(tid)
+
+
+def test_tick_processes_a_group_of_embed_jobs_with_one_analysis_call(fake_mongo,
+                                                                     group_ok):
+    """Three queued tracks leave the loop as one inference group, so their
+    patches can share the fixed 64-patch batch."""
+    _queue_embeds("1", "2", "3")
+
+    worker._tick()
+
+    assert group_ok == [3]
+    assert store.corpus_size() == 3
+    assert store.queued_count() == 0
+
+
+def test_group_is_capped_at_group_size(fake_mongo, group_ok, monkeypatch):
+    """More queued work than GROUP_SIZE: this tick takes exactly GROUP_SIZE
+    and leaves the rest for the next one."""
+    _queue_embeds("1", "2", "3", "4", "5")
+    monkeypatch.setattr(worker, "GROUP_SIZE", 2)
+
+    worker._tick()
+
+    assert group_ok == [2]
+    assert store.queued_count() == 3
+
+
+def test_group_isolates_a_failed_download(fake_mongo, group_ok, monkeypatch,
+                                          tmp_path):
+    """One dead preview fails only its own job: the other two still reach
+    analysis and get stored."""
+    _queue_embeds("1", "2", "3")
+    mp3 = tmp_path / "p.mp3"
+
+    def flaky_download(url):
+        if url.endswith("/2.mp3"):
+            raise OSError("download failed")
+        return mp3
+
+    monkeypatch.setattr(worker, "download_preview", flaky_download)
+    monkeypatch.setattr(
+        worker.deezer, "get_track",
+        lambda t: {**TRACK, "track_id": t, "preview_url": f"http://x/{t}.mp3"},
+    )
+
+    worker._tick()
+
+    assert group_ok == [2]
+    assert_features_match("1", FEATURES)
+    assert_features_match("3", FEATURES)
+    assert store.get_features("2") is None
+    job = fake_mongo.jobs.find_one({"_id": "embed:2"})
+    assert job["state"] == "failed"
+    assert "OSError" in job["error"] and "download failed" in job["error"]
+
+
+def test_group_isolates_a_failed_analysis(fake_mongo, group_ok, monkeypatch):
+    """analyze_tracks reports a per-track failure in that track's slot
+    instead of raising, so the rest of the group is still stored."""
+    _queue_embeds("1", "2")
+    monkeypatch.setattr(worker, "analyze_tracks",
+                        lambda paths: [ValueError("too short"), dict(FEATURES)])
+
+    worker._tick()
+
+    assert store.get_features("1") is None
+    assert_features_match("2", FEATURES)
+    job = fake_mongo.jobs.find_one({"_id": "embed:1"})
+    assert job["state"] == "failed" and "too short" in job["error"]
+
+
+def test_group_unlinks_every_temp_file(fake_mongo, group_ok, monkeypatch,
+                                       tmp_path):
+    """Previews land in temp files; a group must not leak them."""
+    _queue_embeds("1", "2")
+    made = []
+
+    def make_mp3(url):
+        path = tmp_path / f"p{len(made)}.mp3"
+        path.write_bytes(b"mp3")
+        made.append(path)
+        return path
+
+    monkeypatch.setattr(worker, "download_preview", make_mp3)
+
+    worker._tick()
+
+    assert len(made) == 2
+    assert not any(path.exists() for path in made)
+
+
+def test_an_attribution_job_ends_the_group_and_is_still_processed(fake_mongo,
+                                                                  group_ok,
+                                                                  monkeypatch):
+    """A non-embed job claimed while filling a group must not be dropped:
+    the embed group runs first, then the attribution."""
+    _queue_embeds("1", "2")
+    store.enqueue_attribution("42", "43")
+    seen = []
+    monkeypatch.setattr(worker, "process_attribution",
+                        lambda seed, rec: seen.append((seed, rec)) or True)
+
+    worker._tick()
+
+    assert group_ok == [2]
+    assert seen == [("42", "43")]
+    assert store.corpus_size() == 2
+
+
+def test_downloads_in_a_group_run_in_parallel(fake_mongo, group_ok, monkeypatch,
+                                              tmp_path):
+    """Downloads are most of a group's wall clock, so they must overlap: a
+    barrier every download has to reach only clears if they run at once."""
+    import threading
+
+    _queue_embeds("1", "2", "3")
+    mp3 = tmp_path / "p.mp3"
+    barrier = threading.Barrier(3, timeout=10)
+
+    def blocking_download(url):
+        barrier.wait()
+        return mp3
+
+    monkeypatch.setattr(worker, "download_preview", blocking_download)
+
+    worker._tick()
+
+    assert group_ok == [3]
+    assert store.corpus_size() == 3
