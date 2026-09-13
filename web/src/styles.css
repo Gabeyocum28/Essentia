@@ -174,3 +174,35 @@ a { color: var(--accent); }
 .player-artist { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }
 .player-toggle, .player-stop { cursor: pointer; font-size: 16px; padding: 4px 8px; }
+
+/* SOUND mode */
+.sound { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+.sound-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.sound-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sound-artist { color: var(--muted); font-size: 13px; }
+.sound-solo-off { cursor: pointer; color: var(--accent); flex-shrink: 0; }
+.sound-solo-off:disabled { color: var(--muted); cursor: default; }
+.sound-skeleton { height: 200px; border-radius: 12px; background: var(--panel); }
+.sound-row { display: flex; gap: 8px; align-items: stretch; }
+
+.spectrogram { position: relative; flex: 1; height: 200px; border-radius: 12px; overflow: hidden;
+  background: #000; cursor: crosshair; }
+.spectrogram-canvas { display: block; width: 100%; height: 100%; }
+.spectrogram-playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--seed); }
+
+.band-strip { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 56px; }
+.band-strip-track { position: relative; flex: 1; width: 18px; border-radius: 9px; background: var(--panel);
+  border: 1px solid #333; cursor: ns-resize; touch-action: none; }
+.band-strip-selection { position: absolute; left: 0; right: 0; background: var(--accent); opacity: .7;
+  border-radius: 9px; }
+.band-strip-label { color: var(--muted); font-size: 10px; text-align: center; }
+
+.self-similarity { display: flex; justify-content: center; }
+.self-similarity-canvas { display: block; width: 100%; max-width: 320px; aspect-ratio: 1; height: auto;
+  border-radius: 12px; background: #000; cursor: crosshair; }
+
+.why-similar-bar-col { cursor: pointer; padding: 0; }
+.why-similar-bar-col-solo .why-similar-bar { background: var(--seed); }
+.why-similar-note { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.why-similar-solo-off { cursor: pointer; color: var(--accent); }
+.why-similar-solo-off:disabled { color: var(--muted); cursor: default; }

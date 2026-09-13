@@ -10,6 +10,36 @@ function getAudio(): HTMLAudioElement {
   return audio;
 }
 
+// ---- Web Audio graph (used by SOUND mode's band solo) ----
+//
+// The element plays directly until something needs to filter it. A
+// MediaElementAudioSourceNode can only be created ONCE per element and, once
+// created, the element's own output is silenced unless the graph routes it
+// to destination — so this is lazy, cached, and only ever called from a user
+// gesture (Safari refuses to start a context otherwise).
+
+let graph: { context: AudioContext; source: MediaElementAudioSourceNode } | null = null;
+
+export function attachGraph(): { context: AudioContext; source: MediaElementAudioSourceNode } | null {
+  if (graph) {
+    void graph.context.resume?.();
+    return graph;
+  }
+  const Ctor =
+    globalThis.AudioContext ??
+    (globalThis as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!Ctor) return null;
+  try {
+    const context = new Ctor();
+    const source = context.createMediaElementSource(getAudio());
+    graph = { context, source };
+    void context.resume?.();
+    return graph;
+  } catch {
+    return null; // no Web Audio here; playback keeps working, unfiltered
+  }
+}
+
 interface PlayerState {
   nowPlaying: Track | null;
   isPlaying: boolean;
@@ -18,6 +48,8 @@ interface PlayerState {
   play(track: Track): void;
   toggle(): void;
   stop(): void;
+  /** Jump to a fraction (0…1) of the current track. */
+  seek(progress: number): void;
 }
 
 const PlayerContext = createContext<PlayerState | null>(null);
@@ -101,6 +133,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const seek = useCallback((next: number) => {
+    const el = getAudio();
+    if (!nowPlayingRef.current || !(el.duration > 0)) return;
+    const clamped = Math.max(0, Math.min(1, next));
+    el.currentTime = clamped * el.duration;
+    setProgress(clamped);
+  }, []);
+
   const stop = useCallback(() => {
     const el = getAudio();
     el.pause();
@@ -114,7 +154,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <PlayerContext.Provider value={{ nowPlaying, isPlaying, progress, errorMessage, play, toggle, stop }}>
+    <PlayerContext.Provider value={{ nowPlaying, isPlaying, progress, errorMessage, play, toggle, stop, seek }}>
       {children}
     </PlayerContext.Provider>
   );
