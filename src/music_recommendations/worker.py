@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from music_recommendations.analysis import analyze_tracks
 from music_recommendations.corpus import crawl
 from music_recommendations.server import deezer, store, viz
+from music_recommendations.server.dedupe import dedupe_key
 
 CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "300000"))
 CORPUS_BYTES_CAP = int(os.environ.get("CORPUS_BYTES_CAP", str(450 * 1024 * 1024)))
@@ -347,23 +348,47 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
             mp3.unlink(missing_ok=True)
 
 
+# How many candidates the last _enqueue_new call dropped as duplicates of a
+# recording already in the corpus (or of an earlier candidate in the same
+# batch). Module state rather than a second return value so the crawler can
+# report it without changing _enqueue_new's contract with its other callers.
+_last_duplicates_skipped = 0
+
+
 def _enqueue_new(tracks: list[dict]) -> int:
     """Store metadata and queue every track we have not analyzed; count queued.
 
     Skips tracks whose embed job already failed permanently -- otherwise a
     crawl just keeps re-discovering and re-enqueueing the same broken
     tracks (dead preview, unsupported codec, ...) forever.
+
+    Also skips a candidate that is another EDITION of a recording we
+    already hold -- the 2009 remaster, the live take, the "(feat. X)"
+    credit. Deezer publishes those under their own track ids, so the id and
+    feature checks above see a brand new track and the corpus grows by a
+    copy. One `existing_keys` query covers the whole batch, and keys seen
+    earlier in the same batch are remembered locally: charts routinely
+    return two editions side by side, and neither is in the store yet.
     """
+    global _last_duplicates_skipped
     ids = [track["track_id"] for track in tracks]
+    keys = [dedupe_key(track.get("title"), track.get("artist")) for track in tracks]
     features = store.get_many_features(ids)
     failed = store.failed_ids(ids)
+    seen = store.existing_keys(keys)
     queued = 0
-    for track, track_features in zip(tracks, features):
+    duplicates = 0
+    for track, track_features, key in zip(tracks, features, keys):
         if track_features is not None or track["track_id"] in failed:
             continue
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
         store.put_track_meta(track)
         if store.enqueue_embed(track["track_id"]):
             queued += 1
+    _last_duplicates_skipped = duplicates
     return queued
 
 
@@ -444,7 +469,8 @@ def crawl_step() -> int:
     if grow_from is not None:
         _grow_roots(roots, grow_from)
     store.put_state("crawl", {"step": step + 1})
-    print(f"[worker] crawl {source}: {len(tracks)} candidates, {n} queued"
+    print(f"[worker] crawl {source}: {len(tracks)} candidates, {n} queued, "
+          f"{_last_duplicates_skipped} duplicates skipped"
           f"  db {size/1e6:.1f} MB", flush=True)
     return n
 

@@ -125,6 +125,68 @@ def test_tracks_since_returns_only_newer(fake_mongo):
     assert store.tracks_since(store._now() + timedelta(seconds=1)) == []
 
 
+# ---- dedupe ----
+
+def test_put_stores_the_dedupe_key(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    assert fake_mongo.tracks.find_one({"_id": "42"})["dedupe_key"] == \
+        "miles davis|blue in green"
+    # ... and it never leaks into a contract response.
+    assert "dedupe_key" not in store.get_track("42")
+
+
+def test_put_track_meta_stores_the_dedupe_key(fake_mongo):
+    store.put_track_meta({**TRACK, "track_id": "43",
+                          "title": "Blue in Green (2005 Remaster)"})
+    assert fake_mongo.tracks.find_one({"_id": "43"})["dedupe_key"] == \
+        "miles davis|blue in green"
+
+
+def test_existing_keys_reports_only_keys_already_stored(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    got = store.existing_keys(["miles davis|blue in green", "miles davis|so what"])
+    assert got == {"miles davis|blue in green"}
+    assert store.existing_keys([]) == set()
+
+
+def test_existing_keys_ignores_retired_duplicates(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    store.mark_duplicate("42", "primary")
+    assert store.existing_keys(["miles davis|blue in green"]) == set()
+
+
+def test_marked_duplicate_leaves_the_live_corpus(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    store.put_track({**TRACK, "track_id": "43",
+                     "title": "Blue in Green (2005 Remaster)"}, FEATURES)
+    stamp = store.get_analyzed_at("42")
+    assert sorted(store.corpus_ids()) == ["42", "43"]
+
+    store.mark_duplicate("43", "42")
+
+    assert store.corpus_ids() == ["42"]
+    assert store.base_matrix()[0] == ["42"]
+    assert [tid for tid, _ in store.tracks_since(stamp)] == ["42"]
+    assert fake_mongo.tracks.find_one({"_id": "43"})["duplicate_of"] == "42"
+
+
+def test_retired_duplicate_can_still_be_seeded(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    store.mark_duplicate("42", "primary")
+    # An explicit seed of a retired id still ranks: only the corpus
+    # ENUMERATION drops it.
+    assert store.get_features("42") is not None
+    assert store.get_many_features(["42"])[0] is not None
+    assert store.get_track("42") is not None
+
+
+def test_ensure_indexes_covers_the_dedupe_key(fake_mongo):
+    store.ensure_indexes()
+    indexed = {entry[0] if isinstance(entry, (list, tuple)) else entry
+               for info in fake_mongo.tracks.index_information().values()
+               for entry in info["key"]}
+    assert {"analyzed_at", "dedupe_key"} <= indexed
+
 
 # ---- jobs ----
 

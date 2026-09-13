@@ -177,6 +177,47 @@ def seeded_corpus(fake_mongo):
     return tracks
 
 
+# One recording per entry except where the title (or the embedding) says
+# otherwise: d1 is the seed again, a2 is a1 again, e2 is e1 again, and c1 is
+# a genuine cover of a1 by another artist.
+VIZ_DUPLICATES = [
+    ("s",  "So What",                               "Miles Davis", 0.0),
+    ("d1", "So What (2009 Remaster)",               "Miles Davis", 0.02),
+    ("a1", "Blue in Green",                         "Miles Davis", 0.4),
+    ("a2", "Blue in Green - Live at the Blackhawk", "Miles Davis", 0.6),
+    ("c1", "Blue in Green",                         "Bill Evans",  0.8),
+    ("e1", "Flamenco Sketches",                     "Miles Davis", 1.2),
+    ("e2", "Sketches of Flamenco",                  "Nobody Else", 1.22),
+    ("f1", "All Blues",                             "Miles Davis", 1.6),
+]
+
+
+@pytest.fixture
+def duplicate_corpus(fake_mongo):
+    for track_id, title, artist, theta in VIZ_DUPLICATES:
+        v = [0.0] * 1280
+        v[0], v[1] = float(np.cos(theta)), float(np.sin(theta))
+        store.put_track({**TRACK, "track_id": track_id, "title": title,
+                         "artist": artist}, {"embedding": v})
+    return VIZ_DUPLICATES
+
+
+def _viz_rec_ids(client, **params):
+    body = client.get("/viz/map", params={"track_id": "s", "axis": "sounds_like",
+                                          **params}).json()
+    return [rec["track_id"] for rec in body["recs"]]
+
+
+def test_viz_map_returns_each_recording_once(client, duplicate_corpus):
+    """Insights explains the list /recommend served, so it collapses the same
+    duplicates -- by key, and by near-identical embedding."""
+    assert _viz_rec_ids(client, limit=10) == ["a1", "c1", "e1", "f1"]
+
+
+def test_viz_map_widens_the_scan_to_stay_limit_long(client, duplicate_corpus):
+    assert _viz_rec_ids(client, limit=3) == ["a1", "c1", "e1"]
+
+
 def test_viz_map_404_when_seed_unanalyzed(client, fake_mongo):
     resp = client.get("/viz/map", params={"track_id": "nope", "axis": "sounds_like"})
     assert resp.status_code == 404

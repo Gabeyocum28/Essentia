@@ -180,13 +180,22 @@ def test_viz_map_skips_a_rec_analyzed_after_the_snapshot(client, fake_mongo,
     rather than forcing a refresh -- and the list is still `limit` long,
     because the filter runs before the truncation."""
     monkeypatch.setattr(app_module, "VIZ_MAX", 50)
+    # Distinct titles: tracks that share a title and an artist are one
+    # recording as far as the result loops are concerned, and would be
+    # collapsed out of both lists before this test could say anything.
+    # Spread around a circle, 0.2 rad apart: [1.0, 5.0 + i] put every track
+    # within 0.9995 cosine of its neighbour, which the result loops now read
+    # as one recording repeated 30 times. Distinct titles for the same
+    # reason -- a shared title and artist is a shared dedupe key.
     for i in range(30):
-        store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, 5.0 + i]})
+        store.put_track({**TRACK, "track_id": f"t{i}", "title": f"Track {i}"},
+                        {"embedding": [float(np.cos(i * 0.2)),
+                                       float(np.sin(i * 0.2))]})
     client.get("/viz/tour?track_id=t0")
     before = app_module._VIZ_SNAPSHOT
     # A near-duplicate of the seed, so it would otherwise rank first.
-    store.put_track({**TRACK, "track_id": "twin"}, {"embedding": [1.0, 5.0]})
+    store.put_track({**TRACK, "track_id": "twin", "title": "Twin"},
+                    {"embedding": [float(np.cos(0.01)), float(np.sin(0.01))]})
 
     recommended = client.get(
         "/recommend?track_id=t0&axis=sounds_like&limit=3").json()["results"]
@@ -265,7 +274,8 @@ def test_tracks_cached_is_bounded(fake_mongo, monkeypatch):
 
 def test_recommend_fetches_tracks_in_one_batch(client, fake_mongo, monkeypatch):
     for i in range(4):
-        store.put_track({**TRACK, "track_id": f"t{i}"},
+        # Distinct titles: same title + same artist reads as one recording.
+        store.put_track({**TRACK, "track_id": f"t{i}", "title": f"Track {i}"},
                         {"embedding": [1.0, i / 3.0]})
     calls = []
     real = store.get_many_tracks
@@ -277,7 +287,7 @@ def test_recommend_fetches_tracks_in_one_batch(client, fake_mongo, monkeypatch):
     assert r.status_code == 200
     results = r.json()["results"]
     assert len(results) == 3
-    assert all(t["title"] == TRACK["title"] for t in results)   # real metadata
+    assert all(t["title"].startswith("Track ") for t in results)  # real metadata
     assert all(t["artist"] == TRACK["artist"] for t in results)
     assert len(calls) == 1
 
@@ -336,7 +346,11 @@ def test_viz_map_compact_reads_only_the_tracks_it_names(client, fake_mongo,
     body = client.get(
         "/viz/map?track_id=t0&axis=sounds_like&limit=3&points=compact").json()
     assert len(calls) == 1
-    assert set(calls[0]) == {"t0", *(r["track_id"] for r in body["recs"])}
+    # The seed and the recs, plus the few extra candidates the duplicate
+    # collapse had to look at (and read a title/artist for) to fill the
+    # list -- bounded by _scan_width, nowhere near the whole subset.
+    assert {"t0", *(r["track_id"] for r in body["recs"])} <= set(calls[0])
+    assert len(calls[0]) <= 1 + app_module._scan_width(3)
 
 
 def test_viz_map_rejects_an_unknown_points_mode(client, fake_mongo):

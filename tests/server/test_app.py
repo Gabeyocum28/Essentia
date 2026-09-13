@@ -1,5 +1,6 @@
 """app.py: the four contract routes, mock-first with the store + analysis real path."""
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from music_recommendations.server import app as app_module
 from music_recommendations.server import store
-from contract.features import AXES, FEATURE_KEYS
+from contract.features import AXES, FEATURE_KEYS, TRACK_FIELDS
 
 FIXTURE = json.loads(
     (Path(__file__).parents[2] / "contract" / "fixture.json").read_text()
@@ -206,6 +207,91 @@ def test_seed_unknown_track_404(client, fake_mongo, monkeypatch):
     assert client.post("/seed", json={"track_id": "doesnotexist"}).status_code == 404
 
 
+# ---- /recommend: duplicate collapsing ----
+#
+# Deezer publishes one recording under several ids; the corpus can hold the
+# remaster, the live take and the plain release side by side. The result
+# list must show each RECORDING once -- while still showing a genuine cover
+# by another artist.
+
+def _angled(theta: float) -> dict:
+    """A unit embedding at `theta` radians from the seed: the cosine between
+    two of these is exactly cos(theta_a - theta_b), so a test can ask for a
+    near-identical pair (0.9998) or a plain neighbour (0.92) by angle."""
+    v = [0.0] * FEATURE_KEYS["embedding"]
+    v[0] = math.cos(theta)
+    v[1] = math.sin(theta)
+    return {"embedding": v}
+
+
+# id, title, artist, angle from the seed (radians)
+DUPLICATES = [
+    ("s",  "So What",                               "Miles Davis", 0.0),
+    ("d1", "So What (2009 Remaster)",               "Miles Davis", 0.02),
+    ("a1", "Blue in Green",                         "Miles Davis", 0.4),
+    ("a2", "Blue in Green - Live at the Blackhawk", "Miles Davis", 0.6),
+    ("c1", "Blue in Green",                         "Bill Evans",  0.8),
+    ("e1", "Flamenco Sketches",                     "Miles Davis", 1.2),
+    ("e2", "Sketches of Flamenco",                  "Nobody Else", 1.22),
+    ("f1", "All Blues",                             "Miles Davis", 1.6),
+]
+# One entry per distinct recording, in ranked order: a1 and c1 share a title
+# but not an artist (a cover), a2 is a1 again, d1 is the seed again, and e2
+# is e1 again under a title that does not say so.
+DISTINCT = ["a1", "c1", "e1", "f1"]
+
+
+@pytest.fixture
+def duplicate_corpus(fake_mongo):
+    for track_id, title, artist, theta in DUPLICATES:
+        store.put_track({"track_id": track_id, "title": title, "artist": artist,
+                         "album": "Kind of Blue", "artwork_url": "u"},
+                        _angled(theta))
+    return DUPLICATES
+
+
+def _rec_ids(client, **params):
+    body = client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
+                                            **params}).json()
+    return [t["track_id"] for t in body["results"]]
+
+
+def test_recommend_returns_each_recording_once(client, duplicate_corpus):
+    assert _rec_ids(client) == DISTINCT
+
+
+def test_recommend_never_returns_the_seeds_own_re_release(client, duplicate_corpus):
+    assert "d1" not in _rec_ids(client)
+    assert "d1" not in _rec_ids(client, axis="surprise")
+
+
+def test_recommend_keeps_a_cover_by_another_artist(client, duplicate_corpus):
+    # c1 is "Blue in Green" by Bill Evans: same title as a1, different
+    # artist, cosine 0.92 -- a real recommendation, not a re-release.
+    assert "c1" in _rec_ids(client)
+
+
+def test_recommend_drops_a_near_identical_embedding(client, duplicate_corpus):
+    # e2's title and artist say nothing, but it sits 0.02 rad from e1
+    # (cosine 0.9998) -- the same recording under another name.
+    ids = _rec_ids(client)
+    assert "e1" in ids and "e2" not in ids
+
+
+def test_recommend_widens_the_scan_to_stay_limit_long(client, duplicate_corpus):
+    # Three distinct recordings exist above the duplicates, so a limit of 3
+    # must still come back three long rather than short by the skips.
+    assert _rec_ids(client, limit=3) == DISTINCT[:3]
+
+
+def test_recommend_results_carry_exactly_the_contract_fields(client, duplicate_corpus):
+    body = client.get("/recommend", params={"track_id": "s", "axis": "sounds_like"}).json()
+    # dedupe_key is stored on every track document; it must never reach a
+    # response, here or anywhere else.
+    for track in body["results"]:
+        assert set(track) == set(TRACK_FIELDS) | {"score"}
+
+
 # ---- /recommend ----
 
 def test_recommend_returns_scored_tracks_excluding_seed(client, seeded_corpus):
@@ -307,7 +393,10 @@ def test_a_track_analyzed_after_the_first_request_still_appears(client, seeded_c
     assert len(first) == 4
 
     late = FIXTURE[5]
-    store.put_track(late, fake_features(0.5))
+    # 1.5, not 0.5: seeded_corpus already holds a track at 0.5, and an
+    # identical embedding is now collapsed out of the result list as the
+    # same recording. This test is about the matrix cache, not dedupe.
+    store.put_track(late, fake_features(1.5))
 
     second = client.get("/recommend", params={"track_id": seed, "axis": "sounds_like",
                                               "limit": 10}).json()["results"]
