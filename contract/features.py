@@ -10,6 +10,14 @@ TRACK_FIELDS = frozenset(
     {"track_id", "title", "artist", "album", "artwork_url", "preview_url"}
 )
 
+# Keys a Track MAY additionally carry, and only when the value exists:
+#   source           which catalogue it came from ("deezer", "jamendo", ...)
+#   attribution_url  the backlink a Creative Commons licence obliges the
+#                    client to show; absent for sources that require none
+# Absent, not null, when there is nothing to say -- so a client can test for
+# the key. Clients must tolerate both keys being missing.
+TRACK_OPTIONAL_FIELDS = frozenset({"source", "attribution_url"})
+
 # GET /axes returns exactly this, in this order.
 AXES = [
     {"id": "sounds_like", "label": "More sounds like this"},

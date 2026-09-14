@@ -96,20 +96,63 @@ def ensure_indexes() -> None:
 # ---- tracks ----
 
 def _contract(doc: dict) -> dict:
-    return {"track_id": doc["_id"], **{k: doc.get(k) for k in TRACK_FIELDS},
-            "preview_url": ""}
+    """The document as a Track: the contract fields, plus the two optional
+    ones when this row has them (contract.features.TRACK_OPTIONAL_FIELDS).
+
+    Only `attribution.url` is published, not the whole attribution object:
+    the licence deed and the source name are already implied by the link and
+    the `source` field, and the contract fixes what a Track may carry.
+    Absent, never null, when there is nothing to say.
+    """
+    out = {"track_id": doc["_id"], **{k: doc.get(k) for k in TRACK_FIELDS},
+           "preview_url": ""}
+    if doc.get("source"):
+        out["source"] = doc["source"]
+    url = (doc.get("attribution") or {}).get("url")
+    if url:
+        out["attribution_url"] = url
+    return out
+
+
+def _source_of(track: dict) -> str:
+    """Which catalogue a track came from.
+
+    An explicit `source` wins; otherwise it is read off the id, where a
+    namespaced `"jamendo:42"` names its own source and a bare `"42"` is
+    Deezer (corpus/sources/base.py explains why Deezer ids stay bare).
+    """
+    name = track.get("source")
+    if name:
+        return str(name)
+    prefix, sep, _local = str(track.get("track_id") or "").partition(":")
+    return prefix if sep and prefix else "deezer"
 
 
 def _meta(track: dict) -> dict:
-    """The contract fields plus the dedupe key derived from them.
+    """The contract fields plus the dedupe key derived from them, the
+    source, and the attribution the source handed over.
 
     `dedupe_key` is stored, not computed on read, so the crawler's
     "have we got this recording already?" question is one indexed `$in`
     instead of a scan. It is NOT a contract field: _contract() projects
     TRACK_FIELDS only, so it can never reach a response.
+
+    `attribution` is stored whole and published narrow (see _contract): if
+    the clients ever need the licence deed as well as the backlink, the row
+    already has it and no re-crawl is needed.
     """
-    return {**{k: track.get(k) for k in TRACK_FIELDS},
-            "dedupe_key": dedupe_key(track.get("title"), track.get("artist"))}
+    out = {**{k: track.get(k) for k in TRACK_FIELDS},
+           "dedupe_key": dedupe_key(track.get("title"), track.get("artist")),
+           "source": _source_of(track)}
+    attribution = track.get("attribution")
+    if attribution:
+        out["attribution"] = attribution
+    return out
+
+
+# What every Track read projects: the contract fields plus the two optional
+# ones _contract may publish.
+_TRACK_PROJECTION = {**{k: 1 for k in TRACK_FIELDS}, "source": 1, "attribution": 1}
 
 
 # A track that is analyzed and has not been retired as a duplicate of
@@ -167,7 +210,7 @@ def put_track_meta(track: dict) -> None:
 
 
 def get_track(track_id: str) -> dict | None:
-    doc = db().tracks.find_one({"_id": track_id}, {k: 1 for k in TRACK_FIELDS})
+    doc = db().tracks.find_one({"_id": track_id}, _TRACK_PROJECTION)
     return _contract(doc) if doc else None
 
 
@@ -175,7 +218,7 @@ def get_many_tracks(track_ids: list[str]) -> list[dict | None]:
     if not track_ids:
         return []
     found = {d["_id"]: _contract(d) for d in
-             db().tracks.find({"_id": {"$in": track_ids}}, {k: 1 for k in TRACK_FIELDS})}
+             db().tracks.find({"_id": {"$in": track_ids}}, _TRACK_PROJECTION)}
     return [found.get(t) for t in track_ids]
 
 
