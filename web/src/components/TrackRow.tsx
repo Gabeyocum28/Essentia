@@ -1,4 +1,5 @@
 import { Artwork } from "./Artwork";
+import { Attribution } from "./Attribution";
 import { usePlayer } from "../player/usePlayer";
 import type { Track } from "../api/types";
 
@@ -25,15 +26,21 @@ export function TrackRow({ track, onSelect, showScore }: Props) {
         ▶
       </button>
       <Artwork url={track.artwork_url} size={56} />
-      <button
-        type="button"
-        className="track-row-info"
-        onClick={() => onSelect?.(track)}
-        disabled={!onSelect}
-      >
-        <div className="track-row-title">{track.title}</div>
-        <div className="track-row-artist">{track.artist}</div>
-      </button>
+      {/* The credit is a sibling of the select button, not a child: a link
+          inside a button is invalid HTML and the browser would swallow the
+          click on one of them. */}
+      <div className="track-row-body">
+        <button
+          type="button"
+          className="track-row-info"
+          onClick={() => onSelect?.(track)}
+          disabled={!onSelect}
+        >
+          <div className="track-row-title">{track.title}</div>
+          <div className="track-row-artist">{track.artist}</div>
+        </button>
+        <Attribution track={track} />
+      </div>
       {showScore && track.score !== undefined && (
         <span className="mono track-row-score">{track.score.toFixed(4)}</span>
       )}

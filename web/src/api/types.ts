@@ -1,5 +1,9 @@
+// `source` and `attribution_url` are the contract's optional Track fields
+// (contract/features.py TRACK_OPTIONAL_FIELDS): a Creative Commons source
+// requires a credit and a backlink, Deezer sends neither.
 export interface Track { track_id: string; title: string; artist: string; album: string;
-  artwork_url: string | null; preview_url: string | null; score?: number; }
+  artwork_url: string | null; preview_url: string | null; score?: number;
+  source?: string; attribution_url?: string | null; }
 export interface Axis { id: string; label: string; }
 export interface SeedResponse { track_id: string; status: "ready" | "unanalyzed"; }
 export interface RecommendResponse { seed_track_id: string; axis: string; results: Track[]; }

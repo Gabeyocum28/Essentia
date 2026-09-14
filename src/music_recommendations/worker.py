@@ -1,9 +1,13 @@
 """The one background process: embed queued tracks, answer attribution jobs,
-and grow the corpus by crawling Deezer whenever the queue is empty.
+and grow the corpus by crawling the active sources whenever the queue is
+empty.
 
     python -m music_recommendations.worker
 
 Runs on the VM next to the API (deploy/docker-compose.yml). Needs MONGODB_URI.
+
+Which catalogues it crawls is SOURCES (default `deezer`); see
+corpus/sources/__init__.py.
 """
 from __future__ import annotations
 
@@ -18,8 +22,8 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from music_recommendations.analysis import analyze_tracks
-from music_recommendations.corpus import crawl
-from music_recommendations.server import deezer, store, viz
+from music_recommendations.corpus import sources
+from music_recommendations.server import store, viz
 from music_recommendations.server.dedupe import dedupe_key
 
 CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "300000"))
@@ -70,13 +74,22 @@ def _to_plain(features: dict) -> dict:
 
 
 def _fresh_track(track_id: str) -> dict | None:
-    """Fetch straight from Deezer: preview URLs expire in ~15 min (hdnea
-    token), so a job that waited in the queue would 403 on download if we
-    trusted a stored URL. There is no usable fallback to the store's own
-    record -- store.get_track() always answers "" for preview_url (it is
-    never persisted) -- so a Deezer failure here fails the job outright."""
+    """Fetch straight from the source that owns the id.
+
+    Deezer preview URLs expire in ~15 min (hdnea token), so a job that
+    waited in the queue would 403 on download if we trusted a stored URL.
+    There is no usable fallback to the store's own record --
+    store.get_track() always answers "" for preview_url (it is never
+    persisted) -- so a source failure here fails the job outright.
+
+    The track comes back carrying its `source` and, where the licence asks
+    for one, its `attribution`; store._meta persists both.
+    """
+    source = sources.for_id(track_id)
+    if source is None:
+        return None
     try:
-        return deezer.get_track(track_id)
+        return source.track(track_id)
     except Exception:
         return None
 
@@ -403,39 +416,19 @@ def seed_fixture_if_empty() -> int:
     return n
 
 
-def _grow_roots(roots: list[str], tracks: list[dict]) -> None:
-    """Add up to 5 newly-discovered artist names to the `crawl_roots` state,
-    so the snowball/deep-cuts graph expands from what the corpus actually
-    contains instead of staying pinned to the 8 seed roots forever."""
-    discovered = []
-    for track in tracks:
-        name = track.get("artist")
-        if name and name not in roots and name not in discovered:
-            discovered.append(name)
-        if len(discovered) >= 5:
-            break
-    if not discovered:
-        return
-    state = store.get_state("crawl_roots") or {"names": []}
-    names = list(state.get("names", []))
-    for name in discovered:
-        if name not in names:
-            names.append(name)
-    store.put_state("crawl_roots", {"names": names[:200]})
-
-
 def crawl_step() -> int:
-    """One bounded slice of crawling, rotating over three sources: a genre
-    chart, one root's snowball neighbours, or a root's deep album cuts.
+    """One bounded slice of crawling, round-robin across the active sources.
 
-    Breadth (charts across genres), depth (the artist-relatedness graph),
-    and obscurity (album tracks that never show up in a /top or /related
-    call) all keep growing this way. The cursor lives in Atlas so a restart
-    continues where it left off.
+    Each source decides what its own slice is (`Source.candidates`): for
+    Deezer that is the chart / snowball / deep-cuts rotation, for Jamendo a
+    tag list. The cursor lives in Atlas so a restart continues where it left
+    off, and it is divided by the number of sources before being handed
+    over, so every source walks its own rotation one step at a time rather
+    than skipping N-1 of them.
 
-    Runs inline in `_tick`, so a slow Deezer response (or backoff) delays
-    job processing by up to a few minutes -- acceptable for a background
-    crawl, not for the embed/attribution queue it shares the loop with.
+    Runs inline in `_tick`, so a slow API response (or backoff) delays job
+    processing by up to a few minutes -- acceptable for a background crawl,
+    not for the embed/attribution queue it shares the loop with.
     """
     size = store.data_size_bytes()
     if size >= CORPUS_BYTES_CAP or store.corpus_size() >= CORPUS_CAP \
@@ -443,34 +436,18 @@ def crawl_step() -> int:
         if size >= CORPUS_BYTES_CAP:
             print(f"[worker] byte cap reached: {size/1e6:.1f} MB of {CORPUS_BYTES_CAP/1e6:.0f} MB", flush=True)
         return 0
+    active = sources.active()
+    if not active:
+        print("[worker] crawl: no active sources", flush=True)
+        return 0
     state = store.get_state("crawl") or {"step": 0}
     step = int(state.get("step", 0))
-    genres = list(crawl.GENRES)
-    roots_state = store.get_state("crawl_roots")
-    roots = crawl.ROOTS + (roots_state["names"] if roots_state else [])
-    arm = step % 3
-    grow_from = None
-    if arm == 0:
-        genre = genres[(step // 3) % len(genres)]
-        tracks = crawl.from_charts([genre], per_genre=100)
-        source = f"chart {crawl.GENRES[genre]}"
-        grow_from = tracks
-    elif arm == 1:
-        root = roots[(step // 3) % len(roots)]
-        tracks = crawl.snowball([root], hops=1, per_artist=10)
-        source = f"snowball {root}"
-        grow_from = tracks
-    else:
-        root = roots[(step // 3) % len(roots)]
-        ids = crawl.resolve_artists([root])
-        tracks = list(crawl.deep_cuts(ids, albums_per_artist=3))
-        source = f"deep cuts {root}"
+    source = active[step % len(active)]
+    tracks = source.candidates(step // len(active))
     n = _enqueue_new(tracks)
-    if grow_from is not None:
-        _grow_roots(roots, grow_from)
     store.put_state("crawl", {"step": step + 1})
-    print(f"[worker] crawl {source}: {len(tracks)} candidates, {n} queued, "
-          f"{_last_duplicates_skipped} duplicates skipped"
+    print(f"[worker] crawl {source.candidate_label()}: {len(tracks)} candidates, "
+          f"{n} queued, {_last_duplicates_skipped} duplicates skipped"
           f"  db {size/1e6:.1f} MB", flush=True)
     return n
 
@@ -564,6 +541,11 @@ def main() -> None:
         while True:
             time.sleep(60)
     print("[worker] up: embed + attribution jobs, crawling when idle (Ctrl-C to stop)", flush=True)
+    # Deliberately not guarded: a typo in SOURCES, or Jamendo as the only
+    # source with no client id, must stop the process here rather than
+    # surface as a crawl that silently never yields anything.
+    print(f"[worker] sources: {', '.join(s.name for s in sources.active())}",
+          flush=True)
     try:
         seed_fixture_if_empty()
     except Exception as exc:  # noqa: BLE001

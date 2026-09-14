@@ -35,7 +35,8 @@ from contract.features import AXES
 from music_recommendations.analysis import analyze_track, frontend
 from music_recommendations.analysis.feel import FEEL_KEYS
 from music_recommendations.analysis.schema import METRICS
-from music_recommendations.server import deezer, dedupe, store, viz
+from music_recommendations.corpus import sources
+from music_recommendations.server import dedupe, store, viz
 from music_recommendations.server.axes import AXIS_FEATURES, BLENDED_AXES
 
 
@@ -121,12 +122,58 @@ def _playable(track: dict | None) -> dict | None:
     return {**track, "preview_url": f"{base}/preview/{track['track_id']}"}
 
 
+def _public_track(track: dict) -> dict:
+    """A source's Track narrowed to what the contract publishes.
+
+    Sources hand back the contract fields plus `source` and the full
+    `attribution` object; only the backlink out of that object is a contract
+    field (`attribution_url`), and a source may carry extra keys of its own.
+    Search results do not go through the store, so this is where that
+    narrowing happens for them.
+    """
+    out = {"track_id": track.get("track_id"),
+           **{k: track.get(k) for k in store.TRACK_FIELDS},
+           "preview_url": track.get("preview_url")}
+    if track.get("source"):
+        out["source"] = track["source"]
+    url = (track.get("attribution") or {}).get("url") or track.get("attribution_url")
+    if url:
+        out["attribution_url"] = url
+    return out
+
+
+def _from_source(track_id: str) -> dict | None:
+    """This track straight from the catalogue that owns its id, or None.
+
+    Used when the store has never seen the id -- a track the user searched
+    up that the crawler has not reached. A source failure is None, not a
+    500: /seed has a fixture fallback behind this.
+    """
+    source = sources.for_id(track_id)
+    if source is None:
+        return None
+    try:
+        found = source.track(track_id)
+    except Exception:
+        return None
+    return _public_track(found) if found else None
+
+
 def _fresh_preview(track_id: str) -> str | None:
-    """A signed, currently-valid preview URL, from cache or from Deezer."""
+    """A currently-playable URL for this track, from cache or from its source.
+
+    The id says which catalogue to ask (sources.for_id): Deezer ids are bare
+    digits and have to be re-signed every few minutes; a `jamendo:...` id
+    resolves to a stable CC-licensed audio URL. An id from a source this
+    build does not know gets None, which the callers turn into a 404.
+    """
     cached = _safe(store.get_cached_preview, track_id)
     if cached:
         return cached
-    url = deezer.fresh_preview_url(track_id)
+    source = sources.for_id(track_id)
+    if source is None:
+        return None
+    url = source.preview_url(track_id)
     if url:
         _safe(store.put_cached_preview, track_id, url)
     return url
@@ -279,9 +326,8 @@ def _remember_track(track: dict | None) -> dict | None:
     if not track or not track.get("track_id"):
         return None
     track_id = track["track_id"]
-    entry = {"track_id": track_id,
-             **{key: track.get(key) for key in store.TRACK_FIELDS},
-             "preview_url": ""}
+    entry = _public_track(track)
+    entry["preview_url"] = ""
     with _TRACK_META_LOCK:
         _TRACK_META[track_id] = entry
         _TRACK_META.move_to_end(track_id)
@@ -334,17 +380,34 @@ def get_axes() -> dict:
 
 @app.get("/search")
 def search(q: str) -> dict:
+    """Every switched-on source, concatenated in SOURCES order.
+
+    Per-source failures are tolerated -- one catalogue being down must not
+    empty a search that another could answer -- but a search where every
+    source failed falls back to the fixture, which is what the single-source
+    (Deezer-only) case has always done.
+    """
+    results: list[dict] = []
+    failures = 0
     try:
-        return {"results": [_playable(t) for t in deezer.search(q)]}
+        active = sources.active()
     except Exception:
-        needle = q.lower()
-        hits = [
-            t for t in _fixture_tracks()
-            if needle in t["title"].lower()
-            or needle in t["artist"].lower()
-            or needle in t["album"].lower()
-        ]
-        return {"results": hits}
+        active = []
+    for source in active:
+        try:
+            results.extend(_playable(_public_track(t)) for t in source.search(q))
+        except Exception:
+            failures += 1
+    if results or (active and failures < len(active)):
+        return {"results": results}
+    needle = q.lower()
+    hits = [
+        t for t in _fixture_tracks()
+        if needle in t["title"].lower()
+        or needle in t["artist"].lower()
+        or needle in t["album"].lower()
+    ]
+    return {"results": hits}
 
 
 # TensorFlow inference is CPU- and memory-heavy; endpoints run on FastAPI's
@@ -362,10 +425,7 @@ def seed(req: SeedRequest) -> dict:
 
     track = _safe(store.get_track, req.track_id)
     if track is None:
-        try:
-            track = deezer.get_track(req.track_id)
-        except Exception:
-            track = None
+        track = _from_source(req.track_id)
     if track is None:
         track = _fixture_track(req.track_id)
     if track is None:

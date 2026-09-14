@@ -8,14 +8,27 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from music_recommendations.server import app as app_module
+from music_recommendations.server import deezer as deezer_api
 from music_recommendations.server import store
-from contract.features import AXES, FEATURE_KEYS, TRACK_FIELDS
+from contract.features import AXES, FEATURE_KEYS, TRACK_FIELDS, TRACK_OPTIONAL_FIELDS
 
 FIXTURE = json.loads(
     (Path(__file__).parents[2] / "contract" / "fixture.json").read_text()
 )["tracks"]
 
 TRACK_KEYS = {"track_id", "title", "artist", "album", "artwork_url", "preview_url"}
+
+
+def _contract_shape(track: dict, scored: bool = False) -> bool:
+    """Exactly the contract Track (plus `score` on a recommendation), and
+    nothing beyond the two optional keys the contract allows.
+
+    Internal fields -- dedupe_key, the full attribution object, feel -- must
+    never reach a response, so this is an exact-set check with a named
+    allowance rather than a subset check."""
+    keys = set(track)
+    required = TRACK_KEYS | ({"score"} if scored else set())
+    return keys >= required and keys - required <= set(TRACK_OPTIONAL_FIELDS)
 
 
 def fake_features(seed_val: float) -> dict:
@@ -55,27 +68,29 @@ def test_axes_serves_contract_list_verbatim(client):
 
 def test_search_proxies_deezer(client, monkeypatch):
     hits = [dict(FIXTURE[0])]
-    monkeypatch.setattr(app_module.deezer, "search", lambda q, limit=10: hits)
+    monkeypatch.setattr(deezer_api, "search", lambda q, limit=10: hits)
     body = client.get("/search", params={"q": "so what"}).json()
     # Deezer's fields pass through untouched except preview_url, which is
     # re-pointed at this server so it does not expire in the client's hands
     # (see _playable); test_search_serves_this_servers_preview_urls covers it.
-    assert [{k: v for k, v in t.items() if k != "preview_url"}
+    assert [{k: v for k, v in t.items() if k not in ("preview_url", "source")}
             for t in body["results"]] == [
         {k: v for k, v in t.items() if k != "preview_url"} for t in hits
     ]
+    # ...plus the source that answered, which the clients use for attribution.
+    assert [t["source"] for t in body["results"]] == ["deezer"]
 
 
 def test_search_falls_back_to_fixture_when_deezer_down(client, monkeypatch):
     def boom(q, limit=10):
         raise OSError("no network")
 
-    monkeypatch.setattr(app_module.deezer, "search", boom)
+    monkeypatch.setattr(deezer_api, "search", boom)
     body = client.get("/search", params={"q": "miles"}).json()
     assert len(body["results"]) > 0
     assert all("miles" in t["artist"].lower() or "miles" in t["title"].lower()
                for t in body["results"])
-    assert all(set(t) == TRACK_KEYS for t in body["results"])
+    assert all(_contract_shape(t) for t in body["results"])
 
 
 # ---- /seed ----
@@ -93,7 +108,7 @@ def test_seed_warm_track_is_instant_and_never_analyzes(client, seeded_corpus, mo
 def test_seed_cold_track_downloads_analyzes_and_stores(client, fake_mongo, monkeypatch):
     track = dict(FIXTURE[7])
     tid = track["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
     monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
     monkeypatch.setattr(app_module, "analyze_track", lambda p: fake_features(0.5))
 
@@ -101,7 +116,7 @@ def test_seed_cold_track_downloads_analyzes_and_stores(client, fake_mongo, monke
     assert body == {"track_id": tid, "status": "ready"}
     assert store.get_features(tid) is not None
     # get_track never round-trips preview_url (a signed URL is never stored).
-    assert store.get_track(tid) == {**track, "preview_url": ""}
+    assert store.get_track(tid) == {**track, "preview_url": "", "source": "deezer"}
 
 
 @pytest.fixture
@@ -120,13 +135,13 @@ def test_seed_enqueues_and_reports_unanalyzed_on_timeout(
         client, fake_mongo, analysis_unavailable, monkeypatch):
     track = dict(FIXTURE[0])
     tid = track["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
 
     body = client.post("/seed", json={"track_id": tid})
     assert body.status_code == 200
     assert body.json() == {"track_id": tid, "status": "unanalyzed"}
     # metadata stored for the worker, job queued, but corpus untouched
-    assert store.get_track(tid) == {**track, "preview_url": ""}
+    assert store.get_track(tid) == {**track, "preview_url": "", "source": "deezer"}
     assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"})["state"] == "queued"
     assert tid not in store.corpus_ids()
 
@@ -135,7 +150,7 @@ def test_seed_ready_when_worker_delivers_features(
         client, fake_mongo, analysis_unavailable, monkeypatch):
     track = dict(FIXTURE[1])
     tid = track["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
     # First get_features call (the warm check) misses and plants the
     # features, as if the worker finished during the wait; later polls hit.
     real_get = store.get_features
@@ -158,7 +173,7 @@ def test_seed_double_tap_enqueues_once(
         client, fake_mongo, analysis_unavailable, monkeypatch):
     track = dict(FIXTURE[2])
     tid = track["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
     client.post("/seed", json={"track_id": tid})
     client.post("/seed", json={"track_id": tid})
     assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"})["state"] == "queued"
@@ -171,7 +186,7 @@ def test_seed_store_down_degrades_to_ready(client, monkeypatch):
 
     monkeypatch.setattr(store, "db", store_down)
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[3]))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[3]))
     monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
 
     def not_implemented(path):
@@ -190,7 +205,7 @@ def test_seed_download_failure_queues_instead_of_500(client, fake_mongo, monkeyp
         raise OSError("preview fetch failed")
 
     tid = FIXTURE[0]["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[0]))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[0]))
     monkeypatch.setattr(app_module, "_download_preview", boom)
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
     monkeypatch.setattr(app_module, "_EMBED_POLL_S", 0.0)
@@ -203,7 +218,7 @@ def test_seed_download_failure_queues_instead_of_500(client, fake_mongo, monkeyp
 
 
 def test_seed_unknown_track_404(client, fake_mongo, monkeypatch):
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: None)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: None)
     assert client.post("/seed", json={"track_id": "doesnotexist"}).status_code == 404
 
 
@@ -289,7 +304,7 @@ def test_recommend_results_carry_exactly_the_contract_fields(client, duplicate_c
     # dedupe_key is stored on every track document; it must never reach a
     # response, here or anywhere else.
     for track in body["results"]:
-        assert set(track) == set(TRACK_FIELDS) | {"score"}
+        assert _contract_shape(track, scored=True)
 
 
 # ---- /recommend ----
@@ -303,7 +318,7 @@ def test_recommend_returns_scored_tracks_excluding_seed(client, seeded_corpus):
     assert tid not in ids
     assert len(ids) == 4
     for t in body["results"]:
-        assert set(t) == TRACK_KEYS | {"score"}
+        assert _contract_shape(t, scored=True)
         assert isinstance(t["score"], float)
 
 
@@ -468,7 +483,7 @@ def test_seed_falls_back_when_essentia_unavailable(client, fake_mongo, monkeypat
         raise ImportError("No module named 'essentia'")
 
     tid = FIXTURE[0]["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[0]))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[0]))
     monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
     monkeypatch.setattr(app_module, "analyze_track", no_essentia)
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
@@ -532,7 +547,7 @@ def deezer_previews(monkeypatch):
         calls.append(track_id)
         return f"https://cdnt-preview.dzcdn.net/{track_id}.mp3?hdnea=exp=999"
 
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", fresh)
+    monkeypatch.setattr(deezer_api, "fresh_preview_url", fresh)
     return calls
 
 
@@ -558,7 +573,7 @@ def test_preview_reuses_the_cached_signature(client, deezer_previews):
 
 
 def test_preview_404s_when_deezer_has_no_preview(client, monkeypatch):
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", lambda t: None)
+    monkeypatch.setattr(deezer_api, "fresh_preview_url", lambda t: None)
     assert client.get("/preview/nope", follow_redirects=False).status_code == 404
 
 
@@ -658,7 +673,7 @@ def test_preview_audio_closes_the_upstream_response(client, deezer_previews, mon
 
 
 def test_preview_audio_404s_when_deezer_has_no_preview(client, monkeypatch):
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", lambda t: None)
+    monkeypatch.setattr(deezer_api, "fresh_preview_url", lambda t: None)
     assert client.get("/preview/nope/audio").status_code == 404
 
 
@@ -701,7 +716,7 @@ def test_recommend_serves_this_servers_preview_urls(client, seeded_corpus):
 
 
 def test_search_serves_this_servers_preview_urls(client, monkeypatch):
-    monkeypatch.setattr(app_module.deezer, "search", lambda q: [dict(FIXTURE[0])])
+    monkeypatch.setattr(deezer_api, "search", lambda q, limit=25: [dict(FIXTURE[0])])
     body = client.get("/search?q=miles").json()
     assert body["results"][0]["preview_url"] == (
         f"http://testserver/preview/{FIXTURE[0]['track_id']}"
@@ -712,7 +727,7 @@ def test_track_shape_is_unchanged_by_the_rewrite(client, seeded_corpus):
     body = client.get(
         f"/recommend?track_id={seeded_corpus[0]['track_id']}&axis=sounds_like"
     ).json()
-    assert set(body["results"][0]) == TRACK_KEYS | {"score"}
+    assert _contract_shape(body["results"][0], scored=True)
 
 
 def test_public_base_url_overrides_the_request_host(client, seeded_corpus,
@@ -776,8 +791,8 @@ def test_seed_resigns_when_the_stored_url_is_expired(client, fake_mongo,
         return Path("/tmp/x.mp3")
 
     track["preview_url"] = "https://cdnt-preview.dzcdn.net/dead.mp3"
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url",
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
+    monkeypatch.setattr(deezer_api, "fresh_preview_url",
                         lambda t: "https://cdnt-preview.dzcdn.net/live.mp3?hdnea=1")
     monkeypatch.setattr(app_module, "_download_preview", download)
     monkeypatch.setattr(app_module, "analyze_track", lambda p: fake_features(0.5))
@@ -791,10 +806,10 @@ def test_seed_does_not_resign_when_the_stored_url_works(client, fake_mongo,
                                                         monkeypatch):
     """Re-signing costs a Deezer call; a working URL must not trigger one."""
     track = dict(FIXTURE[7])
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
     monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
     monkeypatch.setattr(app_module, "analyze_track", lambda p: fake_features(0.5))
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", lambda t: (_ for _ in ()).throw(
+    monkeypatch.setattr(deezer_api, "fresh_preview_url", lambda t: (_ for _ in ()).throw(
         AssertionError("must not re-sign when the stored URL downloads")))
 
     client.post("/seed", json={"track_id": track["track_id"]})
@@ -841,7 +856,7 @@ def test_seed_returns_502_when_analysis_fails(client, fake_mongo, monkeypatch, t
     mp3 = tmp_path / "p.mp3"
     mp3.write_bytes(b"x")
     monkeypatch.setattr(app_module, "_fetch_preview_audio", lambda tid, t: mp3)
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[0]))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[0]))
 
     def boom(path):
         raise frontend.DecodeError("ffmpeg: bad file")
@@ -1040,7 +1055,7 @@ def test_feel_never_leaks_into_a_result_track(client, feel_corpus):
     body = client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
                                             "feel": 1.0}).json()
     for track in body["results"]:
-        assert set(track) == set(TRACK_FIELDS) | {"score"}
+        assert _contract_shape(track, scored=True)
 
 
 def test_feel_weight_is_bounded(client, feel_corpus):
@@ -1074,3 +1089,106 @@ def test_a_seed_without_feel_ranks_on_the_embedding_alone(client, feel_corpus):
     scores = [t["score"] for t in body["results"]]
     assert all(score > 0 for score in scores)
     assert scores == sorted(scores, reverse=True)
+
+
+# ---- pluggable sources: /search fan-out, /preview routing, attribution ----
+
+JAMENDO_TRACK = {
+    "track_id": "jamendo:168",
+    "title": "Sunrise",
+    "artist": "Dee Yan-Key",
+    "album": "Morning",
+    "artwork_url": "http://x/a.jpg",
+    "preview_url": "https://prod.jamendo.com/168.mp3",
+    "source": "jamendo",
+    "attribution": {"source": "jamendo",
+                    "url": "https://www.jamendo.com/track/168/sunrise",
+                    "license": "http://creativecommons.org/licenses/by-sa/3.0/"},
+}
+
+
+class _FakeSource:
+    def __init__(self, name, results=(), preview=None):
+        self.name = name
+        self.results = list(results)
+        self.preview = preview
+        self.asked = []
+
+    def search(self, q, limit=25):
+        self.asked.append(q)
+        return [dict(t) for t in self.results]
+
+    def track(self, track_id):
+        return next((dict(t) for t in self.results
+                     if t["track_id"] == track_id), None)
+
+    def preview_url(self, track_id):
+        self.asked.append(track_id)
+        return self.preview
+
+
+def test_search_concatenates_the_active_sources_in_order(client, monkeypatch):
+    first = _FakeSource("jamendo", [JAMENDO_TRACK])
+    second = _FakeSource("deezer", [{**FIXTURE[0], "source": "deezer"}])
+    monkeypatch.setattr(app_module.sources, "active", lambda: [first, second])
+
+    results = client.get("/search", params={"q": "sun"}).json()["results"]
+
+    assert [t["source"] for t in results] == ["jamendo", "deezer"]
+    assert first.asked == ["sun"] and second.asked == ["sun"]
+
+
+def test_search_carries_the_attribution_backlink(client, monkeypatch):
+    monkeypatch.setattr(app_module.sources, "active",
+                        lambda: [_FakeSource("jamendo", [JAMENDO_TRACK])])
+    [track] = client.get("/search", params={"q": "sun"}).json()["results"]
+    assert _contract_shape(track)
+    assert track["attribution_url"] == JAMENDO_TRACK["attribution"]["url"]
+    # The full attribution object is server-side only.
+    assert "attribution" not in track and "license" not in track
+
+
+def test_search_survives_one_source_being_down(client, monkeypatch):
+    class Broken(_FakeSource):
+        def search(self, q, limit=25):
+            raise OSError("no network")
+
+    monkeypatch.setattr(app_module.sources, "active",
+                        lambda: [Broken("jamendo"),
+                                 _FakeSource("deezer", [dict(FIXTURE[0])])])
+    results = client.get("/search", params={"q": "so what"}).json()["results"]
+    assert [t["track_id"] for t in results] == [FIXTURE[0]["track_id"]]
+
+
+def test_preview_routes_to_the_source_that_owns_the_id(client, fake_mongo,
+                                                       monkeypatch):
+    jam = _FakeSource("jamendo", [JAMENDO_TRACK],
+                      preview="https://prod.jamendo.com/168.mp3")
+    monkeypatch.setattr(app_module.sources, "for_id",
+                        lambda tid: jam if tid.startswith("jamendo:") else None)
+
+    r = client.get("/preview/jamendo:168", follow_redirects=False)
+
+    assert r.status_code == 302
+    assert r.headers["location"] == "https://prod.jamendo.com/168.mp3"
+    assert jam.asked == ["jamendo:168"]
+
+
+def test_preview_404s_for_an_id_from_an_unknown_source(client, fake_mongo,
+                                                       monkeypatch):
+    monkeypatch.setattr(app_module.sources, "for_id", lambda tid: None)
+    assert client.get("/preview/bandcamp:5").status_code == 404
+
+
+def test_recommend_rows_carry_the_source_and_backlink(client, fake_mongo):
+    """The whole point: a CC track's credit survives the store and the
+    ranking and reaches the client."""
+    store.put_track({**FIXTURE[0], "track_id": "s"}, fake_features(0.0))
+    store.put_track(JAMENDO_TRACK, fake_features(0.1))
+
+    body = client.get("/recommend", params={"track_id": "s",
+                                            "axis": "sounds_like"}).json()
+    [rec] = [t for t in body["results"] if t["track_id"] == "jamendo:168"]
+    assert _contract_shape(rec, scored=True)
+    assert rec["source"] == "jamendo"
+    assert rec["attribution_url"] == JAMENDO_TRACK["attribution"]["url"]

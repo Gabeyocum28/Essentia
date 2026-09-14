@@ -18,12 +18,16 @@ TRACK = {
 }
 FEATURES = {"embedding": [0.1, 0.2, -0.3], "_features_version": FEATURES_VERSION}
 
+# A bare-digit id means Deezer (corpus/sources/base.py), so every Track read
+# back carries `source` even though nothing wrote one.
+STORED = {**TRACK, "preview_url": "", "source": "deezer"}
+
 
 def test_put_then_get_track_roundtrips(fake_mongo):
     store.put_track(TRACK, FEATURES)
     # preview_url is never persisted (it's a signed URL that expires in
     # minutes) -- get_track always answers "" for it; app.py re-signs.
-    assert store.get_track("42") == {**TRACK, "preview_url": ""}
+    assert store.get_track("42") == STORED
 
 
 def test_put_then_get_features_dequantizes(fake_mongo):
@@ -59,7 +63,7 @@ def test_get_missing_track_returns_none(fake_mongo):
 def test_get_many_tracks_preserves_requested_order_and_missing_values(fake_mongo):
     store.put_track(TRACK, FEATURES)
     assert store.get_many_tracks(["nope", "42", "also-nope"]) == [
-        None, {**TRACK, "preview_url": ""}, None,
+        None, STORED, None,
     ]
 
 
@@ -76,7 +80,7 @@ def test_corpus_ids_empty_when_no_tracks(fake_mongo):
 
 def test_put_track_meta_writes_track_only(fake_mongo):
     store.put_track_meta(TRACK)
-    assert store.get_track("42") == {**TRACK, "preview_url": ""}
+    assert store.get_track("42") == STORED
     assert store.get_features("42") is None
     assert "42" not in store.corpus_ids()
 
@@ -418,3 +422,60 @@ def test_get_many_features_carries_feel_per_row(fake_mongo):
 def test_feel_accepts_a_numpy_vector(fake_mongo):
     store.put_track(TRACK, {**FEATURES, "feel": np.asarray(FEEL, dtype=np.float32)})
     assert store.get_features("42")["feel"] == pytest.approx(FEEL, abs=1e-4)
+
+
+# ---- source and attribution (contract.features.TRACK_OPTIONAL_FIELDS) ----
+
+JAMENDO = {
+    "track_id": "jamendo:168",
+    "title": "Sunrise",
+    "artist": "Dee Yan-Key",
+    "album": "Morning",
+    "artwork_url": "http://x/a.jpg",
+    "preview_url": "http://x/full.mp3",
+    "source": "jamendo",
+    "attribution": {"source": "jamendo",
+                    "url": "https://www.jamendo.com/track/168/sunrise",
+                    "license": "http://creativecommons.org/licenses/by-sa/3.0/"},
+}
+
+
+def test_attribution_round_trips_as_a_backlink(fake_mongo):
+    store.put_track(JAMENDO, FEATURES)
+    got = store.get_track("jamendo:168")
+    assert got["source"] == "jamendo"
+    assert got["attribution_url"] == JAMENDO["attribution"]["url"]
+    # The licence deed is kept on the row but is not a contract field.
+    assert "attribution" not in got
+    assert "license" not in got
+
+
+def test_the_stored_attribution_keeps_the_licence(fake_mongo):
+    """Published narrow, stored whole: if the clients ever need the deed,
+    the row already has it and no re-crawl is needed."""
+    store.put_track(JAMENDO, FEATURES)
+    doc = fake_mongo.tracks.find_one({"_id": "jamendo:168"})
+    assert doc["attribution"] == JAMENDO["attribution"]
+
+
+def test_a_bare_id_defaults_to_deezer_and_has_no_attribution(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    got = store.get_track("42")
+    assert got["source"] == "deezer"
+    assert "attribution_url" not in got
+
+
+def test_source_is_read_off_a_namespaced_id_when_unstated(fake_mongo):
+    store.put_track_meta({k: v for k, v in JAMENDO.items()
+                          if k not in ("source", "attribution")})
+    got = store.get_track("jamendo:168")
+    assert got["source"] == "jamendo"
+    assert "attribution_url" not in got
+
+
+def test_get_many_tracks_carries_the_optional_fields(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    store.put_track(JAMENDO, FEATURES)
+    bare, cc = store.get_many_tracks(["42", "jamendo:168"])
+    assert "attribution_url" not in bare
+    assert cc["attribution_url"] == JAMENDO["attribution"]["url"]

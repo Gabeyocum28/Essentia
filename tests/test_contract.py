@@ -34,6 +34,15 @@ def test_track_fields():
     }
 
 
+def test_track_optional_fields():
+    """Two keys a Track MAY carry -- and only these two. They are how a
+    Creative Commons source's credit reaches the clients; anything else a
+    source knows stays server-side."""
+    f = _features()
+    assert f.TRACK_OPTIONAL_FIELDS == {"source", "attribution_url"}
+    assert not (f.TRACK_OPTIONAL_FIELDS & f.TRACK_FIELDS)
+
+
 def test_feature_keys_are_the_embedding_and_the_feel_vector():
     f = _features()
     assert f.FEATURE_KEYS == {"embedding": 1280, "feel": 11}
@@ -56,6 +65,8 @@ def test_fixture_thirty_contract_tracks():
     data = json.loads((CONTRACT / "fixture.json").read_text())
     assert len(data["tracks"]) == 30
     for t in data["tracks"]:
+        # The optional keys are allowed but the fixture is Deezer, which
+        # needs neither.
         assert set(t) == f.TRACK_FIELDS
         assert t["preview_url"].startswith("http")
         assert isinstance(t["track_id"], str)
