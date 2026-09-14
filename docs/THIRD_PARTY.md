@@ -19,6 +19,7 @@ catch.
 | uvicorn | BSD-3-Clause | ASGI server | https://github.com/encode/uvicorn |
 | pymongo | Apache-2.0 | the store | https://github.com/mongodb/mongo-python-driver |
 | numpy | BSD-3-Clause | every vector in the system | https://github.com/numpy/numpy |
+| umap-learn | BSD-3-Clause | the 2D galaxy layout behind /viz/map and /viz/walk | https://github.com/lmcinnes/umap |
 | torch | BSD-3-Clause | runs CLAP and Beat This! on CPU | https://github.com/pytorch/pytorch |
 | msclap | MIT | Microsoft CLAP: the 1024-d audio embedding and the text tower behind the feel axes and text search | https://github.com/microsoft/CLAP |
 | librosa | ISC | decoding, chroma/key, the fallback beat tracker | https://github.com/librosa/librosa |
@@ -39,10 +40,12 @@ the image too:
 | transformers | Apache-2.0 | msclap (GPT-2 tokenizer for the text tower) | https://github.com/huggingface/transformers |
 | huggingface-hub | Apache-2.0 | transformers | https://github.com/huggingface/huggingface_hub |
 | torchlibrosa | MIT | msclap (mel front end inside the audio tower) | https://github.com/qiuqiangkong/torchlibrosa |
-| scikit-learn | BSD-3-Clause | msclap | https://github.com/scikit-learn/scikit-learn |
+| scikit-learn | BSD-3-Clause | msclap, umap-learn | https://github.com/scikit-learn/scikit-learn |
 | pandas | BSD-3-Clause | msclap | https://github.com/pandas-dev/pandas |
 | scipy | BSD-3-Clause | librosa | https://github.com/scipy/scipy |
-| numba | BSD-2-Clause | librosa | https://github.com/numba/numba |
+| numba | BSD-2-Clause | librosa, umap-learn | https://github.com/numba/numba |
+| llvmlite | BSD-2-Clause | numba | https://github.com/numba/llvmlite |
+| pynndescent | BSD-2-Clause | umap-learn (the approximate k-NN graph) | https://github.com/lmcinnes/pynndescent |
 | soundfile | BSD-3-Clause | librosa (libsndfile, LGPL-2.1, dynamically linked) | https://github.com/bastibe/python-soundfile |
 | einops | MIT | beat_this | https://github.com/arogozhnikov/einops |
 | PyYAML | MIT | msclap (model config) | https://github.com/yaml/pyyaml |

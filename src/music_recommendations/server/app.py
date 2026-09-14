@@ -2,7 +2,8 @@
 contract/fixture.json until the corpus lands.
 
 Routes:
-  GET  /search      -- query Deezer (or fixture fallback) for tracks
+  GET  /search       -- query the switched-on sources (or fixture fallback)
+  GET  /search/text  -- CLAP text-to-audio search over the corpus (not contract)
   POST /seed         -- mark a track as the seed for recommendations
   GET  /axes         -- list available recommendation axes
   GET  /recommend    -- ranked, scored tracks for a seed + axis
@@ -33,7 +34,7 @@ from typing import Literal, NamedTuple
 
 from contract.features import AXES
 from music_recommendations.analysis import analyze_track, frontend
-from music_recommendations.analysis.feel import FEEL_KEYS
+from music_recommendations.analysis.feel_v2 import FEEL_KEYS
 from music_recommendations.analysis.schema import METRICS
 from music_recommendations.corpus import sources
 from music_recommendations.server import dedupe, store, viz
@@ -410,6 +411,75 @@ def search(q: str) -> dict:
     return {"results": hits}
 
 
+# ---- GET /search/text — not part of contract/contract.md (like /viz/*) ----
+
+# How many results the text search returns by default. Larger than /search's
+# page because the corpus is the whole catalogue rather than one query's
+# page, and a phrase like "late night piano" is a region, not a track.
+TEXT_LIMIT_DEFAULT = 25
+TEXT_LIMIT_MAX = 50
+
+
+@app.get("/search/text")
+def search_text(q: str,
+                limit: int = Query(TEXT_LIMIT_DEFAULT, ge=1,
+                                   le=TEXT_LIMIT_MAX)) -> dict:
+    """Search the CORPUS by description: cosine between the typed phrase and
+    every analyzed track, in CLAP's shared audio/text space.
+
+    This is the one thing the clean-room stack gives us that the v1 one
+    could not: EffNet has no text tower, so "hazy late-night trumpet" was
+    not a question the old corpus could be asked at all.
+
+    MEMORY: the first call LOADS CLAP INTO THE API PROCESS -- ~700 MB of
+    weights and roughly **2.5 GB resident** once torch's allocator is warm.
+    That is why the import is inside the handler rather than at module
+    scope: an API container that never serves a text search never pays it,
+    and the box does not have room for a copy in every process by accident.
+    On a 2-CPU VM running the API beside the embed worker, this is the
+    number to size `mem_limit` against (see deploy/.env.example).
+
+    503, not 500, when CLAP is unavailable (not installed, or the weights
+    were never fetched): the rest of the API is fine, and a client should
+    hide the toggle rather than report the service down.
+    """
+    query = q.strip()
+    if not query:
+        raise HTTPException(400, "q must not be empty")
+
+    try:
+        from music_recommendations.analysis import clap
+
+        vector = np.asarray(clap.embed_text([query]), dtype=np.float32).ravel()
+    except (ImportError, FileNotFoundError) as exc:
+        raise HTTPException(
+            503, f"text search unavailable: CLAP could not be loaded ({exc})"
+        ) from exc
+
+    corpus = tuple(_safe(store.corpus_ids, default=[]))
+    ids, matrix, _ = (_corpus_matrix(corpus, "embedding", "cosine",
+                                     want_correction=False)
+                      if corpus else ([], np.empty((0, 1)), None))
+    if not ids:
+        return {"results": []}
+    if matrix.shape[1] != vector.shape[0]:
+        # A corpus of version-3 (or synthetic) vectors cannot be compared
+        # with a CLAP text vector at all. Saying so is the only honest
+        # answer; numpy would otherwise raise a shape error as a 500.
+        raise HTTPException(
+            503, "text search unavailable: the corpus is not in CLAP space "
+                 f"({matrix.shape[1]}-d rows against a {vector.shape[0]}-d "
+                 "text vector)"
+        )
+
+    similarity = _similarity("embedding", matrix, vector, "cosine")
+    order = [int(i) for i in np.argsort(similarity)[::-1][:limit]]
+    _tracks_cached([ids[i] for i in order])   # one metadata read for the page
+    return {"results": [{**_rec_track(ids[i]),
+                         "score": round(float(similarity[i]), 4)}
+                        for i in order]}
+
+
 # TensorFlow inference is CPU- and memory-heavy; endpoints run on FastAPI's
 # threadpool, so an unbounded burst of /seed calls would run that many
 # analyses at once on a 4 GB container. Cap concurrent analyses instead of
@@ -681,26 +751,46 @@ def _similarity(feature_key: str, matrix: np.ndarray, seed_vec: np.ndarray,
 #
 # Embedding cosine ranks by STYLE. It cannot tell a hushed solo take from a
 # full-band blast of the same idiom, because both sit in the same corner of
-# Discogs space. The feel vector (eleven classifier heads, analysis/feel.py)
+# CLAP space. The feel vector (eight zero-shot axes, analysis/feel_v2.py)
 # carries exactly what the cosine drops: energy, mood, texture. The blend is
 #
-#     blended = cos(embedding) - w * mean|feel_rec - feel_seed|
+#     blended = cos(embedding) - feel * feel_dist - tempo * tempo_dist
 #
 # a straight subtraction rather than a percentile blend (_blended) because
-# both terms are already on the same scale: a cosine in [-1, 1] against a
-# mean absolute difference of probabilities in [0, 1]. w == 0 reproduces the
-# embedding-only order EXACTLY, which is what makes the slider safe to ship.
+# every term is already on the same scale: a cosine in [-1, 1] against two
+# distances that are O(1) by construction. Both weights at 0 reproduce the
+# embedding-only order EXACTLY, which is what makes the sliders safe to ship.
+#
+# feel_dist is a mean absolute difference of Z-SCORES, not of the raw
+# probabilities. The v2 axes are zero-shot softmaxes over a contrastive pair
+# and they are nothing like equally spread: `acoustic` saturates near 0 or 1
+# on almost every track while `density` lives inside a band a few hundredths
+# wide. On raw values the widest axis simply decides the ranking and the
+# narrow ones are rounding error. Dividing each dimension by its own standard
+# deviation over the corpus asks "how unusual is this difference FOR THIS
+# AXIS", which is the question the slider is supposed to be weighting.
 
 FEEL_DEFAULT = 0.3
 FEEL_MAX = 3.0
 
+# Standard deviations are measured, so a corpus where an axis is constant
+# (one track, a synthetic fixture) would divide by zero and turn every
+# distance into an inf or a nan. The floor makes such an axis contribute a
+# difference of ~0 instead, which is the truth: an axis with no spread
+# distinguishes nothing.
+_FEEL_STD_FLOOR = 1e-6
+
 
 class _FeelRows(NamedTuple):
-    """The feel vectors of one ranking's rows, lined up with its matrix."""
-    distance: np.ndarray   # (n,) mean |rec - seed|, 0.0 where feel is missing
-    rows: np.ndarray       # (n, 11) aligned vectors, zeros where missing
+    """The feel vectors of one ranking's rows, lined up with its matrix.
+
+    `rows` and `seed` are the RAW probabilities, because those are what the
+    math panel draws as bars; only `distance` is z-scored.
+    """
+    distance: np.ndarray   # (n,) mean |z(rec) - z(seed)|, 0.0 where missing
+    rows: np.ndarray       # (n, 8) aligned vectors, zeros where missing
     present: np.ndarray    # (n,) bool -- whether that row has a feel vector
-    seed: np.ndarray       # (11,) the seed's own vector
+    seed: np.ndarray       # (8,) the seed's own vector
 
 
 # The alignment between the embedding matrix's rows and the feel matrix's is
@@ -710,7 +800,8 @@ class _FeelRows(NamedTuple):
 # the array it named be freed and a later array at the same address would be
 # served someone else's alignment. Either matrix growing (a crawl, a backfill)
 # hands back a new object and invalidates this for free.
-_FEEL_ALIGN_CACHE: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+# (matrix, feel_matrix, rows, present, mean, std)
+_FEEL_ALIGN_CACHE: tuple[np.ndarray, ...] | None = None
 _FEEL_ALIGN_LOCK = threading.Lock()
 # Rows still waiting on scripts/feel_backfill.py are a deploy-time fact, not a
 # per-request one: say it once per process rather than on every /recommend.
@@ -718,15 +809,23 @@ _FEEL_MISSING_LOGGED = False
 
 
 def _feel_alignment(ids: list[str], matrix: np.ndarray, feel_ids: list[str],
-                    feel_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(rows, present) for `ids`, drawn from the feel matrix's own id subset."""
+                    feel_matrix: np.ndarray
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(rows, present, mean, std) for `ids`, drawn from the feel matrix.
+
+    `mean`/`std` are per-dimension over the WHOLE feel matrix (every scored
+    row in the corpus, not just this request's), which is what makes the
+    z-score a statement about the corpus rather than about the candidate
+    list. They are computed here, once, because this is the one place that
+    already runs exactly when the feel matrix changes identity.
+    """
     global _FEEL_ALIGN_CACHE, _FEEL_MISSING_LOGGED
 
     with _FEEL_ALIGN_LOCK:
         cached = _FEEL_ALIGN_CACHE
         if (cached is not None and cached[0] is matrix
                 and cached[1] is feel_matrix):
-            return cached[2], cached[3]
+            return cached[2], cached[3], cached[4], cached[5]
 
     at = {track_id: row for row, track_id in enumerate(feel_ids)}
     take = np.array([at.get(track_id, -1) for track_id in ids], dtype=np.int64)
@@ -742,9 +841,17 @@ def _feel_alignment(ids: list[str], matrix: np.ndarray, feel_ids: list[str],
         print(f"feel: {missing} of {len(ids)} corpus rows have no feel vector "
               f"and rank unpenalized — run scripts/feel_backfill.py")
 
+    scored = np.asarray(feel_matrix, dtype=np.float32)
+    if scored.ndim == 2 and scored.shape[0]:
+        mean = scored.mean(axis=0)
+        std = np.maximum(scored.std(axis=0), _FEEL_STD_FLOOR)
+    else:
+        mean = np.zeros(width, dtype=np.float32)
+        std = np.ones(width, dtype=np.float32)
+
     with _FEEL_ALIGN_LOCK:
-        _FEEL_ALIGN_CACHE = (matrix, feel_matrix, rows, present)
-    return rows, present
+        _FEEL_ALIGN_CACHE = (matrix, feel_matrix, rows, present, mean, std)
+    return rows, present, mean, std
 
 
 def _feel_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
@@ -761,18 +868,149 @@ def _feel_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
     # euclidean is nominal here -- no correction is asked for, so the metric
     # only ever reaches rank.centrality, which this never calls. The distance
     # below is a mean ABSOLUTE difference, chosen over L2 so one wildly
-    # different dimension cannot dominate the other ten.
+    # different dimension cannot dominate the other seven.
     feel_ids, feel_matrix, _ = _corpus_matrix(corpus, "feel", "euclidean",
                                               want_correction=False)
     if not feel_ids:
         return None
-    rows, present = _feel_alignment(ids, matrix, feel_ids, feel_matrix)
+    rows, present, mean, std = _feel_alignment(ids, matrix, feel_ids, feel_matrix)
     seed_vec = np.asarray(seed, dtype=np.float32).ravel()
     if rows.shape[1] != seed_vec.shape[0]:
         return None
-    distance = np.abs(rows - seed_vec).mean(axis=1)
+    distance = np.abs((rows - mean) / std - (seed_vec - mean) / std).mean(axis=1)
     distance[~present] = 0.0
     return _FeelRows(distance.astype(np.float32), rows, present, seed_vec)
+
+
+# ---- tempo: the number a listener can actually name ----
+#
+# Two tracks can sit in the same corner of CLAP space and the same corner of
+# feel space and still be a ballad and a double-time burner. Tempo is the one
+# dimension of that the embedding reliably throws away (it is trained on 7 s
+# windows with a contrastive objective, not a beat tracker), and it is also
+# the dimension a listener can name, so it gets its own term and its own
+# slider.
+#
+# The distance is octave-folded: 90 and 180 BPM are the same groove counted
+# differently, and every beat tracker in existence disagrees with every other
+# about which one to report. Working in log2 of the ratio makes "double" and
+# "half" both exactly 1.0 away, so folding is one min() over three offsets
+# rather than a table of special cases.
+
+TEMPO_DEFAULT = 0.2
+TEMPO_MAX = 3.0
+
+# Past half an octave there is nothing left to say: the two tracks are simply
+# at different tempi, and letting the penalty grow without bound would make
+# one 60-BPM outlier beat the entire cosine ranking. Clipping keeps the term
+# comparable in size with the cosine it is subtracted from.
+TEMPO_MAX_DIST = 0.5
+
+
+class _RhythmRows(NamedTuple):
+    """The rhythm of one ranking's rows, lined up with its matrix."""
+    distance: np.ndarray        # (n,) octave-folded tempo distance, 0 if absent
+    rows: list[dict | None]     # (n,) the stored rhythm dict, or None
+    present: np.ndarray         # (n,) bool -- whether that row has a tempo
+    seed: dict                  # the seed's own rhythm dict
+
+
+# Keyed and re-checked on the embedding matrix's identity, exactly like
+# _FEEL_ALIGN_CACHE (and for the same reason: a bare id() can be reused by a
+# later array). One Mongo read of `rhythm` for the whole corpus per matrix
+# identity, not per request.
+_RHYTHM_ALIGN_CACHE: "tuple[np.ndarray, np.ndarray, list[dict | None], np.ndarray] | None" = None
+_RHYTHM_ALIGN_LOCK = threading.Lock()
+
+
+def _rhythm_alignment(ids: list[str], matrix: np.ndarray
+                      ) -> tuple[np.ndarray, list[dict | None], np.ndarray]:
+    """(tempo, rows, present) for `ids`, in matrix row order."""
+    global _RHYTHM_ALIGN_CACHE
+
+    with _RHYTHM_ALIGN_LOCK:
+        cached = _RHYTHM_ALIGN_CACHE
+        if cached is not None and cached[0] is matrix:
+            return cached[1], cached[2], cached[3]
+
+    rows = _safe(store.get_many_rhythm, list(ids), default=None)
+    if rows is None or len(rows) != len(ids):
+        rows = [None] * len(ids)
+    tempo = np.array(
+        [float(r.get("tempo_bpm") or 0.0) if isinstance(r, dict) else 0.0
+         for r in rows],
+        dtype=np.float32,
+    )
+    # A stored 0.0 means "no beat could be found" (contract/features.py), so
+    # it is an absence, not a tempo of zero.
+    present = tempo > 0.0
+
+    with _RHYTHM_ALIGN_LOCK:
+        _RHYTHM_ALIGN_CACHE = (matrix, tempo, rows, present)
+    return tempo, rows, present
+
+
+def _tempo_distance(seed_bpm: float, tempo: np.ndarray,
+                    present: np.ndarray) -> np.ndarray:
+    """min(|d|, |d-1|, |d+1|) for d = log2(seed / candidate), clipped.
+
+    0 wherever the candidate has no tempo: a missing number must never be a
+    penalty, or a partial backfill would quietly hide half the corpus.
+    """
+    distance = np.zeros(tempo.shape, dtype=np.float32)
+    if seed_bpm <= 0.0 or not present.any():
+        return distance
+    ratio = np.log2(seed_bpm / np.where(present, tempo, 1.0))
+    folded = np.minimum(np.abs(ratio),
+                        np.minimum(np.abs(ratio - 1.0), np.abs(ratio + 1.0)))
+    distance = np.clip(folded, 0.0, TEMPO_MAX_DIST).astype(np.float32)
+    distance[~present] = 0.0
+    return distance
+
+
+def _rhythm_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
+                 seed_features: dict) -> _RhythmRows | None:
+    """The tempo penalty for every row of `matrix`, or None if it cannot apply.
+
+    None when the seed has no rhythm at all -- same rule as the feel term:
+    absence means "no penalty", never "rank last".
+    """
+    seed = seed_features.get("rhythm")
+    if not isinstance(seed, dict) or not ids:
+        return None
+    tempo, rows, present = _rhythm_alignment(ids, matrix)
+    distance = _tempo_distance(float(seed.get("tempo_bpm") or 0.0),
+                               tempo, present)
+    return _RhythmRows(distance, rows, present, seed)
+
+
+def _tempo_blend(axis: str, weight: float, similarity: np.ndarray,
+                 rhythm: _RhythmRows | None) -> np.ndarray:
+    """`similarity` minus the tempo penalty, on sounds_like only.
+
+    surprise is untouched for the same reason the feel term leaves it alone:
+    "nothing like this" is already a request to leave the neighbourhood.
+    """
+    if axis != "sounds_like" or rhythm is None or not weight:
+        return similarity
+    return similarity - weight * rhythm.distance
+
+
+# What the math panel shows for a row with no rhythm on either side. Spelled
+# once so the keys are always present in the response, which is what lets the
+# client test `math.rhythm != null` instead of probing for the key.
+_NO_RHYTHM_MATH = {"tempo_dist": None, "rhythm": None}
+
+
+def _rhythm_math(rhythm: _RhythmRows | None, index: int) -> dict:
+    """The math-panel half: both rhythm dicts and the distance between them."""
+    if rhythm is None or not rhythm.present[index]:
+        return dict(_NO_RHYTHM_MATH)
+    return {
+        "tempo_dist": round(float(rhythm.distance[index]), 4),
+        "rhythm": {"seed": dict(rhythm.seed),
+                   "rec": dict(rhythm.rows[index] or {})},
+    }
 
 
 def _feel_blend(axis: str, weight: float, similarity: np.ndarray,
@@ -977,16 +1215,20 @@ def _rec_track(track_id: str) -> dict:
 @app.get("/recommend")
 def recommend(track_id: str, axis: str,
               limit: int = Query(10, ge=1, le=50),
-              feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX)) -> dict:
-    """`feel` weights the eleven-dimension feel penalty on sounds_like.
-    0 is the embedding-only order this endpoint served before the heads
-    shipped; it is ignored on every other axis.
+              feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX),
+              tempo: float = Query(TEMPO_DEFAULT, ge=0, le=TEMPO_MAX)) -> dict:
+    """`feel` weights the eight-dimension feel penalty on sounds_like and
+    `tempo` the octave-folded tempo penalty. Both are ignored on every other
+    axis, and both at 0 give the embedding-only order.
 
-    `score` is the number the list was RANKED by, so on sounds_like with
-    feel > 0 it is the blended value -- cosine minus `feel` times the mean
-    absolute feel difference -- and can therefore sit below the raw cosine,
-    and below zero. At feel == 0 (and on every other axis) it is exactly the
-    raw similarity, unchanged from before the heads shipped."""
+    `score` is the number the list was RANKED by, so on sounds_like it is
+    the blended value
+
+        cos - feel * feel_dist - tempo * tempo_dist
+
+    and can therefore sit below the raw cosine, and below zero. With both
+    weights at 0 (and on every other axis) it is exactly the raw
+    similarity."""
     if axis not in AXIS_FEATURES and axis not in BLENDED_AXES:
         raise HTTPException(400, f"unknown axis {axis!r}")
 
@@ -1030,6 +1272,10 @@ def recommend(track_id: str, axis: str,
             axis, feel,
             similarity,
             _feel_rows(corpus, ids, matrix, seed_features) if feel else None,
+        )
+        blended = _tempo_blend(
+            axis, tempo, blended,
+            _rhythm_rows(corpus, ids, matrix, seed_features) if tempo else None,
         )
         order = rank_mod.rank(
             seed_vec, matrix, direction=direction, limit=_scan_width(limit),
@@ -1101,11 +1347,38 @@ def _top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return coords8, variance
 
 
+# The UMAP layout of a subset matrix, keyed exactly like _TOP8_CACHE: UMAP
+# is seconds of work at VIZ_MAX rows (single-threaded, because a fixed
+# random_state disables its parallelism), so recomputing it per request is
+# not an option. Same identity discipline -- matrix in the value, re-checked
+# with `is` -- and purged with the others when its subset is superseded.
+_UMAP_CACHE: "OrderedDict[int, tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+
+
 def _projection(matrix: np.ndarray) -> np.ndarray:
-    """First two PC columns — numerically identical to viz.project_2d's
-    output, since /viz/map's xy must not change when this cache was added."""
-    coords8, _ = _top8(matrix)
-    return coords8[:, :2]
+    """The (n, 2) galaxy coordinates: UMAP, cached per subset identity.
+
+    /viz/map and /viz/walk only. /viz/tour and /viz/extremes stay on _top8
+    because they are ABOUT the principal components -- a UMAP axis has no
+    variance fraction to report and no "most extreme on PC3" to rank by.
+
+    Under viz.UMAP_MIN_ROWS rows project_umap falls back to the same top-2
+    PCA columns this used to return, so small corpora are unchanged.
+    """
+    key = id(matrix)
+    with _VIZ_CACHE_LOCK:
+        cached = _UMAP_CACHE.get(key)
+        if cached is not None and cached[0] is matrix:
+            _UMAP_CACHE.move_to_end(key)
+            return cached[1]
+    # Outside the lock, like _top8: it is the expensive part, and two threads
+    # racing on one matrix would only compute it twice.
+    xy = viz.project_umap(matrix)
+    with _VIZ_CACHE_LOCK:
+        _UMAP_CACHE[key] = (matrix, xy)
+        while len(_UMAP_CACHE) > _CACHE_KEEP:
+            _UMAP_CACHE.popitem(last=False)
+    return xy
 
 
 def _mst(matrix: np.ndarray) -> list[tuple[int, int, float]]:
@@ -1175,7 +1448,8 @@ def viz_map(track_id: str, axis: str,
             limit: int = Query(10, ge=1, le=50),
             correction: Literal["on", "off"] = "on",
             points: Literal["full", "compact"] = "full",
-            feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX)) -> dict:
+            feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX),
+            tempo: float = Query(TEMPO_DEFAULT, ge=0, le=TEMPO_MAX)) -> dict:
     """Everything the wow screen needs in one payload: the whole corpus as 2D
     points, the seed, and the recs with the actual numbers behind each score.
 
@@ -1239,7 +1513,7 @@ def viz_map(track_id: str, axis: str,
         # percentile so the blend can be shown as the sum it is.
         emb_at = {tid: i for i, tid in enumerate(emb_ids)}
         metric, matrix, correction = "cosine", emb_matrix, None
-        feel_rows = None
+        feel_rows = rhythm_rows = None
     else:
         feature_key, direction = AXIS_FEATURES[axis]
         metric = METRICS.get(feature_key, "cosine")
@@ -1256,7 +1530,10 @@ def viz_map(track_id: str, axis: str,
         # `surprise` map was pure cost.
         feel_rows = (_feel_rows(corpus, ids, matrix, seed_features)
                      if axis == "sounds_like" else None)
+        rhythm_rows = (_rhythm_rows(corpus, ids, matrix, seed_features)
+                       if axis == "sounds_like" else None)
         similarity = _feel_blend(axis, feel, similarity, feel_rows)
+        similarity = _tempo_blend(axis, tempo, similarity, rhythm_rows)
         order = rank_mod.rank(seed_vec, matrix, direction=direction,
                               limit=_scan_width(limit) + skippable, metric=metric,
                               correction=correction, similarity=similarity)
@@ -1295,14 +1572,16 @@ def viz_map(track_id: str, axis: str,
                 for key, values in parts.items()
             }
             math.update(_feel_math(None, idx))
+            math.update(_rhythm_math(None, idx))
         else:
             score = float(similarity[idx])
             math = viz.score_math(
                 seed_vec, matrix[idx], metric,
                 float(correction[idx]) if correction is not None else None,
             )
-            # feel_rows is already None off sounds_like (see above).
+            # feel_rows/rhythm_rows are already None off sounds_like.
             math.update(_feel_math(feel_rows, idx))
+            math.update(_rhythm_math(rhythm_rows, idx))
         recs.append({"track_id": rec_id, "score": score, "math": math})
         if len(recs) == limit:
             break
@@ -1364,8 +1643,9 @@ def viz_map(track_id: str, axis: str,
         "recs": recs,
         "axis": axis_info,
         # Sent rather than hardcoded in the client: the dimension order is
-        # analysis/registry.HEADS' insertion order, and a client with its own
-        # copy of the list would mislabel every bar the day a head moves.
+        # analysis/feel_v2.PROMPT_BANK's insertion order, and a client with
+        # its own copy of the list would mislabel every bar the day an axis
+        # moves.
         "feel_keys": list(FEEL_KEYS),
     }
 
@@ -1402,13 +1682,13 @@ def _purge_viz_caches(matrix_all: np.ndarray) -> None:
     a whole ~450 MB corpus matrix that _MATRIX_CACHE has already replaced.
     LRU eviction alone does not do this: the stale entry can stay inside the
     keep window indefinitely if it is never looked up again. _TOP8_CACHE,
-    _MST_CACHE and _HUBS_CACHE pin subset matrices the same way, so they are
-    purged down to whatever subsets are still cached.
+    _MST_CACHE, _HUBS_CACHE and _UMAP_CACHE pin subset matrices the same
+    way, so they are purged down to whatever subsets are still cached.
     """
     for key in [k for k, v in _SUBSET_CACHE.items() if v[0] is not matrix_all]:
         _SUBSET_CACHE.pop(key, None)
     live = [value[2] for value in _SUBSET_CACHE.values()]
-    for cache in (_TOP8_CACHE, _MST_CACHE, _HUBS_CACHE):
+    for cache in (_TOP8_CACHE, _MST_CACHE, _HUBS_CACHE, _UMAP_CACHE):
         for key in [k for k, v in cache.items()
                     if not any(v[0] is subset for subset in live)]:
             cache.pop(key, None)
@@ -1570,7 +1850,7 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
     it (/viz/map ranks on it), so the growth check does not repeat that
     caller's corpus_ids read.
     """
-    global _VIZ_SNAPSHOT, _ROW_NORMS, _FEEL_ALIGN_CACHE
+    global _VIZ_SNAPSHOT, _ROW_NORMS, _FEEL_ALIGN_CACHE, _RHYTHM_ALIGN_CACHE
 
     # Read live first: this is also the call that appends newly analyzed rows
     # to _MATRIX_CACHE, and it is the cheap part (only new ids are parsed).
@@ -1600,11 +1880,12 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
         _VIZ_SNAPSHOT = (time.monotonic(), ids, matrix)
         # The derived caches belong to the superseded matrix; drop them now
         # rather than letting them pin it until the LRU happens to evict.
-        # _ROW_NORMS and _FEEL_ALIGN_CACHE hold strong references to the old
-        # matrix too (the alignment holds the embedding matrix AND the feel
-        # matrix, so a stale entry pins both).
+        # _ROW_NORMS, _FEEL_ALIGN_CACHE and _RHYTHM_ALIGN_CACHE hold strong
+        # references to the old matrix too (the feel alignment holds the
+        # embedding matrix AND the feel matrix, so a stale entry pins both).
         _ROW_NORMS = None
         _FEEL_ALIGN_CACHE = None
+        _RHYTHM_ALIGN_CACHE = None
         _purge_viz_caches(matrix)
     return ids, matrix
 

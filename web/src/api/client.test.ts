@@ -1,4 +1,5 @@
-import { api, ApiError, clampFeel, decodeCoords8, DEFAULT_FEEL, loadStoredFeel, previewUrl, storeFeel } from "./client";
+import { api, ApiError, clampFeel, clampTempo, decodeCoords8, DEFAULT_FEEL, DEFAULT_TEMPO,
+  loadStoredFeel, loadStoredTempo, previewUrl, storeFeel, storeTempo, TEMPO_MAX } from "./client";
 
 function mockFetch(status: number, body: unknown) {
   globalThis.fetch = vi.fn(async () => new Response(JSON.stringify(body), { status,
@@ -158,4 +159,55 @@ test("loadStoredFeel reads, clamps, and falls back to the default", () => {
   localStorage.setItem("essentia.feel", "junk");
   expect(loadStoredFeel()).toBe(DEFAULT_FEEL);
   localStorage.clear();
+});
+
+test("recommend omits both weights at their server defaults and sends them otherwise", async () => {
+  mockFetch(200, { seed_track_id: "1", axis: "sounds_like", results: [] });
+  await api.recommend("1", "sounds_like", 10, DEFAULT_FEEL, DEFAULT_TEMPO);
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/recommend?track_id=1&axis=sounds_like&limit=10", expect.anything());
+
+  mockFetch(200, { seed_track_id: "1", axis: "sounds_like", results: [] });
+  await api.recommend("1", "sounds_like", 10, 1.2, 0.8);
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/recommend?track_id=1&axis=sounds_like&limit=10&feel=1.2&tempo=0.8",
+    expect.anything());
+});
+
+test("vizMap carries the tempo weight when it is not the default", async () => {
+  mockFetch(200, { points: {}, seed: {}, recs: [], axis: {} });
+  await api.vizMap("1", "sounds_like", 10, undefined, DEFAULT_FEEL, 1.5);
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/viz/map?track_id=1&axis=sounds_like&limit=10&tempo=1.5", expect.anything());
+});
+
+test("clampTempo keeps the range and falls back to the default on junk", () => {
+  expect(clampTempo("1.5")).toBe(1.5);
+  expect(clampTempo(99)).toBe(TEMPO_MAX);
+  expect(clampTempo(-3)).toBe(0);
+  expect(clampTempo("")).toBe(DEFAULT_TEMPO);
+  expect(clampTempo(null)).toBe(DEFAULT_TEMPO);
+  expect(clampTempo("banana")).toBe(DEFAULT_TEMPO);
+});
+
+test("the tempo weight round-trips through localStorage under its own key", () => {
+  localStorage.clear();
+  expect(loadStoredTempo()).toBe(DEFAULT_TEMPO);
+  storeTempo(0.7);
+  expect(localStorage.getItem("essentia.tempo")).toBe("0.7");
+  expect(loadStoredTempo()).toBe(0.7);
+});
+
+test("searchText hits /api/search/text with the phrase encoded", async () => {
+  mockFetch(200, { results: [] });
+  await api.searchText("hazy late-night trumpet");
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/search/text?q=hazy+late-night+trumpet", expect.anything());
+});
+
+test("searchText surfaces the server's 503 detail as an ApiError", async () => {
+  mockFetch(503, { detail: "text search unavailable: CLAP could not be loaded" });
+  await expect(api.searchText("jazz")).rejects.toMatchObject({
+    status: 503, detail: "text search unavailable: CLAP could not be loaded",
+  });
 });

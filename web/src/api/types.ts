@@ -7,9 +7,16 @@ export interface Track { track_id: string; title: string; artist: string; album:
 export interface Axis { id: string; label: string; }
 export interface SeedResponse { track_id: string; status: "ready" | "unanalyzed"; }
 export interface RecommendResponse { seed_track_id: string; axis: string; results: Track[]; }
+// contract/features.py RHYTHM_KEYS: the named, human-readable numbers CLAP
+// cannot give. `key` is 0-11 with 0 = C; `key_strength` 0 means the key field
+// means nothing.
+export interface Rhythm { tempo_bpm: number; beat_strength: number;
+  loudness_lufs: number; loudness_range: number;
+  key: number; mode: string; key_strength: number; }
 export interface ScoreMath { metric: string; dot: number; seed_norm: number; rec_norm: number;
   distance?: number | null; centrality?: number | null;
-  feel_dist?: number | null; feel?: { seed: number[]; rec: number[] } | null; }
+  feel_dist?: number | null; feel?: { seed: number[]; rec: number[] } | null;
+  tempo_dist?: number | null; rhythm?: { seed: Rhythm; rec: Rhythm } | null; }
 export interface VizPoint extends Track { x: number; y: number; }
 export interface VizRec extends VizPoint { score: number; math: ScoreMath; }
 export interface VizMap { points: { ids: string[]; x: number[]; y: number[]; tracks: Track[] };

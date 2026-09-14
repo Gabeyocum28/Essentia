@@ -2,6 +2,7 @@
 import numpy as np
 import pytest
 
+from music_recommendations.analysis.schema import FEATURES_VERSION
 from music_recommendations import worker
 from music_recommendations.corpus import crawl
 from music_recommendations.corpus.sources import deezer as deezer_source
@@ -16,7 +17,7 @@ TRACK = {
     "artwork_url": "http://x/a.jpg",
     "preview_url": "http://x/p.mp3",
 }
-FEATURES = {"embedding": [0.1, 0.2]}
+FEATURES = {"embedding": [0.1, 0.2], "_features_version": FEATURES_VERSION}
 
 
 def assert_features_match(track_id: str, expected: dict) -> None:
@@ -208,8 +209,8 @@ def test_tick_routes_an_attribution_job(fake_mongo, monkeypatch):
 def test_process_attribution_writes_one_delta_per_band(fake_mongo, embedding_stub,
                                                        monkeypatch):
     monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})
-    store.put_track(REC, {"embedding": [1.0, 0.0]})
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track(REC, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
     store.enqueue_attribution("42", "43")
 
     assert worker.process_attribution("42", "43") is True
@@ -231,7 +232,7 @@ def test_process_attribution_writes_one_delta_per_band(fake_mongo, embedding_stu
 def test_process_attribution_caches_failure_so_the_phone_stops_polling(fake_mongo,
                                                                        monkeypatch):
     monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})   # rec never analyzed
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})   # rec never analyzed
 
     assert worker.process_attribution("42", "43") is False
 
@@ -264,8 +265,8 @@ def test_attribution_measures_against_an_identically_processed_reference(
     """Deltas compare wav-vs-wav. Measuring against the stored mp3 embedding
     would fold the decode difference into all ten bands as a constant."""
     monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})
-    store.put_track(REC, {"embedding": [1.0, 0.0]})
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track(REC, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
 
     embeds = []
     original = worker._embed_waveform
@@ -290,8 +291,8 @@ def test_attribution_analyzes_at_the_long_window(fake_mongo, embedding_stub,
     falling back to band_stop's defaults would make neighbouring low bands
     measure the same thing again."""
     monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})
-    store.put_track(REC, {"embedding": [1.0, 0.0]})
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track(REC, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
 
     seen = []
     original = worker.viz.band_stop
@@ -316,8 +317,8 @@ def test_attribution_never_clips_a_hot_counterfactual(fake_mongo, embedding_stub
     import wave as wave_mod
 
     monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})
-    store.put_track(REC, {"embedding": [1.0, 0.0]})
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track(REC, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
     # A hot master: peaks already at full scale before anything is removed.
     t = np.arange(16000) / 16000.0
     hot = np.sin(2 * np.pi * 200 * t) + np.sin(2 * np.pi * 4000 * t)
@@ -374,7 +375,7 @@ def test_seed_fixture_if_empty_enqueues_the_distinct_fixture_tracks_once(fake_mo
 
 
 def test_seed_fixture_skipped_when_corpus_has_tracks(fake_mongo):
-    store.put_track(_tracks(["x"])[0], {"embedding": [1.0]})
+    store.put_track(_tracks(["x"])[0], {"embedding": [1.0], "_features_version": FEATURES_VERSION})
     assert worker.seed_fixture_if_empty() == 0
 
 
@@ -384,7 +385,7 @@ def test_crawl_step_enqueues_unseen_tracks_and_advances_cursor(fake_mongo, monke
                         lambda genre_ids, per_genre=100: (calls.append(("charts", genre_ids)), _tracks(["1", "2", "3"]))[1])
     monkeypatch.setattr(crawl, "snowball",
                         lambda root_names, hops=1, per_artist=10: (calls.append(("snowball", root_names)), _tracks(["3", "4"]))[1])
-    store.put_track(_tracks(["2"])[0], {"embedding": [1.0]})      # already analyzed
+    store.put_track(_tracks(["2"])[0], {"embedding": [1.0], "_features_version": FEATURES_VERSION})      # already analyzed
     assert worker.crawl_step() == 2                                 # 1 and 3
     assert store.get_state("crawl") == {"step": 1}
     assert worker.crawl_step() == 1                                 # 4 (3 is queued already)
@@ -504,7 +505,7 @@ def _edition(track_id, title, artist="Miles Davis"):
 
 
 def test_enqueue_new_skips_a_re_release_of_a_stored_track(fake_mongo):
-    store.put_track(_edition("1", "So What"), {"embedding": [1.0]})
+    store.put_track(_edition("1", "So What"), {"embedding": [1.0], "_features_version": FEATURES_VERSION})
     assert worker._enqueue_new([_edition("2", "So What (2009 Remaster)")]) == 0
     assert store.queued_count() == 0
     assert store.get_track("2") is None          # no metadata written either
@@ -521,7 +522,7 @@ def test_enqueue_new_queues_one_of_two_editions_in_the_same_batch(fake_mongo):
 
 
 def test_enqueue_new_keeps_a_cover_by_another_artist(fake_mongo):
-    store.put_track(_edition("1", "So What"), {"embedding": [1.0]})
+    store.put_track(_edition("1", "So What"), {"embedding": [1.0], "_features_version": FEATURES_VERSION})
     assert worker._enqueue_new([_edition("2", "So What", artist="Ron Carter")]) == 1
 
 
@@ -547,7 +548,7 @@ def test_crawl_step_logs_duplicates_skipped(fake_mongo, monkeypatch, capsys):
 
 def test_crawl_step_respects_corpus_cap_and_queue_depth(fake_mongo, monkeypatch):
     monkeypatch.setattr(worker, "CORPUS_CAP", 1)
-    store.put_track(_tracks(["x"])[0], {"embedding": [1.0]})
+    store.put_track(_tracks(["x"])[0], {"embedding": [1.0], "_features_version": FEATURES_VERSION})
     assert worker.crawl_step() == 0
     monkeypatch.setattr(worker, "CORPUS_CAP", 100000)
     monkeypatch.setattr(worker, "MAX_QUEUED", 1)

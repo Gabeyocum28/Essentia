@@ -5,6 +5,7 @@ import numpy as np
 import pymongo
 import pytest
 
+from contract.features import RHYTHM_KEYS
 from music_recommendations.analysis import FEATURES_VERSION
 from music_recommendations.server import store
 
@@ -101,8 +102,8 @@ def test_corpus_ids_is_sorted_and_incremental(fake_mongo):
 
 
 def test_base_matrix_rows_match_ids(fake_mongo):
-    store.put_track({**TRACK, "track_id": "a"}, {"embedding": [1.0, 0.0]})
-    store.put_track({**TRACK, "track_id": "b"}, {"embedding": [0.0, 1.0]})
+    store.put_track({**TRACK, "track_id": "a"}, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track({**TRACK, "track_id": "b"}, {"embedding": [0.0, 1.0], "_features_version": FEATURES_VERSION})
     store.put_track_meta({**TRACK, "track_id": "meta-only"})
     ids, matrix = store.base_matrix()
     assert ids == ["a", "b"]
@@ -116,9 +117,9 @@ def test_tracks_since_returns_only_newer(fake_mongo):
     # own analyzed_at (see tracks_since's docstring) -- callers dedupe by
     # id. What must hold is that "new" is present, and that a stamp
     # strictly after both returns nothing.
-    store.put_track({**TRACK, "track_id": "old"}, {"embedding": [1.0]})
+    store.put_track({**TRACK, "track_id": "old"}, {"embedding": [1.0], "_features_version": FEATURES_VERSION})
     stamp = store.get_analyzed_at("old")
-    store.put_track({**TRACK, "track_id": "new"}, {"embedding": [2.0]})
+    store.put_track({**TRACK, "track_id": "new"}, {"embedding": [2.0], "_features_version": FEATURES_VERSION})
     got = [tid for tid, _ in store.tracks_since(stamp)]
     assert "new" in got
     # A stamp built to be unambiguously later than both writes, rather than
@@ -479,3 +480,125 @@ def test_get_many_tracks_carries_the_optional_fields(fake_mongo):
     bare, cc = store.get_many_tracks(["42", "jamendo:168"])
     assert "attribution_url" not in bare
     assert cc["attribution_url"] == JAMENDO["attribution"]["url"]
+
+
+# ---- rhythm: the seven named numbers, optional the same way feel is ----
+
+RHYTHM = {"tempo_bpm": 136.4, "beat_strength": 0.97, "loudness_lufs": -27.6,
+          "loudness_range": 6.0, "key": 2, "mode": "minor",
+          "key_strength": 0.73}
+
+
+def test_put_track_stores_the_rhythm_dict(fake_mongo):
+    store.put_track(TRACK, {**FEATURES, "rhythm": RHYTHM})
+    assert fake_mongo.tracks.find_one({"_id": "42"})["rhythm"] == RHYTHM
+
+
+def test_stored_rhythm_is_narrowed_to_the_contract_keys(fake_mongo):
+    """A future extractor must not silently widen every document."""
+    store.put_track(TRACK, {**FEATURES, "rhythm": {**RHYTHM, "swing": 0.5}})
+    assert set(fake_mongo.tracks.find_one({"_id": "42"})["rhythm"]) == set(RHYTHM_KEYS)
+
+
+def test_put_track_without_rhythm_writes_no_field(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    assert "rhythm" not in fake_mongo.tracks.find_one({"_id": "42"})
+
+
+def test_get_features_returns_the_rhythm_dict(fake_mongo):
+    store.put_track(TRACK, {**FEATURES, "rhythm": RHYTHM})
+    got = store.get_features("42")
+    assert got["rhythm"] == RHYTHM
+    assert set(got) == {"embedding", "rhythm", "_features_version"}
+
+
+def test_get_features_omits_rhythm_when_the_row_has_none(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    assert "rhythm" not in store.get_features("42")
+
+
+def test_get_many_rhythm_projects_only_rhythm_in_request_order(fake_mongo):
+    store.put_track(TRACK, {**FEATURES, "rhythm": RHYTHM})
+    store.put_track({**TRACK, "track_id": "43"}, FEATURES)
+    assert store.get_many_rhythm(["43", "42", "nope"]) == [None, RHYTHM, None]
+
+
+def test_get_many_rhythm_of_nothing_is_nothing(fake_mongo):
+    assert store.get_many_rhythm([]) == []
+
+
+# ---- the corpus is version-4 only ----
+
+def test_a_row_from_an_older_feature_version_is_not_in_the_corpus(fake_mongo):
+    """A v3 EffNet vector and a v4 CLAP vector share no space at all, so a
+    corpus that mixes them ranks noise and nothing in the numbers says so."""
+    store.put_track(TRACK, {**FEATURES, "_features_version": FEATURES_VERSION - 1})
+    assert store.corpus_ids() == []
+    assert store.base_matrix()[0] == []
+    assert store.tracks_since(datetime(1970, 1, 1)) == []
+
+
+def test_a_row_with_no_version_at_all_is_not_in_the_corpus(fake_mongo):
+    """A writer that does not say which stack produced a vector has not
+    earned a place in the ranking."""
+    store.put_track(TRACK, {"embedding": [0.1, 0.2, -0.3]})
+    assert store.corpus_ids() == []
+
+
+def test_the_current_version_is_in_the_corpus(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    assert store.corpus_ids() == ["42"]
+    assert store.base_matrix()[0] == ["42"]
+
+
+def test_an_old_row_is_still_readable_by_name(fake_mongo):
+    """Leaving the corpus is not disappearing: a stale id is still a seed a
+    user can search up and press play on, and the backfill has to read it."""
+    store.put_track(TRACK, {**FEATURES, "_features_version": FEATURES_VERSION - 1})
+    assert store.get_track("42") == STORED
+    assert store.get_features("42")["_features_version"] == FEATURES_VERSION - 1
+
+
+def test_the_incremental_corpus_cache_also_honours_the_version(fake_mongo):
+    """corpus_ids' warm path is a different query from its cold one, so the
+    filter has to be in both -- _live_since is why it can only be in one."""
+    store.put_track(TRACK, FEATURES)
+    assert store.corpus_ids() == ["42"]          # cold: fills the cache
+    store.put_track({**TRACK, "track_id": "43"},
+                    {**FEATURES, "_features_version": FEATURES_VERSION - 1})
+    store.put_track({**TRACK, "track_id": "44"}, FEATURES)
+    assert store.corpus_ids() == ["42", "44"]    # warm: watermark query
+
+
+# ---- what the re-analysis backfill (Task 4) reads ----
+
+def test_stale_count_counts_only_superseded_live_rows(fake_mongo):
+    store.put_track(TRACK, FEATURES)
+    store.put_track({**TRACK, "track_id": "43"},
+                    {**FEATURES, "_features_version": FEATURES_VERSION - 1})
+    store.put_track({**TRACK, "track_id": "44"},
+                    {**FEATURES, "_features_version": 1})
+    assert store.stale_count() == 2
+
+
+def test_a_retired_duplicate_is_not_stale_work(fake_mongo):
+    """Re-analyzing a row that will never rank again is wasted download."""
+    store.put_track(TRACK, {**FEATURES, "_features_version": 1})
+    store.mark_duplicate("42", "99")
+    assert store.stale_count() == 0
+    assert store.stale_ids() == []
+
+
+def test_stale_ids_are_oldest_analyzed_first_and_limited(fake_mongo):
+    """Oldest first so an interrupted backfill makes forward progress: a
+    re-analyzed row gets a fresh analyzed_at and sorts to the back."""
+    for track_id in ("a", "b", "c"):
+        store.put_track({**TRACK, "track_id": track_id},
+                        {**FEATURES, "_features_version": 1})
+        fake_mongo.tracks.update_one(
+            {"_id": track_id},
+            {"$set": {"analyzed_at": datetime(2026, 9, 1 + ord(track_id) - ord("a"))}},
+        )
+    assert store.stale_ids(2) == ["a", "b"]
+    assert store.stale_ids() == ["a", "b", "c"]
+    assert store.stale_ids(0) == []

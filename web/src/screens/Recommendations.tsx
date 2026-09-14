@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
-import { api, clampFeel, loadStoredFeel, storeFeel, FEEL_MAX, FEEL_MIN } from "../api/client";
+import {
+  api, clampFeel, loadStoredFeel, storeFeel, FEEL_MAX, FEEL_MIN,
+  clampTempo, loadStoredTempo, storeTempo, TEMPO_MAX, TEMPO_MIN,
+} from "../api/client";
 import { Artwork } from "../components/Artwork";
 import { TrackRow } from "../components/TrackRow";
 import { Card } from "../components/Card";
@@ -9,6 +12,8 @@ import type { Track } from "../api/types";
 
 type Status = "loading" | "ready" | "error";
 
+// Both sliders share it: a drag is a stream of change events and each one
+// would otherwise be a request.
 const FEEL_DEBOUNCE_MS = 250;
 
 export function Recommendations() {
@@ -19,12 +24,13 @@ export function Recommendations() {
   const [status, setStatus] = useState<Status>("loading");
   const [results, setResults] = useState<Track[]>([]);
   const [feel, setFeel] = useState(loadStoredFeel);
+  const [tempo, setTempo] = useState(loadStoredTempo);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const run = useCallback(async (feelValue: number) => {
+  const run = useCallback(async (feelValue: number, tempoValue: number) => {
     setStatus("loading");
     try {
-      const res = await api.recommend(id, axis, 10, feelValue);
+      const res = await api.recommend(id, axis, 10, feelValue, tempoValue);
       setResults(res.results);
       setStatus("ready");
     } catch {
@@ -33,19 +39,32 @@ export function Recommendations() {
   }, [id, axis]);
 
   useEffect(() => {
-    void run(feel);
-    // Only re-run immediately on id/axis change; feel changes are debounced separately.
+    void run(feel, tempo);
+    // Only re-run immediately on id/axis change; slider changes are debounced separately.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, axis]);
+
+  // One debounce timer for both sliders: moving one while the other is
+  // pending should produce ONE request carrying both values, not two.
+  const debounced = (nextFeel: number, nextTempo: number) => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      void run(nextFeel, nextTempo);
+    }, FEEL_DEBOUNCE_MS);
+  };
 
   const handleFeelChange = (raw: number) => {
     const value = clampFeel(raw);
     setFeel(value);
     storeFeel(value);
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      void run(value);
-    }, FEEL_DEBOUNCE_MS);
+    debounced(value, tempo);
+  };
+
+  const handleTempoChange = (raw: number) => {
+    const value = clampTempo(raw);
+    setTempo(value);
+    storeTempo(value);
+    debounced(feel, value);
   };
 
   useEffect(() => {
@@ -80,6 +99,21 @@ export function Recommendations() {
         <span className="mono feel-slider-value">{feel.toFixed(1)}</span>
       </label>
 
+      <label className="feel-slider">
+        <span className="feel-slider-label">Match the tempo</span>
+        <input
+          type="range"
+          min={TEMPO_MIN}
+          max={TEMPO_MAX}
+          step={0.1}
+          value={tempo}
+          onChange={(e) => handleTempoChange(Number(e.target.value))}
+          className="feel-slider-input"
+          aria-label="Match the tempo"
+        />
+        <span className="mono feel-slider-value">{tempo.toFixed(1)}</span>
+      </label>
+
       {status === "loading" && (
         <>
           <p className="hint">Loading recommendations…</p>
@@ -90,7 +124,7 @@ export function Recommendations() {
       {status === "error" && (
         <div className="error-box">
           <p>Something went wrong</p>
-          <button type="button" onClick={() => void run(feel)}>
+          <button type="button" onClick={() => void run(feel, tempo)}>
             Try again
           </button>
         </div>
@@ -102,7 +136,7 @@ export function Recommendations() {
             <span className="recs-count">
               {results.length} {results.length === 1 ? "track" : "tracks"}
             </span>
-            <Link className="insights-link" to={`/insights/${id}/${axis}?feel=${feel}`}>
+            <Link className="insights-link" to={`/insights/${id}/${axis}?feel=${feel}&tempo=${tempo}`}>
               See the math ✦
             </Link>
           </div>

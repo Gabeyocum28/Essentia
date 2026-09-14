@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from music_recommendations.analysis.schema import FEATURES_VERSION
 from music_recommendations.server import app as app_module
 from music_recommendations.server import store, viz
 
@@ -78,10 +79,10 @@ def test_viz_snapshot_is_reused_inside_the_window(fake_mongo):
     object is a cold Insights screen."""
     for i in range(30):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 29.0]})
+                        {"embedding": [1.0, i / 29.0], "_features_version": FEATURES_VERSION})
     ids1, m1 = app_module._viz_snapshot()
     assert len(ids1) == 30
-    store.put_track({**TRACK, "track_id": "t30"}, {"embedding": [0.5, 0.5]})
+    store.put_track({**TRACK, "track_id": "t30"}, {"embedding": [0.5, 0.5], "_features_version": FEATURES_VERSION})
     ids2, m2 = app_module._viz_snapshot()
     assert m2 is m1 and ids2 == ids1          # +1 of 30 is under 5%: no rebuild
     assert "t30" not in ids2
@@ -90,16 +91,16 @@ def test_viz_snapshot_is_reused_inside_the_window(fake_mongo):
 def test_viz_snapshot_refreshes_after_the_window_or_growth(fake_mongo,
                                                            monkeypatch):
     for tid in ("a", "b"):
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": [1.0, 0.0]})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
     ids1, m1 = app_module._viz_snapshot()
     monkeypatch.setattr(app_module, "VIZ_REFRESH_S", 0.0)
-    store.put_track({**TRACK, "track_id": "c"}, {"embedding": [0.0, 1.0]})
+    store.put_track({**TRACK, "track_id": "c"}, {"embedding": [0.0, 1.0], "_features_version": FEATURES_VERSION})
     ids2, m2 = app_module._viz_snapshot()
     assert "c" in ids2 and m2 is not m1
     monkeypatch.setattr(app_module, "VIZ_REFRESH_S", 3600.0)
     for i in range(10):                        # +>5% growth forces a refresh too
         store.put_track({**TRACK, "track_id": f"g{i}"},
-                        {"embedding": [1.0, 1.0]})
+                        {"embedding": [1.0, 1.0], "_features_version": FEATURES_VERSION})
     ids3, _ = app_module._viz_snapshot()
     assert len(ids3) == 13
 
@@ -110,7 +111,7 @@ def test_viz_snapshot_refreshes_when_the_corpus_shrank(fake_mongo, monkeypatch):
     live, so "hasn't grown 5% yet" is the wrong answer."""
     for i in range(30):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 29.0]})
+                        {"embedding": [1.0, i / 29.0], "_features_version": FEATURES_VERSION})
     ids1, m1 = app_module._viz_snapshot()
     assert len(ids1) == 30
 
@@ -130,9 +131,9 @@ def test_viz_snapshot_refreshes_for_a_seed_it_does_not_hold(fake_mongo):
     screen, whatever the refresh window says."""
     for i in range(30):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 29.0]})
+                        {"embedding": [1.0, i / 29.0], "_features_version": FEATURES_VERSION})
     ids1, m1 = app_module._viz_snapshot()
-    store.put_track({**TRACK, "track_id": "fresh"}, {"embedding": [0.0, 1.0]})
+    store.put_track({**TRACK, "track_id": "fresh"}, {"embedding": [0.0, 1.0], "_features_version": FEATURES_VERSION})
     ids2, m2 = app_module._viz_snapshot()
     assert "fresh" not in ids2 and m2 is m1
     ids3, m3 = app_module._viz_snapshot(require="fresh")
@@ -150,10 +151,10 @@ def test_viz_subset_stays_warm_across_requests_inside_the_window(client,
     monkeypatch.setattr(app_module, "VIZ_MAX", 50)
     for i in range(30):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 29.0]})
+                        {"embedding": [1.0, i / 29.0], "_features_version": FEATURES_VERSION})
     first = client.get("/viz/tour?track_id=t0").json()
     subsets = len(app_module._SUBSET_CACHE)
-    store.put_track({**TRACK, "track_id": "t30"}, {"embedding": [0.5, 0.5]})
+    store.put_track({**TRACK, "track_id": "t30"}, {"embedding": [0.5, 0.5], "_features_version": FEATURES_VERSION})
     second = client.get("/viz/tour?track_id=t0").json()
     assert first == second
     assert len(app_module._SUBSET_CACHE) == subsets
@@ -165,9 +166,9 @@ def test_viz_map_draws_a_seed_analyzed_after_the_snapshot(client, fake_mongo,
     monkeypatch.setattr(app_module, "VIZ_MAX", 50)
     for i in range(30):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 29.0]})
+                        {"embedding": [1.0, i / 29.0], "_features_version": FEATURES_VERSION})
     client.get("/viz/tour?track_id=t0")
-    store.put_track({**TRACK, "track_id": "fresh"}, {"embedding": [0.0, 1.0]})
+    store.put_track({**TRACK, "track_id": "fresh"}, {"embedding": [0.0, 1.0], "_features_version": FEATURES_VERSION})
     body = client.get("/viz/map?track_id=fresh&axis=sounds_like&limit=3").json()
     assert body["seed"]["track_id"] == "fresh"
     assert "fresh" in body["points"]["ids"]
@@ -189,13 +190,14 @@ def test_viz_map_skips_a_rec_analyzed_after_the_snapshot(client, fake_mongo,
     # reason -- a shared title and artist is a shared dedupe key.
     for i in range(30):
         store.put_track({**TRACK, "track_id": f"t{i}", "title": f"Track {i}"},
-                        {"embedding": [float(np.cos(i * 0.2)),
-                                       float(np.sin(i * 0.2))]})
+                        {"_features_version": FEATURES_VERSION,
+                         "embedding": [float(np.cos(i * 0.2)),
+                                       float(np.sin(i * 0.2))], "_features_version": FEATURES_VERSION})
     client.get("/viz/tour?track_id=t0")
     before = app_module._VIZ_SNAPSHOT
     # A near-duplicate of the seed, so it would otherwise rank first.
     store.put_track({**TRACK, "track_id": "twin", "title": "Twin"},
-                    {"embedding": [float(np.cos(0.01)), float(np.sin(0.01))]})
+                    {"embedding": [float(np.cos(0.01)), float(np.sin(0.01))], "_features_version": FEATURES_VERSION})
 
     recommended = client.get(
         "/recommend?track_id=t0&axis=sounds_like&limit=3").json()["results"]
@@ -219,7 +221,7 @@ def test_viz_subset_does_not_touch_the_unit_cache(fake_mongo, monkeypatch):
     vecs = {"a": [1, 0], "b": [0.9, 0.1], "c": [0.7, 0.3],
             "d": [0.5, 0.5], "e": [0, 1]}
     for tid, v in vecs.items():
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v, "_features_version": FEATURES_VERSION})
     monkeypatch.setattr(app_module, "_similarity", lambda *a, **k: (
         _ for _ in ()).throw(AssertionError("_viz_subset used _UNIT_CACHE")))
     ids, matrix = app_module._viz_subset("c")
@@ -276,7 +278,7 @@ def test_recommend_fetches_tracks_in_one_batch(client, fake_mongo, monkeypatch):
     for i in range(4):
         # Distinct titles: same title + same artist reads as one recording.
         store.put_track({**TRACK, "track_id": f"t{i}", "title": f"Track {i}"},
-                        {"embedding": [1.0, i / 3.0]})
+                        {"embedding": [1.0, i / 3.0], "_features_version": FEATURES_VERSION})
     calls = []
     real = store.get_many_tracks
     monkeypatch.setattr(store, "get_many_tracks",
@@ -295,7 +297,7 @@ def test_recommend_fetches_tracks_in_one_batch(client, fake_mongo, monkeypatch):
 def test_viz_hubs_fetches_its_rows_in_one_batch(client, fake_mongo, monkeypatch):
     for i in range(6):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 5.0]})
+                        {"embedding": [1.0, i / 5.0], "_features_version": FEATURES_VERSION})
     calls = []
     real = store.get_many_tracks
     monkeypatch.setattr(store, "get_many_tracks",
@@ -311,7 +313,7 @@ def test_viz_hubs_fetches_its_rows_in_one_batch(client, fake_mongo, monkeypatch)
 def test_responses_are_gzipped_for_clients_that_ask(client, fake_mongo):
     for i in range(40):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 39.0]})
+                        {"embedding": [1.0, i / 39.0], "_features_version": FEATURES_VERSION})
     r = client.get("/viz/map?track_id=t0&axis=sounds_like&limit=5",
                    headers={"accept-encoding": "gzip"})
     assert r.status_code == 200
@@ -322,7 +324,7 @@ def test_responses_are_gzipped_for_clients_that_ask(client, fake_mongo):
 def test_viz_map_compact_points_omit_the_track_dicts(client, fake_mongo):
     for i in range(10):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 9.0]})
+                        {"embedding": [1.0, i / 9.0], "_features_version": FEATURES_VERSION})
     params = "track_id=t0&axis=sounds_like&limit=3"
     full = client.get(f"/viz/map?{params}").json()["points"]
     compact = client.get(f"/viz/map?{params}&points=compact").json()["points"]
@@ -338,7 +340,7 @@ def test_viz_map_compact_reads_only_the_tracks_it_names(client, fake_mongo,
     the whole subset's metadata either."""
     for i in range(10):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 9.0]})
+                        {"embedding": [1.0, i / 9.0], "_features_version": FEATURES_VERSION})
     calls = []
     real = store.get_many_tracks
     monkeypatch.setattr(store, "get_many_tracks",
@@ -356,7 +358,7 @@ def test_viz_map_compact_reads_only_the_tracks_it_names(client, fake_mongo,
 def test_viz_map_rejects_an_unknown_points_mode(client, fake_mongo):
     for i in range(3):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 2.0]})
+                        {"embedding": [1.0, i / 2.0], "_features_version": FEATURES_VERSION})
     r = client.get("/viz/map?track_id=t0&axis=sounds_like&points=sparse")
     assert r.status_code == 422
 
@@ -371,7 +373,7 @@ def test_viz_hubs_computes_the_neighbour_arrays_once_per_subset(client,
     monkeypatch.setattr(app_module, "VIZ_MAX", 50)
     for i in range(20):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 19.0]})
+                        {"embedding": [1.0, i / 19.0], "_features_version": FEATURES_VERSION})
     calls = []
     real = app_module._compute_hub_arrays
     monkeypatch.setattr(app_module, "_compute_hub_arrays",
@@ -443,7 +445,7 @@ def test_viz_walk_builds_the_knn_graph_once_per_subset_and_k(client,
     monkeypatch.setattr(app_module, "VIZ_MAX", 50)
     for i in range(20):
         store.put_track({**TRACK, "track_id": f"t{i}"},
-                        {"embedding": [1.0, i / 19.0]})
+                        {"embedding": [1.0, i / 19.0], "_features_version": FEATURES_VERSION})
     calls = []
     real = viz._build_knn_graph
     monkeypatch.setattr(viz, "_build_knn_graph",
@@ -490,7 +492,8 @@ def _feel_corpus(n: int, scored: set[str]) -> list[str]:
     ids = []
     for i in range(n):
         track_id = f"t{i}"
-        features = {"embedding": [1.0, i / float(n)]}
+        features = {"embedding": [1.0, i / float(n)],
+                    "_features_version": FEATURES_VERSION}
         if track_id in scored:
             features["feel"] = [0.5] * FEEL_DIM
         store.put_track({**TRACK, "track_id": track_id, "title": f"Track {i}"},
@@ -533,7 +536,7 @@ def test_unscored_ids_are_looked_up_once_not_once_per_request(client, fake_mongo
 
     # ...but a genuinely new track is still picked up, exactly once.
     store.put_track({**TRACK, "track_id": "t6", "title": "Track 6"},
-                    {"embedding": [1.0, 1.0], "feel": [0.4] * FEEL_DIM})
+                    {"embedding": [1.0, 1.0], "feel": [0.4] * FEEL_DIM, "_features_version": FEATURES_VERSION})
     client.get("/recommend", params=params)
     assert calls == [["t6"]]
     calls.clear()

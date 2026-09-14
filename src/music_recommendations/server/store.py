@@ -3,8 +3,9 @@
   tracks  _id=track_id, title, artist, album, artwork_url,
           embedding (int8 bytes), scale (float), features_version, analyzed_at
           -- the last four are absent until the track is analyzed --
-          and feel (11 floats), absent until the track is scored by the
-          classification heads (see scripts/feel_backfill.py).
+          feel (8 floats, analysis/feel_v2.FEEL_KEYS) and rhythm (the seven
+          contract RHYTHM_KEYS) -- both absent on rows analyzed before they
+          existed, and both optional to the ranking.
   jobs    _id="embed:{id}" | "attr:{seed}:{rec}", kind, state, claimed_at,
           attempts, error, created_at  (+ track_id or seed_id/rec_id)
   cache   _id="preview:{id}" | "attr:{seed}:{rec}", value, expires_at (TTL)
@@ -42,6 +43,8 @@ import pymongo
 from pymongo import ReturnDocument
 
 from music_recommendations.analysis.quantize import from_int8, to_int8
+from music_recommendations.analysis.schema import FEATURES_VERSION
+from contract.features import RHYTHM_KEYS
 from music_recommendations.server.dedupe import dedupe_key
 
 TRACK_FIELDS = ("title", "artist", "album", "artwork_url")
@@ -163,7 +166,21 @@ _TRACK_PROJECTION = {**{k: 1 for k in TRACK_FIELDS}, "source": 1, "attribution":
 # Deliberately NOT applied to get_features/get_many_features/get_track: a
 # retired id is still a legitimate SEED (a user can search it up on Deezer
 # and press play), and refusing to look it up would 404 a playable track.
-LIVE = {"analyzed_at": {"$exists": True}, "duplicate_of": {"$exists": False}}
+# `features_version` is part of it since v4: the CLAP embedding shares no
+# space at all with the v3 EffNet one (analysis/schema.py), so a corpus that
+# mixes them ranks nonsense against nonsense and nothing in the numbers says
+# so. Filtering here means one predicate retires every stale row from
+# ranking, the viz snapshot and the crawl watermark at once, and the
+# re-analysis backfill (stale_ids) is what brings them back.
+LIVE = {"analyzed_at": {"$exists": True}, "duplicate_of": {"$exists": False},
+        "features_version": FEATURES_VERSION}
+
+
+def _live_since(stamp: datetime) -> dict:
+    """LIVE, plus "analyzed at or after `stamp`" -- the incremental form the
+    watermark readers use. Spelled once so a change to LIVE cannot be
+    forgotten in corpus_ids' fast path or tracks_since."""
+    return {**LIVE, "analyzed_at": {"$gte": stamp}}
 
 
 # The feel vector is eleven probabilities in [0, 1], stored as plain BSON
@@ -182,12 +199,33 @@ def _feel(features: dict) -> list[float] | None:
             for v in np.asarray(value, dtype=np.float32).ravel()]
 
 
+# The rhythm dict is stored whole and read back whole: seven named,
+# human-readable numbers (contract/features.py RHYTHM_KEYS) totalling well
+# under 200 bytes a row. Unknown keys are dropped rather than stored, so a
+# future extractor cannot quietly widen every document.
+def _rhythm(features: dict) -> dict | None:
+    """The rhythm dict narrowed to RHYTHM_KEYS, or None if there is none."""
+    value = features.get("rhythm")
+    if not isinstance(value, dict):
+        return None
+    out = {k: value[k] for k in RHYTHM_KEYS if k in value}
+    return out or None
+
+
 def put_track(track: dict, features: dict) -> None:
-    """Upsert contract fields plus the analyzed embedding (and feel, if any).
+    """Upsert contract fields plus the analyzed embedding (and feel/rhythm).
 
     `feel` is optional on the way in: rows analyzed before the heads shipped
     have none until scripts/feel_backfill.py runs, and the ranking treats a
-    missing vector as "no penalty" rather than hiding the track.
+    missing vector as "no penalty" rather than hiding the track. `rhythm` is
+    optional the same way and for the same reason -- it only exists from
+    version 4 on, and a row without it simply takes no tempo penalty.
+
+    `features_version` comes off the analysis dict's `_features_version`
+    (VERSION_KEY) and is what LIVE filters on: a caller that omits it writes
+    version 0, which is a row no corpus enumeration will ever serve. That is
+    deliberate -- a writer that does not say which stack produced a vector
+    has not earned a place in the ranking.
     """
     ensure_indexes()
     data, scale = to_int8(np.asarray(features["embedding"], dtype=np.float32))
@@ -196,6 +234,9 @@ def put_track(track: dict, features: dict) -> None:
     feel = _feel(features)
     if feel is not None:
         fields["feel"] = feel
+    rhythm = _rhythm(features)
+    if rhythm is not None:
+        fields["rhythm"] = rhythm
     db().tracks.update_one(
         {"_id": track["track_id"]},
         {"$set": fields, "$currentDate": {"analyzed_at": True}},
@@ -225,7 +266,8 @@ def get_many_tracks(track_ids: list[str]) -> list[dict | None]:
 # What every feature read projects. `feel` is included but never required:
 # _features() omits the key entirely when the row has not been scored, which
 # is exactly what app.py's _rows_for tests for.
-_FEATURE_FIELDS = {"embedding": 1, "scale": 1, "features_version": 1, "feel": 1}
+_FEATURE_FIELDS = {"embedding": 1, "scale": 1, "features_version": 1,
+                   "feel": 1, "rhythm": 1}
 
 
 def _features(doc: dict | None) -> dict | None:
@@ -235,6 +277,8 @@ def _features(doc: dict | None) -> dict | None:
            VERSION_KEY: doc.get("features_version", 0)}
     if doc.get("feel") is not None:
         out["feel"] = [float(v) for v in doc["feel"]]
+    if doc.get("rhythm") is not None:
+        out["rhythm"] = dict(doc["rhythm"])
     return out
 
 
@@ -275,6 +319,24 @@ def get_many_feel(track_ids: list[str]) -> list[list[float] | None]:
     return [found.get(t) for t in track_ids]
 
 
+def get_many_rhythm(track_ids: list[str]) -> list[dict | None]:
+    """The rhythm dict per requested id, in order; None where there is none.
+
+    A projection of `rhythm` alone, for the same reason get_many_feel
+    exists: the ranking's tempo term wants one float a row and the generic
+    read would dequantize a 1024-int8 embedding per candidate to get it.
+    No LIVE filter, like every other by-name read.
+    """
+    if not track_ids:
+        return []
+    found = {}
+    for doc in db().tracks.find({"_id": {"$in": track_ids}}, {"rhythm": 1}):
+        value = doc.get("rhythm")
+        if value is not None:
+            found[doc["_id"]] = dict(value)
+    return [found.get(t) for t in track_ids]
+
+
 def get_analyzed_at(track_id: str) -> datetime | None:
     doc = db().tracks.find_one({"_id": track_id}, {"analyzed_at": 1})
     return doc.get("analyzed_at") if doc else None
@@ -293,12 +355,12 @@ def tracks_since(stamp: datetime) -> list[tuple[str, np.ndarray]]:
     by re-using the last-seen `analyzed_at` as the next `stamp` must dedupe
     by track id.
 
-    Retired duplicates (`duplicate_of` set) are excluded, like every other
-    corpus enumeration -- a caller paging this to build a matrix must not
-    re-introduce a row corpus_ids() no longer lists.
+    Retired duplicates (`duplicate_of` set) and rows from a superseded
+    feature version are excluded, like every other corpus enumeration -- a
+    caller paging this to build a matrix must not re-introduce a row
+    corpus_ids() no longer lists.
     """
-    cursor = db().tracks.find({"duplicate_of": {"$exists": False},
-                               "analyzed_at": {"$gte": stamp}},
+    cursor = db().tracks.find(_live_since(stamp),
                               {"embedding": 1, "scale": 1}).sort("analyzed_at", 1)
     return [(d["_id"], from_int8(d["embedding"], d["scale"])) for d in cursor]
 
@@ -327,9 +389,7 @@ def corpus_ids() -> list[str]:
         # analyzed in another process within the same millisecond as the
         # watermark would otherwise be missed. Re-fetching the watermark
         # row itself is harmless -- the set union below dedupes it.
-        fresh = list(db().tracks.find({"duplicate_of": {"$exists": False},
-                                       "analyzed_at": {"$gte": newest}},
-                                      {"analyzed_at": 1}))
+        fresh = list(db().tracks.find(_live_since(newest), {"analyzed_at": 1}))
         if fresh:
             newest = max(d["analyzed_at"] for d in fresh)
             ids = sorted(set(ids) | {d["_id"] for d in fresh})
@@ -339,6 +399,34 @@ def corpus_ids() -> list[str]:
 
 def corpus_size() -> int:
     return len(corpus_ids())
+
+
+# Rows that ARE analyzed and not retired, but under a superseded feature
+# version: exactly what LIVE now excludes. They are invisible to ranking
+# until something re-analyzes them, so the re-analysis pass (Task 4) needs
+# to see both how many are left and which to take next.
+_STALE = {"analyzed_at": {"$exists": True}, "duplicate_of": {"$exists": False},
+          "features_version": {"$lt": FEATURES_VERSION}}
+
+
+def stale_count() -> int:
+    """How many live-analyzed rows are below the current feature version."""
+    return db().tracks.count_documents(_STALE)
+
+
+def stale_ids(limit: int = 100) -> list[str]:
+    """The next `limit` stale ids, oldest `analyzed_at` first.
+
+    Oldest-first so a backfill that is interrupted and restarted makes
+    forward progress instead of re-taking the same head of the list: a
+    re-analyzed row gets a fresh `analyzed_at` (put_track stamps it) and
+    therefore sorts to the back even before its version changes.
+    """
+    if limit <= 0:
+        return []
+    cursor = (db().tracks.find(_STALE, {"_id": 1})
+              .sort("analyzed_at", pymongo.ASCENDING).limit(int(limit)))
+    return [d["_id"] for d in cursor]
 
 
 def existing_keys(keys: list[str]) -> set[str]:

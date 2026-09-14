@@ -406,6 +406,17 @@ img.art,
   color: var(--muted);
 }
 
+/* The "by description" toggle, under the search box it changes the meaning
+   of. */
+.search-mode {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: var(--space-2);
+}
+
 .search-form {
   display: flex;
   align-items: center;
@@ -1030,6 +1041,33 @@ img.art,
 }
 .feel-compare-dist {
   margin-top: var(--space-1) !important;
+}
+
+/* The rhythm table: label, the seed's value, the pick's value. Same two
+   accent colours as the feel bars above, so "left is the seed" is learned
+   once. */
+.rhythm-compare {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rhythm-row {
+  display: grid;
+  grid-template-columns: 84px 1fr 1fr;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.rhythm-row-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+.rhythm-row-seed {
+  color: var(--seed);
+  font-size: 12px;
+}
+.rhythm-row-rec {
+  color: var(--accent);
+  font-size: 12px;
 }
 
 /* ------------------------------------------------------------- feel slider */

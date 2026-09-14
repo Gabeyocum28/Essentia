@@ -3,10 +3,15 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from statistics import pstdev
+
+from music_recommendations.analysis.schema import FEATURES_VERSION
+from music_recommendations.analysis import clap
 from music_recommendations.server import app as app_module
 from music_recommendations.server import deezer as deezer_api
 from music_recommendations.server import store
@@ -42,6 +47,8 @@ def fake_features(seed_val: float) -> dict:
             v[0] = 1.0
             v[1] = seed_val
             out[key] = v
+    # Without it the row is version 0, which store.LIVE no longer serves.
+    out["_features_version"] = FEATURES_VERSION
     return out
 
 
@@ -236,7 +243,7 @@ def _angled(theta: float) -> dict:
     v = [0.0] * FEATURE_KEYS["embedding"]
     v[0] = math.cos(theta)
     v[1] = math.sin(theta)
-    return {"embedding": v}
+    return {"embedding": v, "_features_version": FEATURES_VERSION}
 
 
 # id, title, artist, angle from the seed (radians)
@@ -819,7 +826,7 @@ def test_seed_does_not_resign_when_the_stored_url_works(client, fake_mongo,
 
 def test_cold_matrix_uses_base_matrix(fake_mongo, monkeypatch):
     for tid, vec in (("a", [1.0, 0.0]), ("b", [0.0, 1.0])):
-        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec})
+        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec, "_features_version": FEATURES_VERSION})
     calls = []
     real = store.get_many_features
     monkeypatch.setattr(store, "get_many_features",
@@ -836,12 +843,12 @@ def test_corpus_matrix_stays_float32_as_the_corpus_grows(fake_mongo):
     import numpy as np
 
     for tid, vec in (("a", [1.0, 0.0]), ("b", [0.0, 1.0])):
-        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec})
+        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec, "_features_version": FEATURES_VERSION})
     app_module._corpus_matrix(("a", "b"), "embedding", "cosine", False)
     assert app_module._MATRIX_CACHE["embedding"].matrix.dtype == np.float32
 
     # One more track: the growth path, not a cold rebuild.
-    store.put_track({**FIXTURE[0], "track_id": "c"}, {"embedding": [0.5, 0.5]})
+    store.put_track({**FIXTURE[0], "track_id": "c"}, {"embedding": [0.5, 0.5], "_features_version": FEATURES_VERSION})
     ids, matrix, _ = app_module._corpus_matrix(("a", "b", "c"), "embedding",
                                                "cosine", False)
     assert ids == ["a", "b", "c"]
@@ -959,10 +966,13 @@ def test_absolute_and_double_slash_paths_cannot_escape_web_dist(monkeypatch, tmp
 
 # ---- /recommend: the feel blend ----
 #
-# The embedding ranks by style; the eleven-dimension feel vector carries
+# The embedding ranks by style; the eight-dimension feel vector carries
 # energy, mood and texture. `feel` weights the second against the first:
 #
-#     blended = cos(embedding) - feel * mean|feel_rec - feel_seed|
+#     blended = cos(embedding) - feel * mean|z(feel_rec) - z(feel_seed)|
+#
+# The z-score is per dimension over the corpus, which is what stops the one
+# axis with the widest spread from deciding every ranking on its own.
 #
 # The corpus below is built so the two disagree on purpose. "near" is the
 # closest thing in embedding space but feels nothing like the seed; "feely"
@@ -980,6 +990,11 @@ def _feeling(theta: float, feel: float | None) -> dict:
         features["feel"] = [feel] * FEEL_DIM
     return features
 
+
+# Feel distances are z-scores over the corpus (app._feel_alignment), and
+# every scored row below carries one value on all eight dimensions, so the
+# divisor is the population std of the three stored values.
+FEEL_SPREAD = pstdev([0.5, 1.0, 0.5])
 
 # id, title, angle from the seed, every feel dimension's value
 FEEL_CORPUS = [
@@ -1030,7 +1045,9 @@ def test_a_row_without_feel_is_never_penalized(client, feel_corpus):
     # atol covers the int8 round trip the embedding makes through the store.
     assert scores["blank"] == pytest.approx(math.cos(0.60), abs=2e-3)
     assert scores["feely"] == pytest.approx(math.cos(0.45), abs=2e-3)
-    assert scores["near"] == pytest.approx(math.cos(0.30) - 2 * 0.5, abs=2e-3)
+    # The penalty is a z-score, not the raw 0.5: see FEEL_SPREAD.
+    assert scores["near"] == pytest.approx(
+        math.cos(0.30) - 2 * (0.5 / FEEL_SPREAD), abs=2e-3)
 
 
 def test_feel_leaves_surprise_alone(client, feel_corpus):
@@ -1192,3 +1209,240 @@ def test_recommend_rows_carry_the_source_and_backlink(client, fake_mongo):
     assert _contract_shape(rec, scored=True)
     assert rec["source"] == "jamendo"
     assert rec["attribution_url"] == JAMENDO_TRACK["attribution"]["url"]
+
+
+# ---- /recommend: the tempo term ----
+#
+# CLAP is trained on 7 s windows with a contrastive objective, so it throws
+# tempo away almost completely: a ballad and a double-time burner of the same
+# idiom sit in the same corner of the space. `tempo` weights an octave-folded
+# distance between the two stored BPMs:
+#
+#     d = log2(bpm_seed / bpm_rec);  tempo_dist = clip(min(|d|,|d-1|,|d+1|), 0, .5)
+#
+# Folding, because 90 and 180 BPM are the same groove counted differently and
+# every beat tracker disagrees with every other about which to report.
+
+def _with_tempo(theta: float, bpm: float | None) -> dict:
+    features = _angled(theta)
+    if bpm is not None:
+        features["rhythm"] = {"tempo_bpm": bpm, "beat_strength": 0.9,
+                              "loudness_lufs": -9.0, "loudness_range": 5.0,
+                              "key": 2, "mode": "minor", "key_strength": 0.7}
+    return features
+
+
+# id, angle from the seed, stored BPM
+TEMPO_CORPUS = [
+    ("s",      0.00, 120.0),
+    ("near",   0.30, 160.0),   # closest cosine, a third of an octave out
+    ("octave", 0.45, 240.0),   # further out in style, the same groove doubled
+    ("slow",   0.60, 40.0),    # 1.58 octaves down: past the clip
+    ("blank",  0.75, None),    # no rhythm at all
+]
+
+
+@pytest.fixture
+def tempo_corpus(fake_mongo):
+    for i, (track_id, theta, bpm) in enumerate(TEMPO_CORPUS):
+        store.put_track({"track_id": track_id, "title": f"Track {track_id}",
+                         "artist": f"Artist {i}", "album": "Kind of Blue",
+                         "artwork_url": "u"},
+                        _with_tempo(theta, bpm))
+    return TEMPO_CORPUS
+
+
+def _tempo_scores(client, **params) -> dict[str, float]:
+    body = client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
+                                            "feel": 0, **params}).json()
+    return {t["track_id"]: t["score"] for t in body["results"]}
+
+
+def test_tempo_zero_is_the_embedding_only_order(client, tempo_corpus):
+    scores = _tempo_scores(client, tempo=0)
+    assert list(scores) == ["near", "octave", "slow", "blank"]
+    assert scores["near"] == pytest.approx(math.cos(0.30), abs=2e-3)
+
+
+def test_an_octave_apart_is_not_a_tempo_difference(client, tempo_corpus):
+    """240 against 120 is the same groove counted in half bars."""
+    scores = _tempo_scores(client, tempo=3)
+    assert scores["octave"] == pytest.approx(math.cos(0.45), abs=2e-3)
+
+
+def test_a_closer_tempo_outranks_a_closer_embedding(client, tempo_corpus):
+    """"near" leads by 0.055 of cosine and is 0.415 octaves out of tempo."""
+    assert list(_tempo_scores(client, tempo=0))[0] == "near"
+    assert list(_tempo_scores(client, tempo=2))[0] == "octave"
+
+
+def test_the_tempo_distance_is_the_folded_log_ratio(client, tempo_corpus):
+    scores = _tempo_scores(client, tempo=1)
+    expected = abs(math.log2(120.0 / 160.0))          # 0.415, inside the clip
+    assert scores["near"] == pytest.approx(math.cos(0.30) - expected, abs=2e-3)
+
+
+def test_the_tempo_distance_is_clipped(client, tempo_corpus):
+    """40 BPM against 120 folds to 0.585 octaves; past half an octave the two
+    tracks are simply at different tempi and the penalty stops growing, so it
+    can never swamp the cosine it is subtracted from."""
+    scores = _tempo_scores(client, tempo=1)
+    assert scores["slow"] == pytest.approx(math.cos(0.60) - 0.5, abs=2e-3)
+
+
+def test_a_row_without_rhythm_is_never_penalized(client, tempo_corpus):
+    scores = _tempo_scores(client, tempo=3)
+    assert scores["blank"] == pytest.approx(math.cos(0.75), abs=2e-3)
+
+
+def test_a_seed_without_rhythm_ranks_on_the_embedding_alone(client, tempo_corpus):
+    body = client.get("/recommend", params={"track_id": "blank", "feel": 0,
+                                            "axis": "sounds_like",
+                                            "tempo": 3}).json()
+    scores = [t["score"] for t in body["results"]]
+    assert scores == sorted(scores, reverse=True)
+    assert all(score > 0 for score in scores)
+
+
+def test_tempo_leaves_surprise_alone(client, tempo_corpus):
+    off = client.get("/recommend", params={"track_id": "s", "axis": "surprise",
+                                           "tempo": 0}).json()["results"]
+    on = client.get("/recommend", params={"track_id": "s", "axis": "surprise",
+                                          "tempo": 3}).json()["results"]
+    assert off == on
+
+
+def test_the_server_owns_the_default_tempo_weight(client, tempo_corpus):
+    """The web client omits `tempo` at its own default so this number can be
+    retuned without shipping a bundle; the two must therefore agree."""
+    assert app_module.TEMPO_DEFAULT == 0.2
+    assert (_tempo_scores(client)
+            == _tempo_scores(client, tempo=app_module.TEMPO_DEFAULT))
+
+
+def test_tempo_weight_is_bounded(client, tempo_corpus):
+    for bad in (-1, 99):
+        assert client.get("/recommend", params={"track_id": "s", "tempo": bad,
+                                                "axis": "sounds_like"}
+                          ).status_code == 422
+
+
+def test_tempo_never_leaks_into_a_result_track(client, tempo_corpus):
+    body = client.get("/recommend", params={"track_id": "s", "tempo": 1,
+                                            "axis": "sounds_like"}).json()
+    for track in body["results"]:
+        assert _contract_shape(track, scored=True)
+
+
+def test_the_rhythm_alignment_is_cached_across_requests(client, tempo_corpus,
+                                                        monkeypatch):
+    """One `rhythm` read for the whole corpus per matrix identity, not one
+    per request: this is on the /recommend path."""
+    reads = []
+    real = store.get_many_rhythm
+    monkeypatch.setattr(store, "get_many_rhythm",
+                        lambda ids: (reads.append(len(ids)), real(ids))[1])
+    params = {"track_id": "s", "axis": "sounds_like", "tempo": 1}
+    client.get("/recommend", params=params)
+    client.get("/recommend", params=params)
+    assert len(reads) == 1
+
+
+# ---- GET /search/text: the corpus, asked in English ----
+
+TEXT_DIM = FEATURE_KEYS["embedding"]
+
+
+def _text_vector(theta: float) -> np.ndarray:
+    """A (1, 1024) unit row, the shape clap.embed_text answers with."""
+    v = np.zeros((1, TEXT_DIM), dtype=np.float32)
+    v[0, 0], v[0, 1] = math.cos(theta), math.sin(theta)
+    return v
+
+
+@pytest.fixture
+def text_corpus(fake_mongo):
+    """Four tracks on a circle, so a text vector at an angle has a known
+    nearest neighbour."""
+    for i, theta in enumerate((0.0, 0.4, 0.8, 1.2)):
+        store.put_track({"track_id": f"t{i}", "title": f"Track {i}",
+                         "artist": "Miles Davis", "album": "Kind of Blue",
+                         "artwork_url": "u"},
+                        _angled(theta))
+    return ["t0", "t1", "t2", "t3"]
+
+
+def test_search_text_ranks_the_corpus_by_cosine_to_the_phrase(client, text_corpus,
+                                                              monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.8))
+    body = client.get("/search/text", params={"q": "hazy late-night trumpet"}).json()
+    ids = [t["track_id"] for t in body["results"]]
+    assert ids == ["t2", "t1", "t3", "t0"]
+    assert body["results"][0]["score"] == pytest.approx(1.0, abs=2e-3)
+
+
+def test_search_text_passes_the_phrase_to_clap_once(client, text_corpus, monkeypatch):
+    asked = []
+    monkeypatch.setattr(clap, "embed_text",
+                        lambda prompts: (asked.append(prompts), _text_vector(0.0))[1])
+    client.get("/search/text", params={"q": "  solo piano  "})
+    assert asked == [["solo piano"]]
+
+
+def test_search_text_results_are_contract_tracks_with_a_score(client, text_corpus,
+                                                              monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    for track in client.get("/search/text", params={"q": "jazz"}).json()["results"]:
+        assert _contract_shape(track, scored=True)
+
+
+def test_search_text_honours_the_limit(client, text_corpus, monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    body = client.get("/search/text", params={"q": "jazz", "limit": 2}).json()
+    assert len(body["results"]) == 2
+
+
+def test_search_text_rejects_an_empty_query(client, text_corpus, monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    assert client.get("/search/text", params={"q": "   "}).status_code == 400
+
+
+def test_search_text_is_503_when_clap_is_not_installed(client, text_corpus,
+                                                       monkeypatch):
+    """The rest of the API is fine; the client should hide the toggle rather
+    than report the service down."""
+    def missing(_prompts):
+        raise ImportError("No module named 'msclap'")
+
+    monkeypatch.setattr(clap, "embed_text", missing)
+    res = client.get("/search/text", params={"q": "jazz"})
+    assert res.status_code == 503
+    assert "CLAP" in res.json()["detail"]
+
+
+def test_search_text_is_503_when_the_weights_were_never_fetched(client, text_corpus,
+                                                                monkeypatch):
+    def missing(_prompts):
+        raise FileNotFoundError("models/v2/CLAP_weights_2023.pth missing")
+
+    monkeypatch.setattr(clap, "embed_text", missing)
+    assert client.get("/search/text", params={"q": "jazz"}).status_code == 503
+
+
+def test_search_text_is_503_against_a_corpus_that_is_not_clap_space(client,
+                                                                    monkeypatch):
+    """A version-3 (or synthetic) corpus cannot be compared with a text
+    vector at all; numpy would raise that as a 500."""
+    store.put_track({"track_id": "narrow", "title": "t", "artist": "a",
+                     "album": "b", "artwork_url": "u"},
+                    {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    res = client.get("/search/text", params={"q": "jazz"})
+    assert res.status_code == 503
+    assert "CLAP space" in res.json()["detail"]
+
+
+def test_search_text_on_an_empty_corpus_is_empty_not_an_error(client, fake_mongo,
+                                                              monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    assert client.get("/search/text", params={"q": "jazz"}).json() == {"results": []}

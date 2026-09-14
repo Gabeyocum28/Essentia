@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from music_recommendations.analysis.schema import FEATURES_VERSION
 from music_recommendations.server import store
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "feel_backfill.py"
@@ -35,7 +36,7 @@ def _put(track_id: str, first: float, **features) -> None:
     store.put_track({"track_id": track_id, "title": track_id,
                      "artist": "Miles Davis", "album": "Kind of Blue",
                      "artwork_url": "u"},
-                    {"embedding": vec, **features})
+                    {"embedding": vec, **features, "_features_version": FEATURES_VERSION})
 
 
 def _feel(track_id: str) -> list[float] | None:

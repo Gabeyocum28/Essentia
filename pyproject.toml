@@ -8,6 +8,11 @@ dependencies = [
     "uvicorn>=0.29",
     "pymongo>=4.6",
     "numpy>=1.26",
+    # The galaxy layout (server/viz.project_umap). A RUNTIME dependency, not
+    # an analysis one: the API process draws the map, and the box that runs
+    # it need not be the box that has torch. Pulls numba + llvmlite (both
+    # BSD), which is why it is imported inside the function that uses it.
+    "umap-learn>=0.5",
 ]
 
 [project.optional-dependencies]
