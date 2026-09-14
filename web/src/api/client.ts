@@ -10,13 +10,32 @@ export class ApiError extends Error {
   }
 }
 
+/** 409 from a ranking endpoint: the seed is waiting to be re-analyzed.
+ *
+ * Not an error the user can do anything about and not a failure of ours --
+ * the track was analyzed by a superseded version of the audio model and the
+ * worker is redoing it. The screens retry instead of reporting a fault. */
+export const UNANALYZED = 409;
+
+export function isUnanalyzed(err: unknown): boolean {
+  return err instanceof ApiError && err.status === UNANALYZED;
+}
+
 const BASE = "/api";
 
 async function request<R>(path: string, init?: RequestInit): Promise<R> {
   const res = await fetch(BASE + path, { headers: { "content-type": "application/json" }, ...init });
   if (!res.ok) {
     let detail = res.statusText;
-    try { detail = (await res.json()).detail ?? detail; } catch { /* non-JSON error body */ }
+    try {
+      const body = await res.json();
+      // `detail` is FastAPI's own error shape; `reason` is the flat
+      // {status, track_id, reason} body the 409 unanalyzed-seed handler
+      // sends. Both are strings -- a nested object here is what produced
+      // "409: [object Object]" on screen.
+      const said = body?.detail ?? body?.reason;
+      if (typeof said === "string" && said) detail = said;
+    } catch { /* non-JSON error body */ }
     throw new ApiError(res.status, detail);
   }
   return res.json() as Promise<R>;

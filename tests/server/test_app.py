@@ -584,7 +584,13 @@ def test_recommend_with_a_seed_from_another_feature_space_is_not_a_500(
                                          "axis": "sounds_like"})
 
     assert r.status_code == 409
-    assert r.json()["detail"]["status"] == "unanalyzed"
+    body = r.json()
+    # FLAT, not nested under "detail": FastAPI wraps an HTTPException's detail,
+    # and the web client reads `.detail` as a string -- a dict there reaches
+    # the user as "409: [object Object]".
+    assert body == {"status": "unanalyzed", "track_id": "old",
+                    "reason": body["reason"]}
+    assert "re-analysis" in body["reason"]
 
 
 def test_viz_map_with_a_mismatched_seed_is_not_a_500(client, seeded_corpus,
@@ -598,7 +604,9 @@ def test_viz_map_with_a_mismatched_seed_is_not_a_500(client, seeded_corpus,
     r = client.get("/viz/map", params={"track_id": "old", "axis": "sounds_like"})
 
     assert r.status_code == 409
-    assert r.json()["detail"]["status"] == "unanalyzed"
+    assert r.json()["status"] == "unanalyzed"
+    assert isinstance(r.json()["reason"], str)
+    assert "detail" not in r.json()
 
 
 def test_recommend_limit_is_capped(client, seeded_corpus):

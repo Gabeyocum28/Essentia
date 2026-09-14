@@ -106,6 +106,25 @@ struct APIClientTests {
         }
     }
 
+    /// 409 is not a server fault: the seed's vectors came from a superseded
+    /// audio model and the worker is redoing it, so the message the user sees
+    /// has to say that rather than "the server returned status 409".
+    @Test func aConflictReadsAsReanalyzing() async throws {
+        MockURLProtocol.handler = { _ in
+            (409, Data(#"{ "status": "unanalyzed", "track_id": "1", "reason": "queued" }"#.utf8))
+        }
+        do {
+            _ = try await makeClient().recommend(trackID: "1", axis: "sounds_like")
+            Issue.record("a 409 must throw")
+        } catch let error as APIError {
+            guard case .reanalyzing = error else {
+                Issue.record("expected .reanalyzing, got \(error)")
+                return
+            }
+            #expect(error.errorDescription?.contains("re-analyzing") == true)
+        }
+    }
+
     @Test func seedDecodesUnanalyzedStatus() async throws {
         MockURLProtocol.handler = { _ in
             (200, Data(#"{ "track_id": "3135556", "status": "unanalyzed" }"#.utf8))

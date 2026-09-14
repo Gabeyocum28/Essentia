@@ -625,6 +625,31 @@ def test_a_row_leaves_the_queue_only_after_three_classifiable_failures(fake_mong
         "UnfetchableTrack: no preview"
 
 
+def test_blips_do_not_add_up_to_a_verdict(fake_mongo):
+    """D2: two network blips and one DecodeError is not three DecodeErrors.
+    Only failures that are evidence ABOUT THE TRACK may retire it, so they
+    get their own counter."""
+    store.put_track(TRACK, {**FEATURES, "_features_version": 1})
+
+    store.record_reanalysis_failure("42", "OSError: 500", classifiable=False)
+    store.record_reanalysis_failure("42", "OSError: 500", classifiable=False)
+    store.record_reanalysis_failure("42", "DecodeError: not audio",
+                                    classifiable=True)
+
+    row = fake_mongo.tracks.find_one({"_id": "42"})
+    assert row["reanalysis_attempts"] == 3
+    assert row["reanalysis_classifiable_attempts"] == 1
+    assert "reanalysis_failed_at" not in row
+    assert store.stale_count() == 1
+
+    for _ in range(2):
+        store.record_reanalysis_failure("42", "DecodeError: not audio",
+                                        classifiable=True)
+
+    assert store.stale_count() == 0
+    assert store.reanalysis_failed_count() == 1
+
+
 def test_an_unclassifiable_failure_never_retires_a_row(fake_mongo):
     """A CDN 500 or a socket timeout is evidence about the world, not about
     this recording. It still counts an attempt -- that is the queue's backoff
@@ -652,6 +677,54 @@ def test_a_failed_row_sorts_behind_one_that_has_not_been_tried(fake_mongo):
     assert store.stale_ids(1) == ["a"]
 
     store.record_reanalysis_failure("a", "OSError: 500", classifiable=False)
+
+    assert store.stale_ids(2) == ["b", "a"]
+
+
+def test_a_priority_is_spent_by_the_attempt_it_buys(fake_mongo):
+    """D1: priority is DESC and the arm takes the head every tick, so a
+    priority that survives its own attempt is a permanent loop -- and with
+    the budget at 1 during a busy queue, the backfill makes zero progress
+    forever. One attempt is what the stamp buys, success or failure."""
+    for track_id in ("a", "b"):
+        store.put_track({**TRACK, "track_id": track_id},
+                        {**FEATURES, "_features_version": 1})
+    store.prioritize_reanalysis("b")
+    assert store.stale_ids(2)[0] == "b"
+
+    # Unclassifiable, so the row is NOT retired -- it stays stale work.
+    store.record_reanalysis_failure("b", "OSError: 404", classifiable=False)
+
+    assert store.stale_count() == 2
+    assert store.stale_ids(2)[0] == "a"
+    assert "reanalyze_priority" not in fake_mongo.tracks.find_one({"_id": "b"})
+
+
+def test_a_forgotten_priority_expires(fake_mongo):
+    """Belt and braces for D1: a stamp left behind by a crash (or by a
+    client that asked and went away) must not outrank the backlog for ever."""
+    for track_id in ("a", "b"):
+        store.put_track({**TRACK, "track_id": track_id},
+                        {**FEATURES, "_features_version": 1})
+    fake_mongo.tracks.update_one(
+        {"_id": "b"},
+        {"$set": {"reanalyze_priority":
+                  store._now() - timedelta(seconds=store.PRIORITY_TTL_S + 60)}},
+    )
+
+    assert store.stale_ids(2)[0] == "a"
+
+
+def test_a_fresh_priority_still_wins_over_an_expired_one(fake_mongo):
+    for track_id in ("a", "b"):
+        store.put_track({**TRACK, "track_id": track_id},
+                        {**FEATURES, "_features_version": 1})
+    fake_mongo.tracks.update_one(
+        {"_id": "a"},
+        {"$set": {"reanalyze_priority":
+                  store._now() - timedelta(seconds=store.PRIORITY_TTL_S + 60)}},
+    )
+    store.prioritize_reanalysis("b")
 
     assert store.stale_ids(2) == ["b", "a"]
 
@@ -699,6 +772,6 @@ def test_a_successful_analysis_clears_every_reanalysis_field(fake_mongo):
     assert store.corpus_ids() == ["42"]
     row = fake_mongo.tracks.find_one({"_id": "42"})
     for field in ("reanalysis_failed_at", "reanalysis_error",
-                  "reanalysis_attempts", "reanalysis_attempted_at",
-                  "reanalyze_priority"):
+                  "reanalysis_attempts", "reanalysis_classifiable_attempts",
+                  "reanalysis_attempted_at", "reanalyze_priority"):
         assert field not in row

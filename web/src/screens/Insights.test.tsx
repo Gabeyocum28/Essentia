@@ -61,8 +61,19 @@ test("shows the unanalyzed message when seed is not ready", async () => {
   renderInsights();
 
   await waitFor(() =>
-    expect(screen.getByText("This track is not analyzed on the server yet.")).toBeInTheDocument(),
+    expect(screen.getByText(/not analyzed on the server yet/)).toBeInTheDocument(),
   );
+});
+
+test("a 409 from vizMap reads as re-analyzing, not as a failure", async () => {
+  vi.mocked(api.seed).mockResolvedValue({ track_id: "42", status: "ready" });
+  vi.mocked(api.vizMap).mockRejectedValue(
+    new ApiError(409, "queued for re-analysis"));
+  renderInsights();
+  await waitFor(() =>
+    expect(screen.getByText(/not analyzed on the server yet/)).toBeInTheDocument(),
+  );
+  expect(screen.queryByText("Something went wrong")).toBeNull();
 });
 
 test("shows the not-analyzed message when vizMap 404s", async () => {
@@ -71,7 +82,7 @@ test("shows the not-analyzed message when vizMap 404s", async () => {
   renderInsights();
 
   await waitFor(() =>
-    expect(screen.getByText("This track is not analyzed on the server yet.")).toBeInTheDocument(),
+    expect(screen.getByText(/not analyzed on the server yet/)).toBeInTheDocument(),
   );
 });
 

@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { api, ApiError, clampFeel, clampTempo, loadStoredFeel, loadStoredTempo } from "../api/client";
+import {
+  api, ApiError, isUnanalyzed, clampFeel, clampTempo, loadStoredFeel,
+  loadStoredTempo,
+} from "../api/client";
 import type { VizMap } from "../api/types";
 import { RecStrip } from "../insights/RecStrip";
 import { Galaxy } from "../insights/Galaxy";
@@ -59,7 +62,10 @@ export function Insights() {
       setMap(mapResult);
       setStatus("ready");
     } catch (err) {
-      if (err instanceof ApiError && err.status === 404) {
+      // 409 is the seed waiting on the worker's re-analysis queue; 404 is
+      // the seed not being in the corpus at all. Both are "come back in a
+      // moment", and neither is a fault to report as one.
+      if (err instanceof ApiError && (err.status === 404 || isUnanalyzed(err))) {
         setStatus("unanalyzed");
       } else {
         setStatus("error");
@@ -91,7 +97,9 @@ export function Insights() {
 
       {status === "unanalyzed" && (
         <div className="error-box">
-          <p>This track is not analyzed on the server yet.</p>
+          <p>This track is not analyzed on the server yet. If it was just
+            added (or is being re-analyzed with the new audio model) this
+            clears in a few seconds.</p>
           <button type="button" onClick={() => void run()}>
             Try again
           </button>

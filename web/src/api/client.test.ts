@@ -1,4 +1,4 @@
-import { api, ApiError, clampFeel, clampTempo, decodeCoords8, DEFAULT_FEEL, DEFAULT_TEMPO,
+import { api, ApiError, isUnanalyzed, clampFeel, clampTempo, decodeCoords8, DEFAULT_FEEL, DEFAULT_TEMPO,
   loadStoredFeel, loadStoredTempo, previewUrl, storeFeel, storeTempo, TEMPO_MAX } from "./client";
 
 function mockFetch(status: number, body: unknown) {
@@ -25,6 +25,27 @@ test("non-2xx becomes ApiError with the server detail", async () => {
   mockFetch(502, { detail: "analysis failed" });
   await expect(api.seed("1")).rejects.toMatchObject({ status: 502, detail: "analysis failed" });
   await expect(api.seed("1")).rejects.toBeInstanceOf(ApiError);
+});
+
+test("a 409 unanalyzed seed reads its flat `reason`, not [object Object]", async () => {
+  // The body is {status, track_id, reason} with no `detail`: an earlier
+  // version nested it under `detail` as an object, and the message the user
+  // saw was literally "409: [object Object]".
+  mockFetch(409, { status: "unanalyzed", track_id: "42",
+                   reason: "queued for re-analysis" });
+  const err = await api.recommend("42", "sounds_like").catch((e) => e);
+  expect(err).toBeInstanceOf(ApiError);
+  expect(err.status).toBe(409);
+  expect(err.detail).toBe("queued for re-analysis");
+  expect(err.message).not.toContain("[object Object]");
+  expect(isUnanalyzed(err)).toBe(true);
+});
+
+test("isUnanalyzed is false for every other failure", async () => {
+  mockFetch(500, { detail: "boom" });
+  const err = await api.recommend("42", "sounds_like").catch((e) => e);
+  expect(isUnanalyzed(err)).toBe(false);
+  expect(isUnanalyzed(new Error("boom"))).toBe(false);
 });
 
 test("decodeCoords8 splits little-endian float32 into rows of 8", () => {

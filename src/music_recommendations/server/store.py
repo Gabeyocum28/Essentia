@@ -101,6 +101,12 @@ def ensure_indexes() -> None:
     # of a blocking in-memory sort of the whole stale set.
     d.tracks.create_index([("features_version", pymongo.ASCENDING),
                            *_STALE_SORT])
+    # The priority queue stale_ids checks first: a tiny index (almost no row
+    # carries the field, and a stamp lives PRIORITY_TTL_S) that turns "is
+    # anyone waiting?" -- asked every tick -- into a bounded lookup instead
+    # of a scan for a field that is usually absent everywhere.
+    d.tracks.create_index([("reanalyze_priority", pymongo.DESCENDING)],
+                          sparse=True)
     d.jobs.create_index([("state", pymongo.ASCENDING), ("created_at", pymongo.ASCENDING)])
     d.cache.create_index("expires_at", expireAfterSeconds=0)
     _indexes_ready = True
@@ -254,8 +260,9 @@ def put_track(track: dict, features: dict) -> None:
         # version bump's backfill.
         {"$set": fields, "$currentDate": {"analyzed_at": True},
          "$unset": {"reanalysis_failed_at": "", "reanalysis_error": "",
-                    "reanalysis_attempts": "", "reanalysis_attempted_at": "",
-                    "reanalyze_priority": ""}},
+                    "reanalysis_attempts": "",
+                    "reanalysis_classifiable_attempts": "",
+                    "reanalysis_attempted_at": "", "reanalyze_priority": ""}},
         upsert=True,
     )
 
@@ -433,16 +440,32 @@ _STALE = {"analyzed_at": {"$exists": True}, "duplicate_of": {"$exists": False},
           "features_version": {"$lt": FEATURES_VERSION},
           "reanalysis_failed_at": {"$exists": False}}
 
-# How many classifiable failures a row gets before it leaves the queue.
+# How many CLASSIFIABLE failures a row gets before it leaves the queue.
+# Counted separately from `reanalysis_attempts` (which counts every attempt,
+# and is what the backoff sort reads) because otherwise two network blips
+# plus one real DecodeError would retire a perfectly good recording: three
+# failures is not three verdicts.
 REANALYSIS_MAX_ATTEMPTS = 3
 
-# The order the arm works in, and the reason for each key:
+# How long a /seed priority stamp outranks the backlog. It buys ONE attempt
+# (record_reanalysis_failure and put_track both clear it), so this is only
+# the backstop for a stamp nothing ever came back for -- a crash between the
+# stamp and the attempt, or a client that asked and went away. Without it a
+# forgotten stamp is permanent: `reanalyze_priority` is the first, DESCENDING
+# sort key, so the row would be handed to the arm every tick for ever.
+PRIORITY_TTL_S = 600
+
+# The arm works two queues, in order.
 #
-#   reanalyze_priority   DESCENDING, so a row someone is WAITING on (a /seed
-#                        on a superseded track stamps it) jumps the whole
-#                        backlog. Absent is null, which sorts last descending
-#                        -- i.e. after every prioritized row, which is what
-#                        "jumps the queue" has to mean.
+# FIRST, rows someone is actively waiting on: a /seed on a superseded track
+# stamps `reanalyze_priority`, and the most recent stamp goes first. This is a
+# separate QUERY rather than a leading sort key because a sort key cannot
+# express "and only if the stamp is still fresh" -- and an expired or
+# forgotten stamp that still sorted first would hand the arm the same row
+# every tick for ever (PRIORITY_TTL_S above).
+_PRIORITY_SORT = [("reanalyze_priority", pymongo.DESCENDING)]
+#
+# THEN the backlog:
 #   reanalysis_attempted_at  ASCENDING, absent (never tried) first, then the
 #                        longest-ago attempt. This is the backoff: a row that
 #                        just failed goes behind every row that has not been
@@ -451,8 +474,7 @@ REANALYSIS_MAX_ATTEMPTS = 3
 #   analyzed_at          ASCENDING, oldest first -- so an interrupted backfill
 #                        makes forward progress (a re-analyzed row gets a
 #                        fresh stamp and sorts to the back).
-_STALE_SORT = [("reanalyze_priority", pymongo.DESCENDING),
-               ("reanalysis_attempted_at", pymongo.ASCENDING),
+_STALE_SORT = [("reanalysis_attempted_at", pymongo.ASCENDING),
                ("analyzed_at", pymongo.ASCENDING)]
 
 
@@ -461,15 +483,34 @@ def stale_count() -> int:
     return db().tracks.count_documents(_STALE)
 
 
+def _priority_cutoff() -> datetime:
+    return _now() - timedelta(seconds=PRIORITY_TTL_S)
+
+
 def stale_ids(limit: int = 100) -> list[str]:
-    """The next `limit` stale ids, in _STALE_SORT order (see above):
-    prioritized rows, then never-tried, then longest-since-tried, then
-    oldest-analyzed."""
+    """The next `limit` stale ids: freshly prioritized rows first (newest
+    stamp first), then the backlog in _STALE_SORT order.
+
+    Two queries rather than one sort, so an expired stamp is genuinely
+    ignored instead of merely sorting oddly. The two predicates are
+    complementary, so no id can come back from both.
+    """
     if limit <= 0:
         return []
-    cursor = (db().tracks.find(_STALE, {"_id": 1})
-              .sort(_STALE_SORT).limit(int(limit)))
-    return [d["_id"] for d in cursor]
+    limit = int(limit)
+    cutoff = _priority_cutoff()
+    tracks = db().tracks
+    ids = [d["_id"] for d in
+           tracks.find({**_STALE, "reanalyze_priority": {"$gte": cutoff}},
+                       {"_id": 1}).sort(_PRIORITY_SORT).limit(limit)]
+    if len(ids) >= limit:
+        return ids
+    backlog = {**_STALE, "$or": [{"reanalyze_priority": {"$exists": False}},
+                                 {"reanalyze_priority": {"$lt": cutoff}}]}
+    ids += [d["_id"] for d in
+            tracks.find(backlog, {"_id": 1})
+            .sort(_STALE_SORT).limit(limit - len(ids))]
+    return ids
 
 
 def prioritize_reanalysis(track_id: str) -> None:
@@ -494,34 +535,44 @@ def record_reanalysis_failure(track_id: str, error: str,
     EVERY failure bumps `reanalysis_attempts` and stamps
     `reanalysis_attempted_at`, because that timestamp is the queue's backoff
     key -- without it a row that fails keeps the head of an oldest-first
-    queue and nothing behind it is ever reached.
+    queue and nothing behind it is ever reached. Every failure also SPENDS
+    any priority stamp: the attempt is what the stamp bought, and a stamp
+    that outlives its attempt hands the arm the same row every tick for ever.
 
-    Only a CLASSIFIABLE failure can retire the row, and only at
-    REANALYSIS_MAX_ATTEMPTS. Classifiable means the failure was a verdict
-    about this track -- its audio will not decode, no source owns its id, the
-    source no longer offers a preview. An unclassifiable failure (the CDN
-    500ing, a socket timeout, a broken model) is evidence about the WORLD,
-    and charging it to the track is how a bad afternoon retires a corpus.
+    Only a CLASSIFIABLE failure bumps `reanalysis_classifiable_attempts`, and
+    only that counter can retire the row, at REANALYSIS_MAX_ATTEMPTS.
+    Classifiable means the failure was a verdict about this track -- its
+    audio will not decode, no source owns its id, the source no longer offers
+    a preview. An unclassifiable failure (the CDN 500ing, a socket timeout, a
+    broken model) is evidence about the WORLD; charging it to the track is
+    how a bad afternoon retires a corpus, and counting the two in ONE counter
+    means two blips plus one real DecodeError retires a good recording.
 
     A retired row keeps its old vectors and stays readable by id (a seed the
     user can still play); it is simply out of LIVE, out of `stale_ids` and
     out of `stale_count`. put_track clears every one of these fields, so a
     row that becomes analyzable again rejoins the queue on its own.
+
+    Returns the CLASSIFIABLE count -- what a caller logs a give-up against.
     """
+    increments = {"reanalysis_attempts": 1}
+    if classifiable:
+        increments["reanalysis_classifiable_attempts"] = 1
     doc = db().tracks.find_one_and_update(
         {"_id": track_id},
         {"$set": {"reanalysis_error": str(error)[:500]},
-         "$inc": {"reanalysis_attempts": 1},
-         "$currentDate": {"reanalysis_attempted_at": True}},
+         "$inc": increments,
+         "$currentDate": {"reanalysis_attempted_at": True},
+         "$unset": {"reanalyze_priority": ""}},
         return_document=ReturnDocument.AFTER,
     )
-    attempts = int((doc or {}).get("reanalysis_attempts", 0))
-    if classifiable and attempts >= REANALYSIS_MAX_ATTEMPTS:
+    verdicts = int((doc or {}).get("reanalysis_classifiable_attempts", 0))
+    if classifiable and verdicts >= REANALYSIS_MAX_ATTEMPTS:
         db().tracks.update_one(
             {"_id": track_id},
             {"$currentDate": {"reanalysis_failed_at": True}},
         )
-    return attempts
+    return verdicts
 
 
 def reanalysis_failed_count() -> int:

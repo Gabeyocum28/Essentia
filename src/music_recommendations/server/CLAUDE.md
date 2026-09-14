@@ -13,8 +13,10 @@ Rules:
 - A seed is "ready" only at the CURRENT features_version. A row analyzed by
   an older stack is prioritized for re-analysis (store.prioritize_reanalysis)
   and waited on like a cold one; /recommend and the viz endpoints answer 409
-  `{"status": "unanalyzed"}` for it rather than letting numpy's shape error
-  become a 500.
+  with a FLAT `{"status": "unanalyzed", "track_id", "reason"}` body (its own
+  exception type and handler -- an HTTPException would nest it under `detail`
+  and the web client renders that as "[object Object]") rather than letting
+  numpy's shape error become a 500.
 - Ranking is normalize + matmul + argsort in numpy, in-process. Never add
   FAISS/pgvector/ANN — pure overhead at this scale (spec §2.2).
 - The axis registry in axes.py is the one table for adding/removing/

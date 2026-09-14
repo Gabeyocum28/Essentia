@@ -26,7 +26,8 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
+                               StreamingResponse)
 from pydantic import BaseModel
 from starlette.requests import Request
 from typing import Literal, NamedTuple
@@ -307,15 +308,38 @@ def _fixture_track(track_id: str) -> dict | None:
 # the row exists, it is queued for re-analysis and will work shortly. 409
 # Conflict with an `unanalyzed` body says exactly that, and is the same shape
 # a client already handles from /seed.
+#
+# Its own exception type with its own handler, NOT HTTPException(409, {...}):
+# FastAPI nests an HTTPException's detail under a "detail" key, so a dict
+# detail reaches the web client (which reads `.detail` as a string) as
+# "409: [object Object]". The body has to be FLAT.
+
+class UnanalyzedSeed(Exception):
+    """The seed's vectors are not in the corpus's feature space (yet)."""
+
+    def __init__(self, track_id: str, reason: str):
+        super().__init__(reason)
+        self.track_id = track_id
+        self.reason = reason
+
+
+@app.exception_handler(UnanalyzedSeed)
+async def _unanalyzed_seed_handler(_request: Request,
+                                   exc: UnanalyzedSeed) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"status": "unanalyzed", "track_id": exc.track_id,
+                 "reason": exc.reason},
+    )
+
 
 def _is_current(features: dict) -> bool:
     """Were these features produced by the stack this server ranks with?"""
     return int(features.get(store.VERSION_KEY, 0)) == FEATURES_VERSION
 
 
-def _unanalyzed(track_id: str, why: str) -> HTTPException:
-    return HTTPException(409, {"status": "unanalyzed", "track_id": track_id,
-                               "detail": why})
+def _unanalyzed(track_id: str, why: str) -> UnanalyzedSeed:
+    return UnanalyzedSeed(track_id, why)
 
 
 def _require_current(track_id: str, features: dict | None) -> None:

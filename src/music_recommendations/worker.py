@@ -278,10 +278,13 @@ def _fail_reanalysis(track_id: str, exc: Exception) -> None:
     """Record one failed attempt against this row, and say why.
 
     Every attempt is recorded because the attempt TIMESTAMP is the queue's
-    backoff key: without it a row that fails keeps the head of the sort and
-    the rest of the corpus never gets a turn. Whether the row can ever be
-    RETIRED by this depends on `_classifiable` -- only a verdict about the
-    track counts, and only after store.REANALYSIS_MAX_ATTEMPTS of them.
+    backoff key (and because recording one SPENDS any /seed priority stamp,
+    so a row whose preview is dead cannot be handed back every tick): without
+    it a row that fails keeps the head of the sort and the rest of the corpus
+    never gets a turn. Whether the row can ever be RETIRED by this depends on
+    `_classifiable` -- only a verdict about the track counts, and only after
+    store.REANALYSIS_MAX_ATTEMPTS of them. Two network blips plus one
+    DecodeError is one verdict, not three.
 
     A retired row keeps its old vectors, stays playable by id, and is simply
     out of the ranking; a later successful put_track clears every one of
@@ -292,14 +295,14 @@ def _fail_reanalysis(track_id: str, exc: Exception) -> None:
           f"{'' if classifiable else '  (not charged against the track)'}",
           flush=True)
     try:
-        attempts = store.record_reanalysis_failure(
+        verdicts = store.record_reanalysis_failure(
             track_id, f"{type(exc).__name__}: {exc}", classifiable=classifiable)
     except Exception:  # noqa: BLE001 - a store blip must not kill the group
         return
-    if classifiable and attempts >= store.REANALYSIS_MAX_ATTEMPTS:
-        print(f"[worker] reanalyze {track_id}: giving up after {attempts} "
-              f"attempts; the row stays playable but leaves the ranking",
-              flush=True)
+    if classifiable and verdicts >= store.REANALYSIS_MAX_ATTEMPTS:
+        print(f"[worker] reanalyze {track_id}: giving up after {verdicts} "
+              f"failures of its own; the row stays playable but leaves the "
+              f"ranking", flush=True)
 
 
 # The circuit breaker. `analyze_tracks` RAISING (rather than putting an

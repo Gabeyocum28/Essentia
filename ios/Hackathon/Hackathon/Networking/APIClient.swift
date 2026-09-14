@@ -13,6 +13,12 @@ enum APIError: Error, LocalizedError {
     case invalidURL
     case invalidResponse
     case status(Int)
+    /// HTTP 409 from a ranking endpoint: the seed was analyzed by a
+    /// superseded version of the audio model and the worker is redoing it.
+    /// Not a failure the user caused or can fix — a wait. The server has
+    /// already pushed this track to the front of its re-analysis queue, so
+    /// the wait is one track's analysis rather than the whole backlog's.
+    case reanalyzing
     case decoding(Error)
 
     var errorDescription: String? {
@@ -20,6 +26,9 @@ enum APIError: Error, LocalizedError {
         case .invalidURL: return "Invalid request URL."
         case .invalidResponse: return "The server sent an unexpected response."
         case .status(let code): return "The server returned status \(code)."
+        case .reanalyzing:
+            return "We're re-analyzing this track with the new audio model. "
+                 + "This usually takes a few seconds."
         case .decoding: return "The server response could not be read."
         }
     }
@@ -176,6 +185,7 @@ actor APIClient {
             guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
             guard (200..<300).contains(http.statusCode) else {
                 print("[API] \(request.httpMethod ?? "GET") \(request.url?.absoluteString ?? "<invalid url>") -> \(http.statusCode)")
+                if http.statusCode == 409 { throw APIError.reanalyzing }
                 throw APIError.status(http.statusCode)
             }
             do {

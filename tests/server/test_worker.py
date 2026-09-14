@@ -631,6 +631,32 @@ def test_a_prioritized_row_jumps_the_queue(fake_mongo, reanalysis_ok, monkeypatc
     assert "43" in store.corpus_ids()
 
 
+def test_a_seeded_row_whose_preview_is_dead_does_not_stall_the_backfill(
+        fake_mongo, reanalysis_ok, monkeypatch):
+    """The loop this closes: /seed stamps a priority, the arm takes that row
+    first every tick, the download 404s (unclassifiable, so the row is never
+    retired), and the stamp survives -- so with the budget at 1 during a busy
+    queue the backfill makes ZERO progress, for ever."""
+    monkeypatch.setattr(worker, "GROUP_SIZE", 1)
+    _stale("42")
+    _stale("43", "Another")
+    store.prioritize_reanalysis("42")
+
+    def dead(url):
+        raise OSError("404 from the CDN")
+
+    monkeypatch.setattr(worker, "download_preview", dead)
+    assert store.stale_ids(1) == ["42"]
+
+    assert worker.reanalyze_step() == 0
+
+    # The attempt spent the priority: the next tick moves on, and the row is
+    # still stale work rather than retired.
+    assert store.stale_ids(2)[0] == "43"
+    assert store.stale_count() == 2
+    assert store.reanalysis_failed_count() == 0
+
+
 def test_the_arm_logs_how_many_it_has_given_up_on(fake_mongo, reanalysis_ok,
                                                   monkeypatch, capsys):
     """A backfill that is "finishing" only because it retired half the corpus

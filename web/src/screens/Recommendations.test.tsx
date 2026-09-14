@@ -1,7 +1,9 @@
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { Recommendations } from "./Recommendations";
-import { api, DEFAULT_FEEL, DEFAULT_TEMPO } from "../api/client";
+import {
+  Recommendations, REANALYZE_RETRY_MS, REANALYZE_MAX_RETRIES,
+} from "./Recommendations";
+import { api, ApiError, DEFAULT_FEEL, DEFAULT_TEMPO } from "../api/client";
 import { PlayerProvider } from "../player/usePlayer";
 
 vi.mock("../api/client", async () => {
@@ -131,4 +133,74 @@ test("both sliders moved inside one debounce window make one request carrying bo
   } finally {
     vi.useRealTimers();
   }
+});
+
+// ---- 409: the seed is being re-analyzed ----
+//
+// The server answers 409 {status, track_id, reason} when the seed's vectors
+// came from a superseded audio model. It is a wait, not a fault: /seed has
+// already pushed the row to the front of the worker's re-analysis queue.
+
+function unanalyzed() {
+  return new ApiError(409, "queued for re-analysis");
+}
+
+test("a 409 shows that the track is being re-analyzed, not an error", async () => {
+  vi.mocked(api.recommend).mockRejectedValue(unanalyzed());
+  renderRecs();
+
+  await waitFor(() =>
+    expect(screen.getByText(/re-analyzing this track/i)).toBeInTheDocument());
+  expect(screen.queryByText("Something went wrong")).toBeNull();
+});
+
+test("a 409 retries and renders the results once they arrive", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    vi.mocked(api.recommend)
+      .mockRejectedValueOnce(unanalyzed())
+      .mockResolvedValueOnce({
+        seed_track_id: "42", axis: "energy", results: [track("a", "Track A")],
+      });
+    renderRecs();
+
+    await vi.waitFor(() =>
+      expect(screen.getByText(/re-analyzing this track/i)).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(REANALYZE_RETRY_MS);
+
+    await vi.waitFor(() => expect(screen.getByText("Track A")).toBeInTheDocument());
+    expect(api.recommend).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a 409 that never clears gives up after a bounded number of tries", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    vi.mocked(api.recommend).mockRejectedValue(unanalyzed());
+    renderRecs();
+
+    await vi.waitFor(() =>
+      expect(screen.getByText(/re-analyzing this track/i)).toBeInTheDocument());
+    for (let i = 0; i < REANALYZE_MAX_RETRIES + 1; i++) {
+      await vi.advanceTimersByTimeAsync(REANALYZE_RETRY_MS);
+    }
+
+    await vi.waitFor(() =>
+      expect(screen.getByText("Something went wrong")).toBeInTheDocument());
+    // The first call plus exactly REANALYZE_MAX_RETRIES retries, no more.
+    expect(api.recommend).toHaveBeenCalledTimes(REANALYZE_MAX_RETRIES + 1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("an ordinary failure is still reported as an error immediately", async () => {
+  vi.mocked(api.recommend).mockRejectedValue(new ApiError(500, "boom"));
+  renderRecs();
+
+  await waitFor(() =>
+    expect(screen.getByText("Something went wrong")).toBeInTheDocument());
+  expect(api.recommend).toHaveBeenCalledTimes(1);
 });
