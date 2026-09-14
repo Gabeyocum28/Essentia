@@ -14,6 +14,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from contract.features import FEATURE_KEYS  # noqa: E402
+from music_recommendations.analysis.schema import FEATURES_VERSION  # noqa: E402
 from music_recommendations.server import store  # noqa: E402
 
 _URI_RE = re.compile(r"mongodb(?:\+srv)?://[^\s\"']*")
@@ -48,8 +50,14 @@ def run() -> int:
         # make enqueue_embed below return False through no fault of this run.
         store.clear_embed_marker("atlas-check")
         try:
-            vec = np.linspace(-1, 1, 1280, dtype=np.float32)
-            store.put_track(TRACK, {"embedding": vec, "_features_version": 3})
+            # The CURRENT version and the current width. Writing a superseded
+            # version made the probe row harmless to the ranking, but it also
+            # meant the probe never exercised the path a real write takes --
+            # and, since the re-analysis arm landed, it put a fake row at the
+            # head of the backfill queue for the seconds before cleanup.
+            vec = np.linspace(-1, 1, FEATURE_KEYS["embedding"], dtype=np.float32)
+            store.put_track(TRACK, {"embedding": vec,
+                                    "_features_version": FEATURES_VERSION})
             got = store.get_features("atlas-check")
             assert got and np.allclose(got["embedding"], vec, atol=0.01), "embedding mismatch"
             assert (store.enqueue_embed("atlas-check")

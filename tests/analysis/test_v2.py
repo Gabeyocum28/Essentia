@@ -271,6 +271,17 @@ def test_decode_rejects_a_clip_too_short_to_analyze(tmp_path):
         v2.decode(tiny)
 
 
+def test_decode_reads_at_most_the_analysis_window(tmp_path):
+    """Deezer hands over 30 s and Jamendo the whole track, so without a cap
+    one corpus would hold head-only embeddings beside head-plus-middle ones
+    and their cosines would mean nothing. 45 s in, 30 s out."""
+    from music_recommendations.analysis import v2
+
+    long = write_wav(tmp_path / "long.wav", c_major_loop(seconds=45))
+    y = v2.decode(long)
+    assert abs(len(y) / SR - v2.ANALYSIS_SECONDS) < 0.5
+
+
 def test_decode_reports_a_missing_file_as_missing(tmp_path):
     from music_recommendations.analysis import v2
 

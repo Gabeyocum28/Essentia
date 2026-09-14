@@ -22,10 +22,17 @@ services:
       - "8000"
     networks: [web]
     # The corpus matrices (float32, 1024-d since v4) plus the UMAP layout.
-    # It does NOT hold the CLAP audio tower: /seed hands every unknown track
-    # to the worker, and only /search/text may load the much smaller text
-    # tower. Lowered from 6g to leave the worker room on a 12 GB box.
-    mem_limit: 5g
+    # /seed never analyzes -- every unknown track goes to the worker -- so in
+    # the DEFAULT configuration this process holds no model at all and 3g
+    # would do.
+    #
+    # 6g is sized for the one thing that changes that: TEXT_SEARCH=1. There
+    # is no text-tower-only load in the msclap API, so the first /search/text
+    # pulls the WHOLE model into this process -- ~700 MB of weights, ~2.5 GB
+    # resident once torch's allocator is warm -- and it stays. With the flag
+    # off (the default) the headroom is simply unused; with it on, this is
+    # the limit that stops the first text query OOM-killing the API.
+    mem_limit: 6g
     cpus: 1.5
 
   worker:

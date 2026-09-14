@@ -215,6 +215,36 @@ def process_job(track_id: str) -> bool:
     return process_jobs([track_id]) == 1
 
 
+class UnfetchableTrack(Exception):
+    """This row's audio cannot be obtained, and that is a fact about the ROW.
+
+    No metadata, no source that owns the id, no preview URL any more. Its own
+    type rather than a ValueError so `_classifiable` is a type check and not
+    a string match on an error message.
+    """
+
+
+def _classifiable(exc: BaseException) -> bool:
+    """Is this failure a verdict about the TRACK, or about the world?
+
+    Only a verdict about the track may ever retire a row (after
+    store.REANALYSIS_MAX_ATTEMPTS of them). A CDN 500, a socket timeout, a
+    broken checkpoint, an Atlas blip -- none of those are evidence that this
+    particular recording is unanalyzable, and charging them to the row is how
+    a bad afternoon quietly deletes a third of the corpus.
+    """
+    if isinstance(exc, UnfetchableTrack):
+        return True
+    # Imported by name, lazily: analysis.v2 pulls numpy and the schema at
+    # module scope but nothing heavy, and a host without the analysis extra
+    # must still be able to run the rest of the worker.
+    try:
+        from music_recommendations.analysis.v2 import DecodeError
+    except Exception:  # noqa: BLE001 - no analysis stack here; nothing is classifiable
+        return False
+    return isinstance(exc, DecodeError)
+
+
 def _reanalyze_one(track_id: str) -> tuple[dict, Path] | Exception:
     """Stored metadata plus a freshly downloaded preview, or the failure.
 
@@ -230,39 +260,77 @@ def _reanalyze_one(track_id: str) -> tuple[dict, Path] | Exception:
     try:
         track = store.get_track(track_id)
         if track is None:
-            raise ValueError("no metadata in the store")
+            raise UnfetchableTrack("no metadata in the store")
         source = sources.for_id(track_id)
         if source is None:
-            raise ValueError(f"no source owns {track_id!r}")
+            raise UnfetchableTrack(f"no source owns {track_id!r}")
         url = source.preview_url(track_id)
         if not url:
-            raise ValueError("source has no preview for this track any more")
+            raise UnfetchableTrack("source has no preview for this track any more")
+        # NOT UnfetchableTrack: a download that fails is the network, the CDN
+        # or an expired signature, none of which is a verdict about the track.
         return track, download_preview(url)
     except Exception as exc:  # noqa: BLE001 - reported per id by the caller
         return exc
 
 
 def _fail_reanalysis(track_id: str, exc: Exception) -> None:
-    """Take one id out of the stale queue for good, and say why.
+    """Record one failed attempt against this row, and say why.
 
-    The arm works oldest-first, so an id that cannot be re-analyzed (a
-    delisted track, a preview that 404s, audio that will not decode) would
-    otherwise sit at the head of the queue and be retried every tick while
-    the rest of the corpus waited behind it. store.fail_reanalysis marks the
-    TRACK document (`reanalysis_failed_at` + `reanalysis_error`), which is
-    what store._STALE excludes; the row keeps its old vectors, stays
-    playable by id, and is simply not in the ranking until someone clears
-    the mark. A later successful put_track clears it automatically.
+    Every attempt is recorded because the attempt TIMESTAMP is the queue's
+    backoff key: without it a row that fails keeps the head of the sort and
+    the rest of the corpus never gets a turn. Whether the row can ever be
+    RETIRED by this depends on `_classifiable` -- only a verdict about the
+    track counts, and only after store.REANALYSIS_MAX_ATTEMPTS of them.
+
+    A retired row keeps its old vectors, stays playable by id, and is simply
+    out of the ranking; a later successful put_track clears every one of
+    these fields.
     """
-    print(f"[worker] reanalyze {track_id}: FAILED  {exc}", flush=True)
+    classifiable = _classifiable(exc)
+    print(f"[worker] reanalyze {track_id}: FAILED  {type(exc).__name__}: {exc}"
+          f"{'' if classifiable else '  (not charged against the track)'}",
+          flush=True)
     try:
-        store.fail_reanalysis(track_id, f"{type(exc).__name__}: {exc}")
+        attempts = store.record_reanalysis_failure(
+            track_id, f"{type(exc).__name__}: {exc}", classifiable=classifiable)
     except Exception:  # noqa: BLE001 - a store blip must not kill the group
-        pass
+        return
+    if classifiable and attempts >= store.REANALYSIS_MAX_ATTEMPTS:
+        print(f"[worker] reanalyze {track_id}: giving up after {attempts} "
+              f"attempts; the row stays playable but leaves the ranking",
+              flush=True)
 
 
-def reanalyze_step() -> int:
-    """Bring up to GROUP_SIZE stale rows up to the current feature version.
+# The circuit breaker. `analyze_tracks` RAISING (rather than putting an
+# exception in each slot) means the model is broken, not the audio: a missing
+# checkpoint, an OOM, a bad image. That fails instantly and fails every
+# group, so without a breaker the arm spins through the whole corpus at full
+# speed doing nothing but logging. Three consecutive group-wide failures halt
+# it for REANALYZE_HALT_S; the halt is announced once, not every tick.
+REANALYZE_MAX_GROUP_FAILURES = 3
+REANALYZE_HALT_S = 600.0
+_group_failures = 0
+_halted_until = 0.0
+
+
+def _group_failed(exc: BaseException) -> None:
+    """One group-wide analysis failure: count it, and halt at the cap."""
+    global _group_failures, _halted_until
+    _group_failures += 1
+    print(f"[worker] reanalyze: the whole group failed to analyze "
+          f"({type(exc).__name__}: {exc}); no row charged for it", flush=True)
+    if _group_failures >= REANALYZE_MAX_GROUP_FAILURES:
+        _halted_until = time.monotonic() + REANALYZE_HALT_S
+        print(f"[worker] halting the re-analysis arm for "
+              f"{REANALYZE_HALT_S / 60:.0f} min after {_group_failures} "
+              f"group-wide failures; fix the model, or it retries by itself",
+              flush=True)
+
+
+def reanalyze_step(limit: int | None = None) -> int:
+    """Bring up to `limit` (default GROUP_SIZE) stale rows up to the current
+    feature version.
 
     Stale rows are live-analyzed tracks whose `features_version` is below
     the current one (store.stale_ids). They are invisible to ranking until
@@ -271,11 +339,25 @@ def reanalyze_step() -> int:
     before the crawl every tick: re-earning a track we already hold beats
     discovering one we do not.
 
-    Returns how many rows were brought up to version. Never raises: every
-    failure is either marked on the row (so the queue moves on) or logged.
+    Returns how many rows were brought up to version. Never raises. Failures
+    are attributed carefully, because the cost of getting it wrong is a
+    silently deleted corpus:
+
+      * the whole group failing to analyze charges NOTHING to any row
+        (_group_failed, and the breaker above);
+      * a put_track failure charges nothing either -- the analysis worked,
+        the store did not;
+      * a per-track failure records an attempt, and only a classifiable one
+        can retire the row, at store.REANALYSIS_MAX_ATTEMPTS.
     """
+    global _group_failures
+    size = GROUP_SIZE if limit is None else limit
+    if size <= 0:
+        return 0
+    if time.monotonic() < _halted_until:
+        return 0
     try:
-        ids = store.stale_ids(GROUP_SIZE)
+        ids = store.stale_ids(size)
     except Exception as exc:  # noqa: BLE001 - an Atlas blip is not fatal
         print(f"[worker] reanalyze error {exc}", flush=True)
         return 0
@@ -285,6 +367,7 @@ def reanalyze_step() -> int:
     started = time.monotonic()
     ready: list[tuple[str, dict, Path]] = []
     stored = 0
+    group_failed = False
     try:
         with ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS) as pool:
             prepared = list(pool.map(_reanalyze_one, ids))
@@ -296,31 +379,45 @@ def reanalyze_step() -> int:
             ready.append((track_id, track, mp3))
 
         paths = [mp3 for _, _, mp3 in ready]
-        try:
-            results = _analyze(paths) if paths else []
-        except Exception as exc:  # noqa: BLE001 - a dead model fails the group
-            results = [exc] * len(paths)
+        if paths:
+            try:
+                results = _analyze(paths)
+            except Exception as exc:  # noqa: BLE001 - the MODEL, not the audio
+                _group_failed(exc)
+                group_failed = True
+                return 0
+        else:
+            results = []
 
         for (track_id, track, _mp3), features in zip(ready, results):
+            if isinstance(features, Exception):
+                # This path's own slot: the group ran, this file did not.
+                _fail_reanalysis(track_id, features)
+                continue
             try:
-                if isinstance(features, Exception):
-                    raise features
                 store.put_track(track, _to_plain(features))
-            except Exception as exc:  # noqa: BLE001 - one track, one failure
-                _fail_reanalysis(track_id, exc)
+            except Exception as exc:  # noqa: BLE001 - the store, not the track
+                print(f"[worker] reanalyze {track_id}: could not store "
+                      f"({type(exc).__name__}: {exc}); leaving the row alone",
+                      flush=True)
                 continue
             stored += 1
+        if paths:
+            _group_failures = 0          # a group that ran clears the breaker
         return stored
     finally:
         for _, _, mp3 in ready:
             mp3.unlink(missing_ok=True)
-        try:
-            remaining = store.stale_count()
-        except Exception:  # noqa: BLE001
-            remaining = -1
-        elapsed = time.monotonic() - started
-        print(f"[worker] reanalyzed {stored}, remaining {remaining} "
-              f"({elapsed:.1f}s for {len(ids)})", flush=True)
+        if not group_failed:
+            try:
+                remaining = store.stale_count()
+                gave_up = store.reanalysis_failed_count()
+            except Exception:  # noqa: BLE001
+                remaining = gave_up = -1
+            elapsed = time.monotonic() - started
+            print(f"[worker] reanalyzed {stored}, remaining {remaining} "
+                  f"(gave up on {gave_up}; {elapsed:.1f}s for {len(ids)})",
+                  flush=True)
 
 
 # Attribution analysis window. Long enough that the narrowest log-spaced
@@ -599,6 +696,21 @@ def _run_job(job: tuple[str, str]) -> None:
         print(f"[worker] bad attribution job {payload!r}", flush=True)
 
 
+def _reanalyze_budget() -> int:
+    """How many stale rows this tick may take: one if somebody is queued.
+
+    `queued_count` is one indexed count against the jobs collection, which is
+    cheap next to the group of downloads and a torch forward it decides.
+    A store blip answers "as usual" rather than stalling the backfill.
+    """
+    try:
+        if store.queued_count() > 0:
+            return 1
+    except Exception as exc:  # noqa: BLE001 - not worth stalling the arm over
+        print(f"[worker] queued_count error {exc}", flush=True)
+    return GROUP_SIZE
+
+
 def _tick() -> None:
     """One loop iteration: sweep stale claims, re-analyze a group of
     superseded rows, then claim and process a group of embed jobs (or a
@@ -608,8 +720,11 @@ def _tick() -> None:
     The re-analysis arm goes first because a stale row is a track the corpus
     already paid to discover and currently cannot show; a crawl candidate is
     one it has not. It does ONE group per tick rather than draining the
-    backlog in a loop, so a /seed arriving during a 19k-row backfill still
-    gets analyzed within its wait window instead of a day later.
+    backlog in a loop, and it SHRINKS to a single row whenever an embed job
+    is waiting: a cold /seed blocks a client for 20 s, and spending that wait
+    behind a full re-analysis group is how a day-long backfill makes the app
+    look broken. The backfill still creeps forward, so it cannot be starved
+    by a busy queue either.
 
     The process_* helpers never raise, but store.dequeue_job (and
     requeue_stale) can (a transient connection error while polling Atlas)
@@ -620,7 +735,7 @@ def _tick() -> None:
         store.requeue_stale()
     except Exception as exc:
         print(f"[worker] requeue_stale error {exc}", flush=True)
-    reanalyzed = reanalyze_step()
+    reanalyzed = reanalyze_step(_reanalyze_budget())
     try:
         group, leftover = _claim_group()
         if not group and leftover is None:

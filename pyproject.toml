@@ -34,7 +34,12 @@ analysis = [
     "librosa>=0.10",
     "pyloudnorm>=0.1",
     "soxr>=0.3",
-    "beat_this @ git+https://github.com/CPJKU/beat_this",
+    # Pinned to a commit, not to the branch: the project publishes no
+    # release on PyPI, so an unpinned git URL means "whatever main was on
+    # the day this image happened to build" -- and a beat tracker that
+    # changes its answers changes every stored tempo (FEATURES_VERSION).
+    # Bumping this is a deliberate act with a re-analysis behind it.
+    "beat_this @ git+https://github.com/CPJKU/beat_this@b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c",
 ]
 dev = ["pytest>=8.0", "httpx>=0.27", "mongomock>=4.3"]
 

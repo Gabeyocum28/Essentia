@@ -47,6 +47,22 @@ def clear_matrix_cache():
     viz.clear_geometry_cache()
 
 
+@pytest.fixture(autouse=True)
+def clear_worker_state():
+    """The re-analysis circuit breaker is module state and survives a test.
+
+    A test that deliberately breaks the model leaves the arm HALTED, and the
+    next test's perfectly good group silently does nothing. Reset both ends.
+    """
+    from music_recommendations import worker
+
+    worker._group_failures = 0
+    worker._halted_until = 0.0
+    yield
+    worker._group_failures = 0
+    worker._halted_until = 0.0
+
+
 @pytest.fixture
 def fake_mongo(monkeypatch):
     """A fresh in-memory database wired into store.db() for one test."""

@@ -45,7 +45,7 @@ wheels = [
 [[package]]
 name = "beat-this"
 version = "1.1.0"
-source = { git = "https://github.com/CPJKU/beat_this#b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c" }
+source = { git = "https://github.com/CPJKU/beat_this?rev=b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c#b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c" }
 dependencies = [
     { name = "einops" },
     { name = "numpy" },
@@ -559,7 +559,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "beat-this", marker = "extra == 'analysis'", git = "https://github.com/CPJKU/beat_this" },
+    { name = "beat-this", marker = "extra == 'analysis'", git = "https://github.com/CPJKU/beat_this?rev=b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "librosa", marker = "extra == 'analysis'", specifier = ">=0.10" },

@@ -604,40 +604,101 @@ def test_stale_ids_are_oldest_analyzed_first_and_limited(fake_mongo):
     assert store.stale_ids(0) == []
 
 
-def test_a_row_the_backfill_gave_up_on_leaves_the_queue(fake_mongo):
-    """Oldest-first means one unfixable row at the head would be retried
-    every tick and starve everything behind it."""
+def test_a_row_leaves_the_queue_only_after_three_classifiable_failures(fake_mongo):
+    """One bad afternoon at a source must not retire a third of the corpus,
+    and one unfixable row must not be retried forever. Three attempts."""
     store.put_track(TRACK, {**FEATURES, "_features_version": 1})
     assert store.stale_count() == 1
 
-    store.fail_reanalysis("42", "ValueError: no preview")
+    for expected in (1, 2):
+        assert store.record_reanalysis_failure(
+            "42", "UnfetchableTrack: no preview", classifiable=True) == expected
+        assert store.stale_count() == 1        # still work to do
 
+    assert store.record_reanalysis_failure(
+        "42", "UnfetchableTrack: no preview",
+        classifiable=True) == store.REANALYSIS_MAX_ATTEMPTS
     assert store.stale_count() == 0
     assert store.stale_ids() == []
     assert store.reanalysis_failed_count() == 1
     assert fake_mongo.tracks.find_one({"_id": "42"})["reanalysis_error"] == \
-        "ValueError: no preview"
+        "UnfetchableTrack: no preview"
+
+
+def test_an_unclassifiable_failure_never_retires_a_row(fake_mongo):
+    """A CDN 500 or a socket timeout is evidence about the world, not about
+    this recording. It still counts an attempt -- that is the queue's backoff
+    -- but it can never take the row out."""
+    store.put_track(TRACK, {**FEATURES, "_features_version": 1})
+
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS + 3):
+        store.record_reanalysis_failure("42", "OSError: 500", classifiable=False)
+
+    assert store.stale_count() == 1
+    assert store.reanalysis_failed_count() == 0
+    assert "reanalysis_failed_at" not in fake_mongo.tracks.find_one({"_id": "42"})
+
+
+def test_a_failed_row_sorts_behind_one_that_has_not_been_tried(fake_mongo):
+    """Otherwise the row that just failed keeps the head of an oldest-first
+    queue and nothing behind it is ever reached."""
+    for track_id in ("a", "b"):
+        store.put_track({**TRACK, "track_id": track_id},
+                        {**FEATURES, "_features_version": 1})
+        fake_mongo.tracks.update_one(
+            {"_id": track_id},
+            {"$set": {"analyzed_at": datetime(2026, 9, 1 + ord(track_id) - ord("a"))}},
+        )
+    assert store.stale_ids(1) == ["a"]
+
+    store.record_reanalysis_failure("a", "OSError: 500", classifiable=False)
+
+    assert store.stale_ids(2) == ["b", "a"]
+
+
+def test_a_prioritized_row_beats_the_whole_backlog(fake_mongo):
+    """/seed on a superseded row: a client is blocked on that one track, and
+    19,000 older rows are in front of it."""
+    for track_id in ("a", "b", "c"):
+        store.put_track({**TRACK, "track_id": track_id},
+                        {**FEATURES, "_features_version": 1})
+        fake_mongo.tracks.update_one(
+            {"_id": track_id},
+            {"$set": {"analyzed_at": datetime(2026, 9, 1 + ord(track_id) - ord("a"))}},
+        )
+    assert store.stale_ids(1) == ["a"]
+
+    store.prioritize_reanalysis("c")
+
+    assert store.stale_ids(3)[0] == "c"
 
 
 def test_a_given_up_row_is_still_a_playable_seed(fake_mongo):
     """It keeps its old vectors and its metadata: a user can still search it
     up and press play. It is only out of the RANKING."""
     store.put_track(TRACK, {**FEATURES, "_features_version": 1})
-    store.fail_reanalysis("42", "boom")
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS):
+        store.record_reanalysis_failure("42", "boom", classifiable=True)
 
     assert store.get_track("42")["title"] == TRACK["title"]
     assert store.get_features("42") is not None
     assert store.corpus_ids() == []
 
 
-def test_a_successful_analysis_clears_the_give_up_mark(fake_mongo):
+def test_a_successful_analysis_clears_every_reanalysis_field(fake_mongo):
     """Otherwise the row stays hidden from the NEXT version bump's backfill
-    as well, forever."""
+    as well, forever -- and a stale attempt count would retire it early."""
     store.put_track(TRACK, {**FEATURES, "_features_version": 1})
-    store.fail_reanalysis("42", "boom")
+    store.prioritize_reanalysis("42")
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS):
+        store.record_reanalysis_failure("42", "boom", classifiable=True)
 
     store.put_track(TRACK, FEATURES)
 
     assert store.reanalysis_failed_count() == 0
     assert store.corpus_ids() == ["42"]
-    assert "reanalysis_failed_at" not in fake_mongo.tracks.find_one({"_id": "42"})
+    row = fake_mongo.tracks.find_one({"_id": "42"})
+    for field in ("reanalysis_failed_at", "reanalysis_error",
+                  "reanalysis_attempts", "reanalysis_attempted_at",
+                  "reanalyze_priority"):
+        assert field not in row

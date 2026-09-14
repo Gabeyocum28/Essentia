@@ -411,60 +411,257 @@ def test_reanalyze_progress_is_logged_with_what_is_left(fake_mongo,
     assert "reanalyzed 1, remaining 1" in capsys.readouterr().out
 
 
-def test_a_dead_preview_is_marked_and_never_retried(fake_mongo, monkeypatch):
-    """Oldest-first means a row that cannot be re-analyzed would sit at the
-    head of the queue forever and starve the rest of the corpus. Failing it
-    onto the track document is what moves the queue on."""
+def test_a_dead_preview_is_retried_three_times_then_given_up_on(fake_mongo,
+                                                                 monkeypatch):
+    """"No preview URL" is a verdict about this track, so it counts against
+    the row -- but not on the first try: a source having a bad afternoon must
+    not permanently retire a third of the corpus. Three attempts, then out."""
     _stale("42")
     monkeypatch.setattr(deezer_source.DeezerSource, "preview_url",
                         lambda self, track_id: None)
 
+    for attempt in (1, 2):
+        assert worker.reanalyze_step() == 0
+        row = fake_mongo.tracks.find_one({"_id": "42"})
+        assert row["reanalysis_attempts"] == attempt
+        assert "reanalysis_failed_at" not in row    # still in the queue
+        assert store.stale_count() == 1
+
     assert worker.reanalyze_step() == 0
-    assert store.stale_count() == 0          # out of the queue for good
-    assert store.stale_ids(10) == []
-    assert store.reanalysis_failed_count() == 1
     row = fake_mongo.tracks.find_one({"_id": "42"})
+    assert row["reanalysis_attempts"] == store.REANALYSIS_MAX_ATTEMPTS
     assert "reanalysis_failed_at" in row
     assert "no preview" in row["reanalysis_error"]
+    assert store.stale_count() == 0               # out of the queue for good
+    assert store.stale_ids(10) == []
+    assert store.reanalysis_failed_count() == 1
     # ...but the track is still a playable seed with its old vectors.
     assert store.get_track("42")["title"] == "Old Take"
     assert store.get_features("42") is not None
 
 
-def test_an_undecodable_preview_is_marked_too(fake_mongo, reanalysis_ok,
-                                              monkeypatch):
-    """A failure inside analyze_tracks lands in that path's slot, not as a
-    raise -- it must be marked the same way as a failed download."""
+def test_a_per_track_decode_error_counts_attempts_and_gives_up_at_three(
+        fake_mongo, reanalysis_ok, monkeypatch):
+    """A DecodeError in that path's slot is a verdict about the audio, so it
+    is classifiable -- three attempts, then the row leaves the queue."""
+    from music_recommendations.analysis.v2 import DecodeError
+
     monkeypatch.setattr(worker, "analyze_tracks",
-                        lambda paths: [ValueError("not audio") for _ in paths])
+                        lambda paths: [DecodeError("not audio") for _ in paths])
     _stale("42")
+
+    for attempt in (1, 2):
+        assert worker.reanalyze_step() == 0
+        assert fake_mongo.tracks.find_one({"_id": "42"})["reanalysis_attempts"] == attempt
+        assert store.stale_count() == 1
 
     assert worker.reanalyze_step() == 0
     assert store.stale_count() == 0
     assert store.reanalysis_failed_count() == 1
+
+
+def test_an_unclassifiable_per_track_failure_never_gives_up(fake_mongo,
+                                                            reanalysis_ok,
+                                                            monkeypatch):
+    """A download that 500s, or a slot holding some unexpected exception, is
+    not evidence about the TRACK. It counts as an attempt (so the row moves
+    to the back of the queue instead of blocking it) but must never retire
+    the row -- that is how a bad afternoon deletes a corpus."""
+    monkeypatch.setattr(worker, "analyze_tracks",
+                        lambda paths: [OSError("500 from the CDN") for _ in paths])
+    _stale("42")
+
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS + 2):
+        assert worker.reanalyze_step() == 0
+
+    row = fake_mongo.tracks.find_one({"_id": "42"})
+    assert row["reanalysis_attempts"] > store.REANALYSIS_MAX_ATTEMPTS
+    assert "reanalysis_failed_at" not in row
+    assert store.stale_count() == 1
+    assert store.reanalysis_failed_count() == 0
+
+
+def test_a_group_wide_analysis_failure_marks_nothing(fake_mongo, reanalysis_ok,
+                                                     monkeypatch, capsys):
+    """analyze_tracks raising (rather than filling slots) means the MODEL is
+    broken -- a missing checkpoint, an OOM, a bad image. Charging that to the
+    three tracks that happened to be in the group would quietly retire the
+    whole corpus three rows at a time."""
+    def boom(paths):
+        raise RuntimeError("checkpoint missing")
+
+    monkeypatch.setattr(worker, "analyze_tracks", boom)
+    _stale("42")
+    _stale("43", "Another")
+
+    assert worker.reanalyze_step() == 0
+
+    for track_id in ("42", "43"):
+        row = fake_mongo.tracks.find_one({"_id": track_id})
+        assert "reanalysis_failed_at" not in row
+        assert "reanalysis_attempts" not in row
+    assert store.stale_count() == 2
+    assert "checkpoint missing" in capsys.readouterr().out
+
+
+def test_three_group_wide_failures_halt_the_arm_then_it_retries(
+        fake_mongo, reanalysis_ok, monkeypatch, capsys, tmp_path):
+    """A broken model fails every group instantly, so without a breaker the
+    arm spins on the whole corpus at full speed, logging forever."""
+    def boom(paths):
+        raise RuntimeError("checkpoint missing")
+
+    monkeypatch.setattr(worker, "analyze_tracks", boom)
+    _stale("42")
+
+    for _ in range(worker.REANALYZE_MAX_GROUP_FAILURES):
+        assert worker.reanalyze_step() == 0
+    assert "halting the re-analysis arm" in capsys.readouterr().out
+
+    downloaded = []
+    monkeypatch.setattr(worker, "download_preview",
+                        lambda url: downloaded.append(url))
+    assert worker.reanalyze_step() == 0
+    assert downloaded == []                     # nothing even attempted
+    assert "halting" not in capsys.readouterr().out   # said once, not per tick
+
+    # ...and it comes back by itself once the window lapses.
+    worker._halted_until = 0.0
+    monkeypatch.setattr(worker, "analyze_tracks",
+                        lambda paths: [dict(FEATURES) for _ in paths])
+    mp3 = tmp_path / "again.mp3"
+    mp3.write_bytes(b"mp3")
+    monkeypatch.setattr(worker, "download_preview", lambda url: mp3)
+    assert worker.reanalyze_step() == 1
+
+
+def test_one_good_group_resets_the_breaker(fake_mongo, reanalysis_ok,
+                                           monkeypatch):
+    """The count is CONSECUTIVE failures: two blips a day apart are not a
+    broken model, and must not add up to a halt."""
+    calls = {"n": 0}
+
+    def sometimes(paths):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("blip")
+        return [dict(FEATURES) for _ in paths]
+
+    monkeypatch.setattr(worker, "analyze_tracks", sometimes)
+    _stale("42")
+    _stale("43", "Another")
+
+    assert worker.reanalyze_step() == 0
+    assert worker.reanalyze_step() >= 1
+    assert worker._group_failures == 0
+
+
+def test_a_put_track_failure_marks_nothing(fake_mongo, reanalysis_ok,
+                                           monkeypatch, capsys):
+    """The analysis SUCCEEDED; the store is what failed. Marking the row
+    would retire a perfectly good track because Atlas hiccupped."""
+    _stale("42")
+
+    def boom(track, features):
+        raise ConnectionError("atlas down")
+
+    monkeypatch.setattr(store, "put_track", boom)
+
+    assert worker.reanalyze_step() == 0
+    row = fake_mongo.tracks.find_one({"_id": "42"})
+    assert "reanalysis_failed_at" not in row
+    assert "reanalysis_attempts" not in row
+    assert store.stale_count() == 1
+    assert "atlas down" in capsys.readouterr().out
 
 
 def test_a_later_success_clears_the_give_up_mark(fake_mongo, reanalysis_ok):
     """Otherwise the row would be invisible to the NEXT version bump's
     backfill as well, forever."""
     _stale("42")
-    store.fail_reanalysis("42", "ValueError: not audio")
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS):
+        store.record_reanalysis_failure("42", "DecodeError: not audio",
+                                        classifiable=True)
     assert store.stale_count() == 0
 
     store.put_track({**TRACK, "track_id": "42"}, dict(FEATURES))
 
     assert store.reanalysis_failed_count() == 0
     assert "42" in store.corpus_ids()
+    assert "reanalysis_attempts" not in fake_mongo.tracks.find_one({"_id": "42"})
 
 
 def test_an_unknown_source_does_not_block_the_queue(fake_mongo, reanalysis_ok):
     """A namespaced id whose source is no longer in the registry: nothing can
-    ever fetch its audio, so it is marked rather than retried."""
+    ever fetch its audio, so it is classifiable and retires after three."""
     store.put_track({**TRACK, "track_id": "spotify:9"}, dict(OLD))
 
-    assert worker.reanalyze_step() == 0
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS):
+        assert worker.reanalyze_step() == 0
+
     assert store.stale_count() == 0
     assert store.reanalysis_failed_count() == 1
+
+
+def test_a_failed_row_goes_to_the_back_of_the_queue(fake_mongo, reanalysis_ok,
+                                                    monkeypatch):
+    """Otherwise a row that fails and is retried keeps the head of an
+    oldest-first queue and the rest of the corpus never gets a turn."""
+    monkeypatch.setattr(worker, "GROUP_SIZE", 1)
+    _stale("42")
+    _stale("43", "Another")
+    monkeypatch.setattr(deezer_source.DeezerSource, "preview_url",
+                        lambda self, track_id: None if track_id == "42" else "http://x/p.mp3")
+
+    assert worker.reanalyze_step() == 0        # took 42, failed
+    assert store.stale_ids(1) == ["43"]        # 42 is now behind it
+    assert worker.reanalyze_step() == 1
+
+
+def test_a_prioritized_row_jumps_the_queue(fake_mongo, reanalysis_ok, monkeypatch):
+    """/seed on a superseded row asks for it by name: a user is waiting on
+    that one track, not on the 19,000 rows in front of it."""
+    monkeypatch.setattr(worker, "GROUP_SIZE", 1)
+    _stale("42")
+    _stale("43", "Another")
+    store.prioritize_reanalysis("43")
+
+    assert store.stale_ids(1) == ["43"]
+    assert worker.reanalyze_step() == 1
+    assert "43" in store.corpus_ids()
+
+
+def test_the_arm_logs_how_many_it_has_given_up_on(fake_mongo, reanalysis_ok,
+                                                  monkeypatch, capsys):
+    """A backfill that is "finishing" only because it retired half the corpus
+    should be visible in the same line that reports progress."""
+    _stale("42")
+    _stale("99", "Given up")
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS):
+        store.record_reanalysis_failure("99", "DecodeError: not audio",
+                                        classifiable=True)
+
+    worker.reanalyze_step()
+
+    assert "gave up on 1" in capsys.readouterr().out
+
+
+def test_embed_jobs_come_before_the_backfill(fake_mongo, reanalysis_ok,
+                                             monkeypatch):
+    """A cold /seed waits 20 s for the worker. During a day-long backfill it
+    must not spend that wait behind a re-analysis group."""
+    monkeypatch.setattr(worker, "GROUP_SIZE", 3)
+    for i in range(5):
+        _stale(str(200 + i))
+    store.enqueue_embed("42")
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
+
+    worker._tick()
+
+    # The queued embed job was served, and the backfill gave way to it: at
+    # most one stale row was taken this tick, not a full group of three.
+    assert store.get_features("42") is not None
+    assert store.stale_count() >= 4
 
 
 def test_reanalysis_runs_before_the_crawl(fake_mongo, reanalysis_ok, monkeypatch):

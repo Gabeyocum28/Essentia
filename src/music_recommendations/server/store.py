@@ -95,10 +95,12 @@ def ensure_indexes() -> None:
     # and which are the oldest" every tick (stale_count / stale_ids, _STALE).
     # On the bare `analyzed_at` index that is a scan of the whole corpus for
     # a count that is usually zero once the backfill has drained; leading on
-    # features_version (an equality-style range) and following with
-    # analyzed_at lets the sort come off the index too.
+    # features_version (an equality-style range) makes the count cheap, and
+    # the remaining keys are _STALE_SORT in the SAME directions, which is
+    # what lets the arm's three-key sort come off the index rather than out
+    # of a blocking in-memory sort of the whole stale set.
     d.tracks.create_index([("features_version", pymongo.ASCENDING),
-                           ("analyzed_at", pymongo.ASCENDING)])
+                           *_STALE_SORT])
     d.jobs.create_index([("state", pymongo.ASCENDING), ("created_at", pymongo.ASCENDING)])
     d.cache.create_index("expires_at", expireAfterSeconds=0)
     _indexes_ready = True
@@ -251,7 +253,9 @@ def put_track(track: dict, features: dict) -> None:
         # more, and leaving the mark would hide the row from a future
         # version bump's backfill.
         {"$set": fields, "$currentDate": {"analyzed_at": True},
-         "$unset": {"reanalysis_failed_at": "", "reanalysis_error": ""}},
+         "$unset": {"reanalysis_failed_at": "", "reanalysis_error": "",
+                    "reanalysis_attempts": "", "reanalysis_attempted_at": "",
+                    "reanalyze_priority": ""}},
         upsert=True,
     )
 
@@ -418,15 +422,38 @@ def corpus_size() -> int:
 # until something re-analyzes them, so the worker's re-analysis arm needs
 # to see both how many are left and which to take next.
 #
-# `reanalysis_failed_at` is what takes a row OUT of that queue for good. The
-# arm works oldest-first, so a row whose preview is permanently gone (a
-# delisted track, a dead id) would otherwise sit at the head of the list and
-# be retried every tick forever, and nothing else would ever be re-analyzed.
-# Marking the track document rather than the jobs collection is deliberate:
-# re-analysis is not a queued job, it is a property of the row.
+# `reanalysis_failed_at` is what takes a row OUT of that queue for good, and
+# it is set only after REANALYSIS_MAX_ATTEMPTS classifiable failures (see
+# record_reanalysis_failure). A row that has failed once or twice is still
+# stale work: retiring a track on one bad afternoon at the source would
+# quietly delete a third of the corpus, and nothing in the numbers would say
+# so. Marking the track document rather than the jobs collection is
+# deliberate: re-analysis is not a queued job, it is a property of the row.
 _STALE = {"analyzed_at": {"$exists": True}, "duplicate_of": {"$exists": False},
           "features_version": {"$lt": FEATURES_VERSION},
           "reanalysis_failed_at": {"$exists": False}}
+
+# How many classifiable failures a row gets before it leaves the queue.
+REANALYSIS_MAX_ATTEMPTS = 3
+
+# The order the arm works in, and the reason for each key:
+#
+#   reanalyze_priority   DESCENDING, so a row someone is WAITING on (a /seed
+#                        on a superseded track stamps it) jumps the whole
+#                        backlog. Absent is null, which sorts last descending
+#                        -- i.e. after every prioritized row, which is what
+#                        "jumps the queue" has to mean.
+#   reanalysis_attempted_at  ASCENDING, absent (never tried) first, then the
+#                        longest-ago attempt. This is the backoff: a row that
+#                        just failed goes behind every row that has not been
+#                        tried, so one bad track cannot hold the head of the
+#                        queue and starve the other 19,000.
+#   analyzed_at          ASCENDING, oldest first -- so an interrupted backfill
+#                        makes forward progress (a re-analyzed row gets a
+#                        fresh stamp and sorts to the back).
+_STALE_SORT = [("reanalyze_priority", pymongo.DESCENDING),
+               ("reanalysis_attempted_at", pymongo.ASCENDING),
+               ("analyzed_at", pymongo.ASCENDING)]
 
 
 def stale_count() -> int:
@@ -435,37 +462,66 @@ def stale_count() -> int:
 
 
 def stale_ids(limit: int = 100) -> list[str]:
-    """The next `limit` stale ids, oldest `analyzed_at` first.
-
-    Oldest-first so a backfill that is interrupted and restarted makes
-    forward progress instead of re-taking the same head of the list: a
-    re-analyzed row gets a fresh `analyzed_at` (put_track stamps it) and
-    therefore sorts to the back even before its version changes.
-    """
+    """The next `limit` stale ids, in _STALE_SORT order (see above):
+    prioritized rows, then never-tried, then longest-since-tried, then
+    oldest-analyzed."""
     if limit <= 0:
         return []
     cursor = (db().tracks.find(_STALE, {"_id": 1})
-              .sort("analyzed_at", pymongo.ASCENDING).limit(int(limit)))
+              .sort(_STALE_SORT).limit(int(limit)))
     return [d["_id"] for d in cursor]
 
 
-def fail_reanalysis(track_id: str, error: str) -> None:
-    """This row cannot be brought up to the current version; stop trying.
+def prioritize_reanalysis(track_id: str) -> None:
+    """Put this row at the FRONT of the re-analysis queue.
 
-    The preview is gone, the source no longer knows the id, or the audio
-    will not decode. Without this the row stays stale forever AND stays at
-    the head of the oldest-first queue, so the arm would re-download the
-    same dead preview every tick and never reach the rest of the corpus.
+    /seed on a row the previous stack analyzed: the client is blocked on
+    this one track, and behind it may be the whole corpus. Stamping
+    `reanalyze_priority` is what the queue's first sort key honours. Later
+    stamps beat earlier ones, which is right -- the most recent person
+    waiting is served first.
 
-    The row keeps its old vectors and stays readable by id (a seed the user
-    can still play); it is simply out of LIVE, out of `stale_ids` and out of
-    `stale_count`. Clearing the two fields is all it takes to retry it.
+    Does nothing to a row that is not stale; the arm only ever reads _STALE.
     """
-    db().tracks.update_one(
+    db().tracks.update_one({"_id": track_id},
+                           {"$currentDate": {"reanalyze_priority": True}})
+
+
+def record_reanalysis_failure(track_id: str, error: str,
+                              classifiable: bool) -> int:
+    """One failed re-analysis attempt against this row; returns the count.
+
+    EVERY failure bumps `reanalysis_attempts` and stamps
+    `reanalysis_attempted_at`, because that timestamp is the queue's backoff
+    key -- without it a row that fails keeps the head of an oldest-first
+    queue and nothing behind it is ever reached.
+
+    Only a CLASSIFIABLE failure can retire the row, and only at
+    REANALYSIS_MAX_ATTEMPTS. Classifiable means the failure was a verdict
+    about this track -- its audio will not decode, no source owns its id, the
+    source no longer offers a preview. An unclassifiable failure (the CDN
+    500ing, a socket timeout, a broken model) is evidence about the WORLD,
+    and charging it to the track is how a bad afternoon retires a corpus.
+
+    A retired row keeps its old vectors and stays readable by id (a seed the
+    user can still play); it is simply out of LIVE, out of `stale_ids` and
+    out of `stale_count`. put_track clears every one of these fields, so a
+    row that becomes analyzable again rejoins the queue on its own.
+    """
+    doc = db().tracks.find_one_and_update(
         {"_id": track_id},
         {"$set": {"reanalysis_error": str(error)[:500]},
-         "$currentDate": {"reanalysis_failed_at": True}},
+         "$inc": {"reanalysis_attempts": 1},
+         "$currentDate": {"reanalysis_attempted_at": True}},
+        return_document=ReturnDocument.AFTER,
     )
+    attempts = int((doc or {}).get("reanalysis_attempts", 0))
+    if classifiable and attempts >= REANALYSIS_MAX_ATTEMPTS:
+        db().tracks.update_one(
+            {"_id": track_id},
+            {"$currentDate": {"reanalysis_failed_at": True}},
+        )
+    return attempts
 
 
 def reanalysis_failed_count() -> int:

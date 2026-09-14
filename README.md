@@ -42,7 +42,17 @@ preview cannot stall the queue behind it.
 
 Only the worker loads the audio model. `POST /seed` for an unknown track
 queues it for the worker and waits; the API process never analyzes anything,
-because a second copy of CLAP on a 5 GB container is an OOM kill.
+because a second copy of CLAP alongside the worker's is an OOM kill. A seed
+whose row was analyzed by an older version is not "ready" either — it is
+pushed to the front of the re-analysis queue and waited on like a cold one,
+and `/recommend` answers 409 `unanalyzed` rather than ranking a vector from
+another feature space.
+
+`GET /search/text` (search by description) is the exception and is **off by
+default**: msclap has no text-tower-only load, so the first query pulls the
+whole model into the API process (~2.5 GB resident, permanently). Set
+`TEXT_SEARCH=1` to switch it on — `GET /axes` reports `text_search`, and the
+web app shows the toggle only when it is true.
 
 ## Sources and licensing
 
@@ -54,7 +64,9 @@ Where tracks come from is `SOURCES` (`corpus/sources/`):
   this can actually be sold with. Needs a free `JAMENDO_CLIENT_ID`. Every
   track carries an `attribution_url`; the web app and the iPhone app both
   render a "via Jamendo · CC BY-SA" credit that links to it, because the
-  licence obliges it.
+  licence obliges it. (The iOS credit line ships in this branch **unbuilt** —
+  there is no Xcode toolchain in the environment it was written in, so it has
+  not been compiled or seen on a device.)
 
 Both may be listed at once (`SOURCES=deezer,jamendo`); the crawler
 round-robins them, and a track id resolves back to its own source whether or

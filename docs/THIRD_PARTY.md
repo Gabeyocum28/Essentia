@@ -25,7 +25,8 @@ catch.
 | librosa | ISC | decoding, chroma/key, the fallback beat tracker | https://github.com/librosa/librosa |
 | pyloudnorm | MIT | ITU-R BS.1770 integrated loudness and loudness range | https://github.com/csteinmetz1/pyloudnorm |
 | soxr | LGPL-2.1-or-later | resampling inside Beat This! (dynamically linked, unmodified) | https://github.com/dofuuz/python-soxr |
-| beat_this | MIT | transformer beat tracker → tempo and beat strength | https://github.com/CPJKU/beat_this |
+| beat_this | MIT | transformer beat tracker → tempo and beat strength (pinned to commit `b95c8ab`) | https://github.com/CPJKU/beat_this |
+| transformers | Apache-2.0 | CLAP's text tower runs GPT-2's tokenizer through it; imported by msclap at model load | https://github.com/huggingface/transformers |
 | pytest | MIT | tests (dev only) | https://github.com/pytest-dev/pytest |
 | httpx | BSD-3-Clause | test client (dev only) | https://github.com/encode/httpx |
 | mongomock | BSD-3-Clause | store tests (dev only) | https://github.com/mongomock/mongomock |
@@ -36,7 +37,6 @@ the image too:
 | Package | Licence | Comes with | Link |
 |---|---|---|---|
 | torchaudio | BSD-2-Clause | msclap (imported at module load) | https://github.com/pytorch/audio |
-| transformers | Apache-2.0 | msclap (GPT-2 tokenizer for the text tower) | https://github.com/huggingface/transformers |
 | huggingface-hub | Apache-2.0 | transformers | https://github.com/huggingface/huggingface_hub |
 | torchlibrosa | MIT | msclap (mel front end inside the audio tower) | https://github.com/qiuqiangkong/torchlibrosa |
 | scikit-learn | BSD-3-Clause | msclap, umap-learn | https://github.com/scikit-learn/scikit-learn |
@@ -95,7 +95,11 @@ three, and as a standing rule:
 - we **do not patch** them, and any future need to would end this
   arrangement and require the patched source to be published;
 - any artifact we distribute ships their **licence notices and an offer of
-  source** (the upstream URLs in this file are that offer).
+  source**. The offer runs from US, not from Debian or PyPI: **on request we
+  provide the corresponding source for these packages**, in the versions the
+  distributed image contains. The upstream URLs in this file are where we get
+  it from; they are not a substitute for the obligation, because an upstream
+  that deletes a tag does not discharge it.
 
 Under LGPL-2.1 §6 that is the clause-compliant arrangement: a user can
 replace the library with their own build without touching our code. Nothing

@@ -243,6 +243,68 @@ def test_seed_unplayable_track_queues_instead_of_500(client, fake_mongo, monkeyp
     assert tid not in store.corpus_ids()
 
 
+def test_seed_on_a_superseded_row_is_not_ready(client, fake_mongo,
+                                               analysis_unavailable, monkeypatch):
+    """A row the PREVIOUS stack analyzed has features, but not ones this
+    server can rank: its vector is in a different space entirely. Answering
+    "ready" sends the client straight to a /recommend that cannot work."""
+    track = dict(FIXTURE[4])
+    tid = track["track_id"]
+    store.put_track(track, {**fake_features(0.5),
+                            "_features_version": FEATURES_VERSION - 1})
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
+
+    body = client.post("/seed", json={"track_id": tid}).json()
+
+    assert body == {"track_id": tid, "status": "unanalyzed"}
+
+
+def test_seed_on_a_superseded_row_jumps_the_reanalysis_queue(
+        client, fake_mongo, analysis_unavailable, monkeypatch):
+    """Somebody is blocked on this one track, and the whole backlog is in
+    front of it. It goes to the front, and it is NOT queued as a cold embed:
+    the row already has its metadata, only its vectors are out of date."""
+    track = dict(FIXTURE[4])
+    tid = track["track_id"]
+    store.put_track(track, {**fake_features(0.5),
+                            "_features_version": FEATURES_VERSION - 1})
+    store.put_track({**FIXTURE[3], "track_id": "older"},
+                    {**fake_features(0.1), "_features_version": FEATURES_VERSION - 1})
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
+
+    client.post("/seed", json={"track_id": tid})
+
+    assert store.stale_ids(2)[0] == tid
+    assert "reanalyze_priority" in fake_mongo.tracks.find_one({"_id": tid})
+    assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"}) is None
+
+
+def test_seed_is_ready_once_the_row_reaches_the_current_version(
+        client, fake_mongo, monkeypatch):
+    """The wait is version-aware too: a poll that stopped at "there are some
+    features" would return ready on exactly the rows it just rejected."""
+    track = dict(FIXTURE[4])
+    tid = track["track_id"]
+    store.put_track(track, {**fake_features(0.5),
+                            "_features_version": FEATURES_VERSION - 1})
+    monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 1.0)
+    monkeypatch.setattr(app_module, "_EMBED_POLL_S", 0.0)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
+    polled = {"n": 0}
+    real_get = store.get_features
+
+    def get_features_then_upgrade(track_id):
+        polled["n"] += 1
+        if polled["n"] == 2:
+            store.put_track(track, fake_features(0.5))
+        return real_get(track_id)
+
+    monkeypatch.setattr(store, "get_features", get_features_then_upgrade)
+
+    body = client.post("/seed", json={"track_id": tid}).json()
+    assert body == {"track_id": tid, "status": "ready"}
+
+
 def test_seed_unknown_track_404(client, fake_mongo, monkeypatch):
     monkeypatch.setattr(deezer_api, "get_track", lambda t: None)
     assert client.post("/seed", json={"track_id": "doesnotexist"}).status_code == 404
@@ -506,6 +568,37 @@ def test_seed_on_a_host_without_the_analysis_extra(client, fake_mongo, monkeypat
     body = client.post("/seed", json={"track_id": tid})
     assert body.status_code == 200
     assert body.json() == {"track_id": tid, "status": "unanalyzed"}
+
+
+def test_recommend_with_a_seed_from_another_feature_space_is_not_a_500(
+        client, seeded_corpus, fake_mongo):
+    """A superseded seed (a 1280-d vector against a 1024-d corpus) used to
+    reach numpy as a shape error and come back as a 500. It is a known,
+    explainable state -- the row is waiting for re-analysis -- so it gets a
+    409 that says so."""
+    store.put_track({**FIXTURE[6], "track_id": "old"},
+                    {"embedding": [0.1] * 3, "feel": [0.5] * 8,
+                     "_features_version": FEATURES_VERSION - 1})
+
+    r = client.get("/recommend", params={"track_id": "old",
+                                         "axis": "sounds_like"})
+
+    assert r.status_code == 409
+    assert r.json()["detail"]["status"] == "unanalyzed"
+
+
+def test_viz_map_with_a_mismatched_seed_is_not_a_500(client, seeded_corpus,
+                                                     fake_mongo):
+    """Same guard on the insights path: it ranks the same seed against the
+    same matrix, so it fails the same way without it."""
+    store.put_track({**FIXTURE[6], "track_id": "old"},
+                    {"embedding": [0.1] * 3, "feel": [0.5] * 8,
+                     "_features_version": FEATURES_VERSION - 1})
+
+    r = client.get("/viz/map", params={"track_id": "old", "axis": "sounds_like"})
+
+    assert r.status_code == 409
+    assert r.json()["detail"]["status"] == "unanalyzed"
 
 
 def test_recommend_limit_is_capped(client, seeded_corpus):

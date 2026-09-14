@@ -5,10 +5,16 @@ same query params, same JSON keys. The mock (fixture-serving) behavior
 ships first and stays as the fallback until the corpus lands.
 
 Rules:
-- The API process NEVER analyzes. It does not import the analysis stack at
-  all, except CLAP's text tower lazily inside GET /search/text. A cold seed
-  is handed to the worker, which is the one process that loads the audio
-  model; a second copy of it here is an OOM kill on a 5 GB container.
+- The API process NEVER analyzes. A cold seed is handed to the worker, which
+  is the one process that loads the audio model. The single exception is
+  GET /search/text, which is OFF unless TEXT_SEARCH=1 because msclap has no
+  text-tower-only load and the first query would pull the whole ~2.5 GB
+  model into this process permanently.
+- A seed is "ready" only at the CURRENT features_version. A row analyzed by
+  an older stack is prioritized for re-analysis (store.prioritize_reanalysis)
+  and waited on like a cold one; /recommend and the viz endpoints answer 409
+  `{"status": "unanalyzed"}` for it rather than letting numpy's shape error
+  become a 500.
 - Ranking is normalize + matmul + argsort in numpy, in-process. Never add
   FAISS/pgvector/ANN — pure overhead at this scale (spec §2.2).
 - The axis registry in axes.py is the one table for adding/removing/

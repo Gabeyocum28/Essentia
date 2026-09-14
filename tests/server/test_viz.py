@@ -1276,6 +1276,42 @@ def test_the_background_layout_starts_once_per_subset(client, big_corpus,
     assert len(calls) == 1
 
 
+def test_two_subsets_lay_out_one_at_a_time(client, big_corpus, monkeypatch):
+    """Each layout is 2-15 s of single-threaded numba, and the box has two
+    cores it also answers requests with. _UMAP_PENDING only stops a burst
+    against ONE subset from starting several threads; two different subsets
+    are two identities, so without a process-wide lock they run at once and
+    make each other (and the API) slower."""
+    active = []
+    overlap = []
+    runs = []
+
+    def slow_umap(matrix, seed=0):
+        runs.append(id(matrix))
+        active.append(1)
+        if len(active) > 1:
+            overlap.append(len(active))
+        time.sleep(0.15)
+        active.pop()
+        return _stub_umap(matrix)
+
+    monkeypatch.setattr(viz, "project_umap", slow_umap)
+
+    # Two DIFFERENT subset identities: /viz/map's seed-anchored subset for two
+    # seeds far apart on the ring.
+    client.get("/viz/map", params={"track_id": "b0", "axis": "sounds_like"})
+    client.get("/viz/map", params={"track_id": "b30", "axis": "surprise"})
+
+    deadline = time.monotonic() + 10.0
+    while app_module._UMAP_PENDING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not app_module._UMAP_PENDING, "a background layout never finished"
+    # The premise: these really are two separate layouts, not one subset
+    # asked for twice (which _UMAP_PENDING alone would already collapse).
+    assert len(set(runs)) == 2, f"expected two distinct subsets, got {runs}"
+    assert overlap == [], f"{len(overlap)} layouts ran concurrently"
+
+
 def test_a_failed_background_layout_leaves_the_map_on_pca(client, big_corpus,
                                                           monkeypatch):
     """A broken layout must not break the endpoint that draws it."""

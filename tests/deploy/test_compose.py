@@ -39,13 +39,15 @@ def test_env_example_documents_the_source_switches():
     assert text.split("JAMENDO_CLIENT_ID=")[1].splitlines()[0] == ""
 
 
-def test_the_worker_gets_the_memory_the_audio_tower_needs():
-    """Only the worker loads CLAP's audio tower (~2.5 GB resident), and the
-    API no longer analyzes anything -- so the worker's limit went up and the
-    API's came down. Both still fit the 12 GB box beside Caddy."""
+def test_the_containers_are_sized_for_the_models_they_can_load():
+    """The worker always loads CLAP's audio tower (~2.5 GB resident). The API
+    loads nothing by default but pulls the WHOLE model on the first
+    /search/text when TEXT_SEARCH=1 -- msclap has no text-tower-only load --
+    so its limit has to cover that or the feature OOM-kills the API the first
+    time anyone uses it. Both still fit the 12 GB box beside Caddy."""
     text = (DEPLOY / "docker-compose.yml").read_text()
     limits = re.findall(r"mem_limit: (\d+)g", text)
-    assert limits == ["5", "4"]
+    assert limits == ["6", "4"]
 
 
 def test_the_image_installs_git_for_the_beat_tracker():

@@ -33,7 +33,7 @@ from typing import Literal, NamedTuple
 
 from contract.features import AXES
 from music_recommendations.analysis.feel import FEEL_KEYS
-from music_recommendations.analysis.schema import METRICS
+from music_recommendations.analysis.schema import FEATURES_VERSION, METRICS
 from music_recommendations.corpus import sources
 from music_recommendations.server import dedupe, store, viz
 from music_recommendations.server.axes import AXIS_FEATURES, BLENDED_AXES
@@ -296,6 +296,47 @@ def _fixture_track(track_id: str) -> dict | None:
     )
 
 
+# ---- "this seed is not in the corpus's feature space" ----
+#
+# A row analyzed by a superseded stack HAS features; they are simply in a
+# different vector space (1280-d EffNet against a 1024-d CLAP corpus, or the
+# same width with different meaning). Every path that ranks a seed against
+# the corpus matrix used to reach numpy with those and come back as a 500.
+#
+# It is not a server error and it is not a 404 either -- the track exists,
+# the row exists, it is queued for re-analysis and will work shortly. 409
+# Conflict with an `unanalyzed` body says exactly that, and is the same shape
+# a client already handles from /seed.
+
+def _is_current(features: dict) -> bool:
+    """Were these features produced by the stack this server ranks with?"""
+    return int(features.get(store.VERSION_KEY, 0)) == FEATURES_VERSION
+
+
+def _unanalyzed(track_id: str, why: str) -> HTTPException:
+    return HTTPException(409, {"status": "unanalyzed", "track_id": track_id,
+                               "detail": why})
+
+
+def _require_current(track_id: str, features: dict | None) -> None:
+    """409 when this seed's vectors are not the corpus's vectors.
+
+    Also PRIORITIZES the row: whoever asked is blocked on this one track,
+    and the re-analysis arm works through a backlog that may be the whole
+    corpus. Best-effort -- a store that cannot take the stamp must not turn
+    a readable 409 into a 500.
+    """
+    if features is None or _is_current(features):
+        return
+    _safe(store.prioritize_reanalysis, track_id)
+    raise _unanalyzed(
+        track_id,
+        f"analyzed by feature version {features.get(store.VERSION_KEY, 0)}, "
+        f"this server ranks version {FEATURES_VERSION}; it is queued for "
+        f"re-analysis"
+    )
+
+
 def _safe(fn, *args, default=None):
     """store call, but a down store means mock-first fallback, not a 500."""
     try:
@@ -538,12 +579,26 @@ def seed(req: SeedRequest) -> dict:
     process in the system that owns the audio tower, and /seed waits on the
     queue instead (_seed_via_worker).
 
-    The only model the API may ever load is CLAP's TEXT tower, lazily, for
-    GET /search/text -- see that handler.
+    "Has features" is not the question: a row the PREVIOUS stack analyzed has
+    features in a space this server cannot rank against, so readiness is
+    version-aware and such a row is pushed to the front of the re-analysis
+    queue instead of being re-crawled.
+
+    The only other model load in this process is GET /search/text, which is
+    off unless TEXT_SEARCH=1 -- see that handler.
     """
     ready = {"track_id": req.track_id, "status": "ready"}
-    if _safe(store.get_features, req.track_id) is not None:
+    features = _safe(store.get_features, req.track_id)
+    if features is not None and _is_current(features):
         return ready
+    if features is not None:
+        # The row is analyzed, but by a stack this server cannot rank
+        # against. It needs no crawl and no embed job -- it is already in the
+        # worker's re-analysis queue, possibly behind the entire corpus. Push
+        # it to the front and wait exactly like a cold seed.
+        _safe(store.prioritize_reanalysis, req.track_id)
+        status = "ready" if _await_features(req.track_id) else "unanalyzed"
+        return {"track_id": req.track_id, "status": status}
 
     track = _safe(store.get_track, req.track_id)
     if track is None:
@@ -575,10 +630,16 @@ def _seed_via_worker(track_id: str, track: dict) -> dict:
 
 
 def _await_features(track_id: str) -> bool:
-    """Poll until the worker writes features:{id}, or the wait window closes."""
+    """Poll until the row carries CURRENT features, or the window closes.
+
+    Version-aware on purpose: "has some features" is exactly the state a
+    superseded row is already in, so a poll that stopped there would answer
+    "ready" the instant it was asked about the rows it had just rejected.
+    """
     deadline = time.monotonic() + _EMBED_WAIT_S
     while True:
-        if _safe(store.get_features, track_id) is not None:
+        features = _safe(store.get_features, track_id)
+        if features is not None and _is_current(features):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -739,9 +800,21 @@ _UNIT_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
 def _similarity(feature_key: str, matrix: np.ndarray, seed_vec: np.ndarray,
                 metric: str) -> np.ndarray:
-    """Seed against every row, reusing a cached unit matrix where cosine allows."""
+    """Seed against every row, reusing a cached unit matrix where cosine allows.
+
+    The width check is here rather than at each caller because this is the
+    one funnel every seed-vs-corpus comparison goes through: /recommend,
+    /viz/map, /viz/histogram and /search/text all land on it, and numpy's
+    shape error is a 500 with nothing in it a client could act on.
+    """
     from music_recommendations.server import rank as rank_mod
 
+    if len(matrix) and matrix.ndim == 2 and matrix.shape[1] != seed_vec.shape[0]:
+        raise _unanalyzed(
+            "seed",
+            f"the seed is a {seed_vec.shape[0]}-d {feature_key} vector and the "
+            f"corpus is {matrix.shape[1]}-d; the seed is queued for re-analysis"
+        )
     if metric != "cosine" or not len(matrix):
         return rank_mod.scores(seed_vec, matrix, metric)
 
@@ -1077,6 +1150,13 @@ def _fill_rec_rhythm(recs: list[dict]) -> None:
         return
     rows = _safe(store.get_many_rhythm, wanted, default=None)
     if rows is None or len(rows) != len(wanted):
+        # get_many_rhythm promises one slot per requested id, in order. A
+        # different length means that contract broke (or the store is down),
+        # and silently serving a panel with every "rec" column blank is the
+        # kind of bug that gets diagnosed as "the UI is wrong".
+        if rows is not None:
+            print(f"rhythm: asked for {len(wanted)} rows and got {len(rows)}; "
+                  f"the math panel will show no rec rhythm")
         return
     found = {track_id: row for track_id, row in zip(wanted, rows)
              if isinstance(row, dict)}
@@ -1306,6 +1386,7 @@ def recommend(track_id: str, axis: str,
         raise HTTPException(400, f"unknown axis {axis!r}")
 
     seed_features = _safe(store.get_features, track_id)
+    _require_current(track_id, seed_features)
     corpus = tuple(_safe(store.corpus_ids, default=[]))
     ranked_against = [i for i in corpus if i != track_id]
 
@@ -1430,9 +1511,23 @@ def _top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # not an option. Same identity discipline -- matrix in the value, re-checked
 # with `is` -- and purged with the others when its subset is superseded.
 _UMAP_CACHE: "OrderedDict[int, tuple[np.ndarray, np.ndarray]]" = OrderedDict()
-# Matrix identities a background layout is already running for, so a burst of
-# requests against one cold subset starts ONE thread, not one per request.
+# Matrix identities a background layout is already running or queued for, so a
+# burst of requests against one cold subset starts ONE thread, not one per
+# request.
 _UMAP_PENDING: set[int] = set()
+
+# ONE layout computes at a time, process-wide. _UMAP_PENDING already stops a
+# burst against a SINGLE subset from starting several threads, but distinct
+# subsets (a second seed, a corpus that grew, /viz/walk beside /viz/map) are
+# distinct identities and would each start their own. Each is 2-15 s of
+# single-threaded numba on a box with two cores that also has to answer
+# requests and run the analysis worker, so running several at once makes
+# every one of them slower and starves the API.
+#
+# Serializing costs nothing a caller can see: the request never waits for a
+# layout either way -- it is answered with PCA and upgraded once the layout
+# lands -- so a queued subset simply stays on PCA for a few seconds longer.
+_UMAP_WORK_LOCK = threading.Lock()
 
 
 def _remember_umap(matrix: np.ndarray, xy: np.ndarray) -> None:
@@ -1453,7 +1548,12 @@ def _start_umap(matrix: np.ndarray) -> None:
 
     def work() -> None:
         try:
-            _remember_umap(matrix, viz.project_umap(matrix))
+            # Held for the whole layout: a second subset's thread waits here
+            # rather than competing for the same two cores. Its own request
+            # has already been answered with PCA, so nothing is blocked on
+            # this lock except the upgrade.
+            with _UMAP_WORK_LOCK:
+                _remember_umap(matrix, viz.project_umap(matrix))
         except Exception as exc:  # noqa: BLE001 - a failed layout is not a failed request
             print(f"viz: UMAP layout failed ({exc!r}); staying on PCA")
         finally:
@@ -1598,6 +1698,10 @@ def viz_map(track_id: str, axis: str,
         raise HTTPException(400, f"unknown axis {axis!r}")
 
     seed_features = _safe(store.get_features, track_id)
+    # Before the 404 below: a superseded row IS analyzed, it is just not
+    # analyzed by this stack, and "not in corpus" would send the client
+    # looking for a track that is sitting in the re-analysis queue.
+    _require_current(track_id, seed_features)
     corpus = tuple(_safe(store.corpus_ids, default=[]))
     if seed_features is None or not corpus:
         raise HTTPException(404, f"track {track_id} not analyzed")
@@ -2104,6 +2208,7 @@ def viz_walk(from_: str = Query(alias="from"), to: str = Query(),
 @app.get("/viz/histogram")
 def viz_histogram(track_id: str) -> dict:
     seed_features = _safe(store.get_features, track_id)
+    _require_current(track_id, seed_features)
     if not seed_features or "embedding" not in seed_features:
         raise HTTPException(404, f"track {track_id} not analyzed")
     ids, matrix = _viz_embedding_corpus()

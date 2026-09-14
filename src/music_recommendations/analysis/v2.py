@@ -35,6 +35,17 @@ SAMPLE_RATE = 44100
 # window is 7 s) or a tempo (three beats at 60 BPM is 2 s).
 MIN_SECONDS = 1.0
 
+# How much of a track is analyzed, and NOT an optimization: it is what makes
+# two tracks comparable. A Deezer preview is 30 s; Jamendo hands back the
+# whole recording (the worker's Range cap stops the download at ~1 MB, which
+# is 85 s at 96 kbps, not 30). Embedding one track's first 30 s against
+# another's first 85 s compares a head against a head-plus-middle, and the
+# loudness and tempo statistics are taken over different amounts of music
+# too. Fixing the window makes the corpus one corpus.
+#
+# Changing this number moves every vector: it is a FEATURES_VERSION bump.
+ANALYSIS_SECONDS = 30.0
+
 
 class DecodeError(Exception):
     """The file could not be turned into audio: not audio, truncated, empty."""
@@ -42,6 +53,9 @@ class DecodeError(Exception):
 
 def decode(path: Path | str) -> np.ndarray:
     """Mono float32 at 44.1 kHz, via librosa (audioread/soundfile + ffmpeg).
+
+    At most ANALYSIS_SECONDS of it -- see that constant: the cap is what puts
+    every source's audio on the same footing, not a speed trick.
 
     Raises DecodeError rather than whichever of librosa's five backends
     failed first, so the worker sees one exception type in the slot and can
@@ -53,7 +67,8 @@ def decode(path: Path | str) -> np.ndarray:
     if not p.exists():
         raise FileNotFoundError(p)
     try:
-        y, _sr = librosa.load(str(p), sr=SAMPLE_RATE, mono=True)
+        y, _sr = librosa.load(str(p), sr=SAMPLE_RATE, mono=True,
+                              duration=ANALYSIS_SECONDS)
     except Exception as exc:  # noqa: BLE001 - normalized into DecodeError
         raise DecodeError(f"{p}: {type(exc).__name__}: {exc}") from exc
     y = np.asarray(y, dtype=np.float32)
