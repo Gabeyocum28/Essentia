@@ -24,6 +24,12 @@ from __future__ import annotations
 # other silently, which looks like "the recommendations got worse" and is
 # almost impossible to trace back. The pre-spec MVP hit this and solved it the
 # same way (legacy/mvp/analyzer.py CACHE_VERSION).
+# 4: clean-room stack. Discogs-EffNet (non-commercial) replaced by Microsoft
+#    CLAP: the embedding is 1024-d and in a different space entirely, so a
+#    version-3 vector and a version-4 vector have no meaningful cosine at
+#    all. The feel vector went from eleven trained heads to eight zero-shot
+#    contrastive axes (analysis/feel_v2.PROMPT_BANK), and `rhythm` is new.
+#    Every stored row must be re-analyzed; ranking reads version-4 only.
 # 3: Essentia replaced by ffmpeg + numpy mel + TensorFlow (Linux ARM has no
 #    Essentia wheels). Same model, same maths, but not bit-identical: cosine
 #    with v2 vectors is >0.99, yet a corpus must not mix the two. Genre head
@@ -32,7 +38,7 @@ from __future__ import annotations
 #    rescaled to their measured ranges so each contributes comparably. Vectors
 #    written under v1 are NOT comparable with v2 and must be re-analyzed.
 # 1: initial.
-FEATURES_VERSION = 3
+FEATURES_VERSION = 4
 
 # Which distance is correct for each feature key.
 #
@@ -40,8 +46,9 @@ FEATURES_VERSION = 3
 # constructed, so it belongs next to the construction rather than in the
 # server's axis table.
 #
-#   embedding -- 1280-d EffNet activations, direction carries the meaning and
-#                magnitude mostly reflects loudness. Cosine.
+#   embedding -- 1024-d CLAP activations, L2-normalized at analysis time.
+#                Direction is the whole of the meaning (the model was trained
+#                with a cosine objective). Cosine.
 METRICS = {
     "embedding": "cosine",
 }

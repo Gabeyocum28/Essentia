@@ -79,3 +79,21 @@ HAVE_EFFNET = (MODELS / "discogs-effnet-bs64-1.pb").exists()
 needs_effnet = pytest.mark.skipif(
     not HAVE_EFFNET, reason="run scripts/fetch_models.py first"
 )
+
+# ---- v2 (CLAP + Beat This!) -------------------------------------------------
+#
+# The v2 stack (torch, msclap, librosa, pyloudnorm, beat_this) is not
+# installed in the same interpreter as TensorFlow/Essentia during the
+# transition, so the default `python3 -m pytest` run skips every v2 test and
+# they are run against the v2 interpreter instead. Both runs must be green;
+# see docs/superpowers/plans/2026-09-13-clean-room.md.
+HAVE_V2 = importlib.util.find_spec("msclap") is not None
+needs_v2 = pytest.mark.skipif(
+    not HAVE_V2, reason="v2 tests need the analysis extra (torch + msclap)"
+)
+
+V2_MODELS = MODELS / "v2"
+HAVE_CLAP_WEIGHTS = (V2_MODELS / "CLAP_weights_2023.pth").exists()
+needs_clap_weights = pytest.mark.skipif(
+    not HAVE_CLAP_WEIGHTS, reason="run scripts/fetch_models.py first"
+)
