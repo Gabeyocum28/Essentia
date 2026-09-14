@@ -1,9 +1,7 @@
-"""Shared fixtures: a synthetic tone on disk, and Essentia-availability skips."""
+"""Shared fixtures: synthetic audio on disk, and the v2-availability skips."""
 from __future__ import annotations
 
 import importlib.util
-import subprocess
-import sys
 import wave
 from pathlib import Path
 
@@ -11,24 +9,6 @@ import numpy as np
 import pytest
 
 SR = 16000
-
-
-def run_essentia(script: str, out: Path) -> np.ndarray:
-    """Run `script` in a subprocess (it must np.save its result to `out`).
-
-    Essentia and TensorFlow cannot both be loaded in one process (they
-    deadlock/abort — verified locally), and this test suite also exercises
-    embedding.py's TensorFlow graph. So the essentia reference is always
-    computed out of process, and only numpy arrays cross back over.
-    """
-    try:
-        subprocess.run(
-            [sys.executable, "-c", script], check=True,
-            capture_output=True, text=True,
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"essentia subprocess failed:\n{e.stderr}") from e
-    return np.load(out)
 
 
 def write_tone_wav(path: Path, seconds: float = 3.0, hz: float = 440.0,
@@ -69,27 +49,15 @@ def stereo_tone_wav(tmp_path: Path) -> Path:
     return write_stereo_tone_wav(tmp_path / "stereo_tone.wav")
 
 
-HAVE_ESSENTIA = importlib.util.find_spec("essentia") is not None
-needs_essentia = pytest.mark.skipif(
-    not HAVE_ESSENTIA, reason="parity tests need essentia (Mac only)"
-)
-
 MODELS = Path(__file__).resolve().parents[2] / "models"
-HAVE_EFFNET = (MODELS / "discogs-effnet-bs64-1.pb").exists()
-needs_effnet = pytest.mark.skipif(
-    not HAVE_EFFNET, reason="run scripts/fetch_models.py first"
-)
 
-# ---- v2 (CLAP + Beat This!) -------------------------------------------------
-#
-# The v2 stack (torch, msclap, librosa, pyloudnorm, beat_this) is not
-# installed in the same interpreter as TensorFlow/Essentia during the
-# transition, so the default `python3 -m pytest` run skips every v2 test and
-# they are run against the v2 interpreter instead. Both runs must be green;
-# see docs/superpowers/plans/2026-09-13-clean-room.md.
+# The analysis stack (torch, msclap, librosa, pyloudnorm, beat_this) is a
+# heavy optional extra, so a checkout that only runs the server tests does
+# not install it and everything that needs a model skips. Both the plain and
+# the analysis interpreter must be green.
 HAVE_V2 = importlib.util.find_spec("msclap") is not None
 needs_v2 = pytest.mark.skipif(
-    not HAVE_V2, reason="v2 tests need the analysis extra (torch + msclap)"
+    not HAVE_V2, reason="these tests need the analysis extra (torch + msclap)"
 )
 
 V2_MODELS = MODELS / "v2"

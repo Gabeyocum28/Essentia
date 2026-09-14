@@ -16,6 +16,8 @@ which no real recording does.
 """
 from __future__ import annotations
 
+import json
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -27,10 +29,32 @@ from tests.analysis.conftest import needs_clap_weights, needs_v2
 pytestmark = needs_v2
 
 SR = 44100
-PREVIEW = Path(
-    "/private/tmp/claude-501/-Users-gabrielyocum-Projects-Essentia"
-    "/a19167c7-7d14-4a2a-9bcb-b87a72c2843c/scratchpad/parity/2711781.mp3"
-)
+FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"
+
+
+@pytest.fixture(scope="module")
+def fixture_preview(tmp_path_factory) -> Path:
+    """A real jazz preview off contract/fixture.json, downloaded once.
+
+    The fixture is 30 real tracks with real Deezer preview URLs (AGENTS.md:
+    do not invent test tracks), so this is the one place the v2 stack meets
+    audio it did not synthesize. Deezer's URLs are signed leases and this
+    host may be offline, so a fetch that does not work is a skip, not a
+    failure -- the synthetic tests carry the actual correctness claims.
+    """
+    track = json.loads(FIXTURE.read_text())["tracks"][0]
+    url = track.get("preview_url")
+    if not url:
+        pytest.skip("fixture track has no preview URL")
+    dest = tmp_path_factory.mktemp("preview") / "fixture.mp3"
+    try:
+        with urllib.request.urlopen(url, timeout=20) as response:
+            dest.write_bytes(response.read(4 * 1024 * 1024))
+    except Exception as exc:  # noqa: BLE001 - offline or an expired signature
+        pytest.skip(f"fixture preview unreachable: {type(exc).__name__}: {exc}")
+    if dest.stat().st_size < 10_000:
+        pytest.skip("fixture preview came back empty")
+    return dest
 
 
 # ---- synthetic audio --------------------------------------------------------
@@ -131,32 +155,32 @@ def test_feel_scores_saturate_at_the_poles():
     """An "audio" vector that IS the positive prompt must score ~1 on that
     axis, and one that is the negative prompt ~0. Pure arithmetic on a fake
     text matrix -- no model, so this runs anywhere the extra is installed."""
-    from music_recommendations.analysis import feel_v2
+    from music_recommendations.analysis import feel
 
-    n = len(feel_v2.FEEL_KEYS)
+    n = len(feel.FEEL_KEYS)
     rng = np.random.default_rng(0)
     text = rng.standard_normal((n, 2, 1024)).astype(np.float32)
     text /= np.linalg.norm(text, axis=2, keepdims=True)
-    feel_v2._text = text
+    feel._text = text
     try:
         pos = np.stack([text[i, 0] for i in range(n)])
         neg = np.stack([text[i, 1] for i in range(n)])
-        scores_pos = feel_v2.feel_scores(pos)
-        scores_neg = feel_v2.feel_scores(neg)
+        scores_pos = feel.feel_scores(pos)
+        scores_neg = feel.feel_scores(neg)
         assert scores_pos.shape == (n, n)
         for i in range(n):
             assert scores_pos[i, i] > 0.99
             assert scores_neg[i, i] < 0.01
         assert scores_pos.min() >= 0.0 and scores_pos.max() <= 1.0
     finally:
-        feel_v2._text = None
+        feel._text = None
 
 
 def test_feel_keys_and_prompt_bank_agree():
-    from music_recommendations.analysis import feel_v2
+    from music_recommendations.analysis import feel
 
-    assert len(feel_v2.FEEL_KEYS) == 8
-    assert feel_v2.FEEL_KEYS == [n for n, _p, _q in feel_v2.PROMPT_BANK]
+    assert len(feel.FEEL_KEYS) == 8
+    assert feel.FEEL_KEYS == [n for n, _p, _q in feel.PROMPT_BANK]
 
 
 # ---- clap -------------------------------------------------------------------
@@ -206,7 +230,7 @@ def test_embed_audio_is_unit_length_and_batch_matches_single(tmp_path):
 def test_analyze_tracks_shapes_and_one_bad_path(tmp_path):
     """One unreadable file must cost itself and nothing else."""
     from music_recommendations.analysis import FEATURES_VERSION, analyze_tracks
-    from music_recommendations.analysis import as_json, feel_v2, rhythm
+    from music_recommendations.analysis import as_json, feel, rhythm
 
     good = write_wav(tmp_path / "good.wav", c_major_loop(seconds=15))
     out = analyze_tracks([good, tmp_path / "nope.mp3", good])
@@ -217,7 +241,7 @@ def test_analyze_tracks_shapes_and_one_bad_path(tmp_path):
         assert feats["embedding"].shape == (1024,)
         assert feats["embedding"].dtype == np.float32
         assert abs(float(np.linalg.norm(feats["embedding"])) - 1.0) < 1e-4
-        assert feats["feel"].shape == (len(feel_v2.FEEL_KEYS),)
+        assert feats["feel"].shape == (len(feel.FEEL_KEYS),)
         assert 0.0 <= float(feats["feel"].min())
         assert float(feats["feel"].max()) <= 1.0
         assert set(feats["rhythm"]) == set(rhythm.RHYTHM_KEYS)
@@ -255,14 +279,13 @@ def test_decode_reports_a_missing_file_as_missing(tmp_path):
 
 
 @needs_clap_weights
-@pytest.mark.skipif(not PREVIEW.exists(), reason="no real preview on this host")
-def test_real_preview_gets_plausible_numbers():
-    """A jazz preview ("All Blues"): acoustic, not very dance-y, a real tempo
-    and a loudness in the band a mastered recording actually occupies."""
-    from music_recommendations.analysis import analyze_track, feel_v2
+def test_real_preview_gets_plausible_numbers(fixture_preview):
+    """A real jazz preview: acoustic, not very dance-y, a real tempo and a
+    loudness in the band a mastered recording actually occupies."""
+    from music_recommendations.analysis import analyze_track, feel
 
-    feats = analyze_track(PREVIEW)
-    feel = dict(zip(feel_v2.FEEL_KEYS, feats["feel"].tolist()))
+    feats = analyze_track(fixture_preview)
+    feel = dict(zip(feel.FEEL_KEYS, feats["feel"].tolist()))
     rhythm = feats["rhythm"]
 
     assert feel["acoustic"] > 0.5

@@ -5,7 +5,7 @@ Discogs-EffNet embedding. Two things it gives us that EffNet did not:
 
   * a 1024-d audio vector under a licence we can sell against, and
   * a *text* tower into the same space, so a mood axis is a pair of
-    sentences rather than a trained classifier head (see feel_v2.py), and
+    sentences rather than a trained classifier head (see feel.py), and
     "/search/text" is a cosine against a typed phrase.
 
 The msclap wrapper wants file paths and decodes them with torchaudio /

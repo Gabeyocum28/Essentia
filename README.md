@@ -6,11 +6,66 @@ tracks with 30 s previews. Design: `Essencia_design_spec.md`.
 
 ## Setup
 
-    python3 -m pip install -e ".[dev,analysis]"   # analysis extra = tensorflow
+    python3 -m pip install -e ".[dev]"             # server + tests, no models
+    python3 -m pip install -e ".[analysis]"        # + torch/CLAP: only the worker needs this
     brew install ffmpeg                            # or apt install ffmpeg
-    python3 scripts/fetch_models.py                # downloads EffNet into models/
+    python3 scripts/fetch_models.py                # CLAP + Beat This! into models/v2
     export MONGODB_URI="mongodb+srv://..."   # Atlas connection string, never committed
     uvicorn music_recommendations.server.app:app --reload
+
+## Analysis
+
+Each 30-second preview is decoded once (librosa, mono 44.1 kHz) and three
+things are computed off that one waveform (`src/music_recommendations/analysis/`):
+
+- **embedding** — Microsoft CLAP 2023, 1024-d, L2-normalized. Three 7 s
+  windows spread across the clip, meaned. This is what "sounds like" is a
+  cosine of.
+- **feel** — eight axes (energy, valence, tension, acoustic, danceable,
+  vocal, brightness, density), each a softmax over a *pair* of sentences
+  scored against the same embedding by CLAP's text tower. Zero-shot: no
+  trained classifier, so an axis is added by writing a sentence.
+- **rhythm** — tempo and beat strength from Beat This!, integrated loudness
+  and loudness range from pyloudnorm (BS.1770), key/mode/key_strength from
+  chroma against the Krumhansl profiles.
+
+`FEATURES_VERSION` (`analysis/schema.py`) stamps every stored row, and the
+ranking reads only rows at the current version — two vectors from different
+stacks have no meaningful cosine, and nothing in the numbers would say so.
+When the version goes up, the visible corpus shrinks to what the new stack
+has analyzed and the **worker's re-analysis arm** refills it: each tick it
+takes the oldest `GROUP_SIZE` superseded rows, re-fetches their audio from
+the source that owns them, re-analyzes, and logs `reanalyzed N, remaining M`
+— before it crawls for anything new. A row whose audio can no longer be
+fetched or decoded is marked on its own document and skipped, so one dead
+preview cannot stall the queue behind it.
+
+Only the worker loads the audio model. `POST /seed` for an unknown track
+queues it for the worker and waits; the API process never analyzes anything,
+because a second copy of CLAP on a 5 GB container is an OOM kill.
+
+## Sources and licensing
+
+Where tracks come from is `SOURCES` (`corpus/sources/`):
+
+- `SOURCES=deezer` — 30-second previews. **Development only.** Deezer's API
+  terms do not permit shipping it in a product.
+- `SOURCES=jamendo` — Creative Commons music, full audio, and the catalogue
+  this can actually be sold with. Needs a free `JAMENDO_CLIENT_ID`. Every
+  track carries an `attribution_url`; the web app and the iPhone app both
+  render a "via Jamendo · CC BY-SA" credit that links to it, because the
+  licence obliges it.
+
+Both may be listed at once (`SOURCES=deezer,jamendo`); the crawler
+round-robins them, and a track id resolves back to its own source whether or
+not that source is still switched on.
+
+Every dependency and model file is MIT, BSD, ISC or Apache — see
+`docs/THIRD_PARTY.md`, which `tests/test_licences.py` keeps honest: a new
+dependency without a row fails the suite, and so does anything
+non-commercial. That register is the whole point of the current stack. The
+previous one embedded audio with Discogs-EffNet (CC BY-NC-SA) under
+TensorFlow; both are gone, along with ~600 MB of image.
 
 ## Web app
 
@@ -25,22 +80,22 @@ at `/` by the FastAPI app (`web/dist`).
 
 Embedding cosine ranks by *style*: it puts a hushed solo take and a full-band
 blast of the same idiom in the same corner of the space, because idiomatically
-they are the same thing. Eleven small classifier heads (`analysis/feel.py`,
-graphs fetched by `scripts/fetch_models.py`) read the same EffNet embedding and
-score what the cosine drops — energy, mood, texture. "More sounds like this"
-then ranks on `cos(embedding) − w · mean|feel_rec − feel_seed|`, and the "Match
-the feel" slider on the recommendations screen is `w`. At `w = 0` the order is
-exactly the embedding-only order the app served before the heads shipped, which
-is what makes the slider safe to drag either way; the default is 0.3 and lives
-on the server (`FEEL_DEFAULT` in `server/app.py`) — the web client omits the
-`feel` parameter at that value so the number can be retuned without a redeploy
-of the bundle. The slider position is remembered in `localStorage` and carried
-into Insights, where the math panel shows the seed's and the rec's eleven
-dimensions side by side and the `feel_dist` between them. A track with no feel
-vector yet (a row `scripts/feel_backfill.py` has not reached) is never
-penalized — a partial backfill must not hide tracks — and `surprise` is left
-alone entirely, since "nothing like this" is already a request to leave the
-seed's neighbourhood.
+they are the same thing. The eight feel axes (`analysis/feel.py`) score what
+the cosine drops — energy, mood, texture — and "More sounds like this" ranks on
+`cos(embedding) − w · mean|z(feel_rec) − z(feel_seed)|`, where the "Match the
+feel" slider on the recommendations screen is `w` and each axis is z-scored
+over the corpus first so no axis dominates by being wider. At `w = 0` the order
+is exactly the embedding-only order, which is what makes the slider safe to
+drag either way; the default is 0.3 and lives on the server (`FEEL_DEFAULT` in
+`server/app.py`) — the web client omits the `feel` parameter at that value so
+the number can be retuned without a redeploy of the bundle. A second slider,
+"Match the tempo", subtracts an octave-folded tempo distance the same way.
+Slider positions are remembered in `localStorage` and carried into Insights,
+where the math panel shows the seed's and the rec's eight dimensions side by
+side, the `feel_dist` between them, and both tracks' BPM, key and loudness. A
+track with no feel vector is never penalized, and `surprise` is left alone
+entirely, since "nothing like this" is already a request to leave the seed's
+neighbourhood.
 
 ### SOUND mode
 
@@ -51,8 +106,8 @@ pooled mel frames (bright off-diagonal blocks are restated material), and a
 band-solo strip you drag to hear only one range of frequencies. All of it is
 computed in the browser, in a worker, from the decoded preview.
 
-Ordinary playback still uses `GET /preview/{id}`, a 302 to Deezer's CDN, so
-the mp3 bytes never touch our host. Only SOUND mode needs the raw samples —
+Ordinary playback still uses `GET /preview/{id}`, a 302 to the source's CDN,
+so the mp3 bytes never touch our host. Only SOUND mode needs the raw samples —
 a cross-origin stream decodes to silence through a `MediaElementSource` —
 so the audio is proxied through `GET /preview/{id}/audio` only once a solo
 is asked for.
@@ -80,7 +135,6 @@ on the VM.
     scripts/                      operator entry points
     legacy/                       pre-spec MVP, frozen reference
 
-Tests: `python3 -m pytest`
-Before merging analysis changes, also run
-`PARITY=1 python3 -m pytest tests/analysis/test_parity.py -s` (needs
-Essentia, network).
+Tests: `python3 -m pytest` (and `cd web && npm test`). The analysis tests
+skip unless the `analysis` extra is installed and `scripts/fetch_models.py`
+has run — both runs must be green.

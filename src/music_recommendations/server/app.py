@@ -15,7 +15,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import tempfile
 import threading
 import time
 import urllib.request
@@ -33,8 +32,7 @@ from starlette.requests import Request
 from typing import Literal, NamedTuple
 
 from contract.features import AXES
-from music_recommendations.analysis import analyze_track, frontend
-from music_recommendations.analysis.feel_v2 import FEEL_KEYS
+from music_recommendations.analysis.feel import FEEL_KEYS
 from music_recommendations.analysis.schema import METRICS
 from music_recommendations.corpus import sources
 from music_recommendations.server import dedupe, store, viz
@@ -201,9 +199,23 @@ def preview(track_id: str) -> RedirectResponse:
 _AUDIO_CHUNK = 64 * 1024
 
 
+# A preview is 30 s; at 256 kbps that is ~960 KB, so 1 MB covers every real
+# one with room to spare. The cap is a cap, not an estimate: without it a
+# redirect to something enormous (or a source that changes its mind about
+# what "preview" means) streams unbounded bytes through this container.
+PREVIEW_MAX_BYTES = 1024 * 1024
+
+
 def _open_upstream(url: str):
-    """Open the upstream preview URL. Its own function so tests can stub it."""
-    return urllib.request.urlopen(url, timeout=10)
+    """Open the upstream preview URL, asking for the first megabyte only.
+
+    The Range header is the polite half and the read cap below is the half
+    that actually holds: a CDN may ignore Range and answer 200 with the whole
+    file, so the caller counts bytes as well.
+    """
+    request = urllib.request.Request(
+        url, headers={"Range": f"bytes=0-{PREVIEW_MAX_BYTES - 1}"})
+    return urllib.request.urlopen(request, timeout=10)
 
 
 @app.get("/preview/{track_id}/audio")
@@ -232,11 +244,13 @@ def preview_audio(track_id: str) -> StreamingResponse:
         raise HTTPException(502, "upstream preview fetch failed") from exc
 
     def chunks():
+        sent = 0
         try:
-            while True:
-                chunk = upstream.read(_AUDIO_CHUNK)
+            while sent < PREVIEW_MAX_BYTES:
+                chunk = upstream.read(min(_AUDIO_CHUNK, PREVIEW_MAX_BYTES - sent))
                 if not chunk:
                     return
+                sent += len(chunk)
                 yield chunk
         finally:
             upstream.close()
@@ -250,6 +264,13 @@ def preview_audio(track_id: str) -> StreamingResponse:
         "Content-Encoding": "identity",
     }
     length = upstream.headers.get("Content-Length") if hasattr(upstream, "headers") else None
+    if length and not str(length).isdigit():
+        length = None          # a header we cannot trust is a header we drop
+    if length and int(length) > PREVIEW_MAX_BYTES:
+        # A source that ignored the Range header: the body is about to be
+        # truncated at the cap, so promising the full length would leave the
+        # <audio> element waiting for bytes that never come.
+        length = None
     if length:
         # Both of these are what let the element seek inside the preview
         # instead of treating it as an open-ended stream.
@@ -273,15 +294,6 @@ def _fixture_track(track_id: str) -> dict | None:
     return next(
         (t for t in _fixture_tracks() if t["track_id"] == track_id), None
     )
-
-
-def _download_preview(url: str) -> Path:
-    fd, name = tempfile.mkstemp(suffix=".mp3")
-    os.close(fd)
-    path = Path(name)
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        path.write_bytes(resp.read())
-    return path
 
 
 def _safe(fn, *args, default=None):
@@ -427,9 +439,10 @@ def search_text(q: str,
     """Search the CORPUS by description: cosine between the typed phrase and
     every analyzed track, in CLAP's shared audio/text space.
 
-    This is the one thing the clean-room stack gives us that the v1 one
-    could not: EffNet has no text tower, so "hazy late-night trumpet" was
-    not a question the old corpus could be asked at all.
+    This is the one thing the clean-room stack gives us that the stack it
+    replaced could not: that embedding had no text tower, so "hazy
+    late-night trumpet" was not a question the old corpus could be asked at
+    all.
 
     MEMORY: the first call LOADS CLAP INTO THE API PROCESS -- ~700 MB of
     weights and roughly **2.5 GB resident** once torch's allocator is warm.
@@ -480,15 +493,23 @@ def search_text(q: str,
                         for i in order]}
 
 
-# TensorFlow inference is CPU- and memory-heavy; endpoints run on FastAPI's
-# threadpool, so an unbounded burst of /seed calls would run that many
-# analyses at once on a 4 GB container. Cap concurrent analyses instead of
-# concurrent requests -- requests beyond the cap just wait their turn.
-_ANALYZE_SEM = threading.Semaphore(2)
-
-
 @app.post("/seed")
 def seed(req: SeedRequest) -> dict:
+    """Make sure this track has features, then say so.
+
+    The API NEVER analyzes. It used to: a cold seed downloaded the preview
+    and ran the model inline, with a semaphore to keep two of them from
+    eating the container. That was affordable when the model was small. CLAP
+    is ~700 MB of weights and roughly 2.5 GB resident once torch's allocator
+    is warm, and the worker on the same box already holds a copy -- an API
+    that loads a second one on an unlucky request is an API that gets OOM
+    killed. So every unknown seed is handed to the worker, which is the one
+    process in the system that owns the audio tower, and /seed waits on the
+    queue instead (_seed_via_worker).
+
+    The only model the API may ever load is CLAP's TEXT tower, lazily, for
+    GET /search/text -- see that handler.
+    """
     ready = {"track_id": req.track_id, "status": "ready"}
     if _safe(store.get_features, req.track_id) is not None:
         return ready
@@ -501,52 +522,7 @@ def seed(req: SeedRequest) -> dict:
     if track is None:
         raise HTTPException(404, f"track {req.track_id} not found")
 
-    mp3 = _fetch_preview_audio(req.track_id, track)
-    if mp3 is None:
-        # Deezer preview fetch failed -- flake, timeout, 404, or a signature
-        # that could not be renewed. Don't 500 on a transient failure; hand
-        # the job to the worker.
-        return _seed_via_worker(req.track_id, track)
-
-    try:
-        with _ANALYZE_SEM:
-            features = _to_plain(analyze_track(mp3))
-        _safe(store.put_track, track, features)
-        _remember_track(track)
-    except (NotImplementedError, ImportError):
-        # Analysis can't run on this host (no aarch64 essentia wheels on the
-        # ARM VM). Hand the job to the worker and wait.
-        return _seed_via_worker(req.track_id, track)
-    except (frontend.DecodeError, ValueError) as exc:
-        # The preview itself is bad (undecodable, too short). Not transient,
-        # so do not queue it; tell the client (spec §8).
-        raise HTTPException(502, "analysis failed") from exc
-    finally:
-        mp3.unlink(missing_ok=True)
-    return ready
-
-
-def _fetch_preview_audio(track_id: str, track: dict) -> "Path | None":
-    """The preview mp3 for analysis, or None if no signature could be had.
-
-    Tries the URL already in hand, then re-signs once. A track that came from
-    /search carries a live signature and downloads first try; one read back
-    from the store carries a dead one, so the 403 is expected rather than a
-    flake. corpus/download.py takes the same try-then-re-sign shape for the
-    same reason. urllib raises OSError subclasses (URLError, socket.timeout).
-    """
-    # Lazily: re-signing costs a Deezer call, so it must not happen when the
-    # URL already in hand works.
-    for source in (lambda: track.get("preview_url"),
-                   lambda: _fresh_preview(track_id)):
-        url = source()
-        if not url:
-            continue
-        try:
-            return _download_preview(url)
-        except OSError:
-            continue
-    return None
+    return _seed_via_worker(req.track_id, track)
 
 
 # How long /seed waits for the embed worker before failing loudly. Module
@@ -585,7 +561,7 @@ class _CorpusMatrix(NamedTuple):
     correction: np.ndarray | None  # centrality, computed only if an axis wants it
     # Every id this key has been LOOKED UP for, whether or not it turned out
     # to have the feature. Sparse keys need it: `feel` is absent on every row
-    # scripts/feel_backfill.py has not reached, so those ids never enter
+    # whose analysis produced none, so those ids never enter
     # `ids` -- and a `fresh` computed from `ids` alone re-queried all of them
     # on every single request, which is the whole cost the cache exists to
     # avoid. An id enters this set once and stays; a row that gains its
@@ -751,7 +727,7 @@ def _similarity(feature_key: str, matrix: np.ndarray, seed_vec: np.ndarray,
 #
 # Embedding cosine ranks by STYLE. It cannot tell a hushed solo take from a
 # full-band blast of the same idiom, because both sit in the same corner of
-# CLAP space. The feel vector (eight zero-shot axes, analysis/feel_v2.py)
+# CLAP space. The feel vector (eight zero-shot axes, analysis/feel.py)
 # carries exactly what the cosine drops: energy, mood, texture. The blend is
 #
 #     blended = cos(embedding) - feel * feel_dist - tempo * tempo_dist
@@ -803,8 +779,8 @@ class _FeelRows(NamedTuple):
 # (matrix, feel_matrix, rows, present, mean, std)
 _FEEL_ALIGN_CACHE: tuple[np.ndarray, ...] | None = None
 _FEEL_ALIGN_LOCK = threading.Lock()
-# Rows still waiting on scripts/feel_backfill.py are a deploy-time fact, not a
-# per-request one: say it once per process rather than on every /recommend.
+# Rows with no feel vector are a deploy-time fact, not a per-request one: say
+# it once per process rather than on every /recommend.
 _FEEL_MISSING_LOGGED = False
 
 
@@ -838,8 +814,8 @@ def _feel_alignment(ids: list[str], matrix: np.ndarray, feel_ids: list[str],
     missing = int(len(ids) - present.sum())
     if missing and not _FEEL_MISSING_LOGGED:
         _FEEL_MISSING_LOGGED = True
-        print(f"feel: {missing} of {len(ids)} corpus rows have no feel vector "
-              f"and rank unpenalized — run scripts/feel_backfill.py")
+        print(f"feel: {missing} of {len(ids)} corpus rows have no feel "
+              f"vector and rank unpenalized")
 
     scored = np.asarray(feel_matrix, dtype=np.float32)
     if scored.ndim == 2 and scored.shape[0]:
@@ -910,7 +886,6 @@ TEMPO_MAX_DIST = 0.5
 class _RhythmRows(NamedTuple):
     """The rhythm of one ranking's rows, lined up with its matrix."""
     distance: np.ndarray        # (n,) octave-folded tempo distance, 0 if absent
-    rows: list[dict | None]     # (n,) the stored rhythm dict, or None
     present: np.ndarray         # (n,) bool -- whether that row has a tempo
     seed: dict                  # the seed's own rhythm dict
 
@@ -919,19 +894,24 @@ class _RhythmRows(NamedTuple):
 # _FEEL_ALIGN_CACHE (and for the same reason: a bare id() can be reused by a
 # later array). One Mongo read of `rhythm` for the whole corpus per matrix
 # identity, not per request.
-_RHYTHM_ALIGN_CACHE: "tuple[np.ndarray, np.ndarray, list[dict | None], np.ndarray] | None" = None
+#
+# Only the TEMPO column is kept, not the rhythm dicts it was read out of: a
+# dict per corpus row is tens of megabytes of Python objects at 90k rows, and
+# the only rows whose whole rhythm anyone ever sees are the handful the math
+# panel draws (_fill_rec_rhythm reads those back in one query per request).
+_RHYTHM_ALIGN_CACHE: "tuple[np.ndarray, np.ndarray, np.ndarray] | None" = None
 _RHYTHM_ALIGN_LOCK = threading.Lock()
 
 
 def _rhythm_alignment(ids: list[str], matrix: np.ndarray
-                      ) -> tuple[np.ndarray, list[dict | None], np.ndarray]:
-    """(tempo, rows, present) for `ids`, in matrix row order."""
+                      ) -> tuple[np.ndarray, np.ndarray]:
+    """(tempo, present) for `ids`, in matrix row order."""
     global _RHYTHM_ALIGN_CACHE
 
     with _RHYTHM_ALIGN_LOCK:
         cached = _RHYTHM_ALIGN_CACHE
         if cached is not None and cached[0] is matrix:
-            return cached[1], cached[2], cached[3]
+            return cached[1], cached[2]
 
     rows = _safe(store.get_many_rhythm, list(ids), default=None)
     if rows is None or len(rows) != len(ids):
@@ -941,13 +921,14 @@ def _rhythm_alignment(ids: list[str], matrix: np.ndarray
          for r in rows],
         dtype=np.float32,
     )
+    del rows                    # the dicts die here, only the column survives
     # A stored 0.0 means "no beat could be found" (contract/features.py), so
     # it is an absence, not a tempo of zero.
     present = tempo > 0.0
 
     with _RHYTHM_ALIGN_LOCK:
-        _RHYTHM_ALIGN_CACHE = (matrix, tempo, rows, present)
-    return tempo, rows, present
+        _RHYTHM_ALIGN_CACHE = (matrix, tempo, present)
+    return tempo, present
 
 
 def _tempo_distance(seed_bpm: float, tempo: np.ndarray,
@@ -978,10 +959,10 @@ def _rhythm_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
     seed = seed_features.get("rhythm")
     if not isinstance(seed, dict) or not ids:
         return None
-    tempo, rows, present = _rhythm_alignment(ids, matrix)
+    tempo, present = _rhythm_alignment(ids, matrix)
     distance = _tempo_distance(float(seed.get("tempo_bpm") or 0.0),
                                tempo, present)
-    return _RhythmRows(distance, rows, present, seed)
+    return _RhythmRows(distance, present, seed)
 
 
 def _tempo_blend(axis: str, weight: float, similarity: np.ndarray,
@@ -1006,11 +987,35 @@ def _rhythm_math(rhythm: _RhythmRows | None, index: int) -> dict:
     """The math-panel half: both rhythm dicts and the distance between them."""
     if rhythm is None or not rhythm.present[index]:
         return dict(_NO_RHYTHM_MATH)
+    # "rec" is filled in by _fill_rec_rhythm once the page is chosen: the
+    # corpus-wide cache holds only tempi, so the pick's own numbers (key,
+    # loudness) are read for the handful of rows actually shown.
     return {
         "tempo_dist": round(float(rhythm.distance[index]), 4),
-        "rhythm": {"seed": dict(rhythm.seed),
-                   "rec": dict(rhythm.rows[index] or {})},
+        "rhythm": {"seed": dict(rhythm.seed), "rec": {}},
     }
+
+
+def _fill_rec_rhythm(recs: list[dict]) -> None:
+    """One query for the whole page's rhythm dicts, written into the math.
+
+    The alternative -- keeping every corpus row's rhythm dict beside the
+    tempo column -- costs memory proportional to the corpus for numbers only
+    ~10 rows per request ever display.
+    """
+    wanted = [rec["track_id"] for rec in recs
+              if isinstance(rec.get("math", {}).get("rhythm"), dict)]
+    if not wanted:
+        return
+    rows = _safe(store.get_many_rhythm, wanted, default=None)
+    if rows is None or len(rows) != len(wanted):
+        return
+    found = {track_id: row for track_id, row in zip(wanted, rows)
+             if isinstance(row, dict)}
+    for rec in recs:
+        rhythm = rec.get("math", {}).get("rhythm")
+        if isinstance(rhythm, dict):
+            rhythm["rec"] = dict(found.get(rec["track_id"]) or {})
 
 
 def _feel_blend(axis: str, weight: float, similarity: np.ndarray,
@@ -1585,6 +1590,7 @@ def viz_map(track_id: str, axis: str,
         recs.append({"track_id": rec_id, "score": score, "math": math})
         if len(recs) == limit:
             break
+    _fill_rec_rhythm(recs)
 
     # The points/projection are seed-anchored, not the whole corpus: recs
     # (e.g. `surprise`'s far neighbours) are drawn even when they fall
@@ -1643,7 +1649,7 @@ def viz_map(track_id: str, axis: str,
         "recs": recs,
         "axis": axis_info,
         # Sent rather than hardcoded in the client: the dimension order is
-        # analysis/feel_v2.PROMPT_BANK's insertion order, and a client with
+        # analysis/feel.PROMPT_BANK's insertion order, and a client with
         # its own copy of the list would mislabel every bar the day an axis
         # moves.
         "feel_keys": list(FEEL_KEYS),
@@ -2153,13 +2159,6 @@ def _fixture_fallback(track_id: str, limit: int) -> list[dict]:
 def _vector(features: dict, key: str) -> np.ndarray:
     value = features[key]
     return np.atleast_1d(np.asarray(value, dtype=float))
-
-
-def _to_plain(features: dict) -> dict:
-    """np arrays/scalars -> JSON-serializable lists/floats."""
-    return {
-        k: v.tolist() if hasattr(v, "tolist") else v for k, v in features.items()
-    }
 
 
 # ---- the web app: web/dist built into the image, served at / ----

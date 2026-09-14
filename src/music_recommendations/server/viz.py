@@ -394,9 +394,13 @@ def score_math(seed_vec: np.ndarray, rec_vec: np.ndarray, metric: str,
 # ---- occlusion attribution (T2.6): which frequencies carry a similarity ----
 
 ATTRIBUTION_BANDS = 10
-# EffNet consumes 16 kHz mono, so the model literally cannot see anything
-# above 8 kHz: bands stop just under that Nyquist rather than at the 12 kHz
-# a 44.1 kHz display spectrogram could show.
+# These edges are a CONTRACT, not a tuning choice: the phone's band-solo
+# player filters with the exact complement of this mask, so changing them
+# silently desynchronizes what the user hears from what the bars claim. They
+# were chosen when the model ran at 16 kHz (nothing above its 8 kHz Nyquist
+# was worth probing); CLAP runs at 44.1 kHz and could see higher, but the
+# audible payoff above 8 kHz on a 30 s lossy preview is small and the cost of
+# moving them is a client change in lockstep.
 ATTRIBUTION_LO_HZ = 60.0
 ATTRIBUTION_HI_HZ = 7800.0
 

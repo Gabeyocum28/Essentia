@@ -15,16 +15,17 @@ services:
     container_name: essentia-api
     restart: unless-stopped
     env_file: .env
-    environment:
-      TF_CPP_MIN_LOG_LEVEL: "2"
     command: >
       uvicorn music_recommendations.server.app:app
       --host 0.0.0.0 --port 8000 --workers 1
     expose:
       - "8000"
     networks: [web]
-    # two float32 matrices of ~230k×1280 (~2.4 GB) plus TensorFlow
-    mem_limit: 6g
+    # The corpus matrices (float32, 1024-d since v4) plus the UMAP layout.
+    # It does NOT hold the CLAP audio tower: /seed hands every unknown track
+    # to the worker, and only /search/text may load the much smaller text
+    # tower. Lowered from 6g to leave the worker room on a 12 GB box.
+    mem_limit: 5g
     cpus: 1.5
 
   worker:
@@ -33,11 +34,12 @@ services:
     restart: unless-stopped
     depends_on: [api]
     env_file: .env
-    environment:
-      TF_CPP_MIN_LOG_LEVEL: "2"
     command: python -m music_recommendations.worker
     networks: [web]
-    mem_limit: 3g
+    # The only process that loads the CLAP AUDIO tower: ~700 MB of weights
+    # and ~2.5 GB resident once torch's allocator is warm, plus Beat This!
+    # and a group of decoded 30 s waveforms. Raised from 3g accordingly.
+    mem_limit: 4g
     cpus: 1.0
 
 networks:

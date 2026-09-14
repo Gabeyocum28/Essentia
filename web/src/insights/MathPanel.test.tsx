@@ -33,7 +33,7 @@ test("shows the centrality line when centrality is a number", () => {
   expect(screen.getByText("centrality = 0.1200")).toBeInTheDocument();
 });
 
-// analysis/feel_v2.PROMPT_BANK order, which the server sends as feel_keys.
+// analysis/feel.PROMPT_BANK order, which the server sends as feel_keys.
 const FEEL_KEYS = [
   "energy", "valence", "tension", "acoustic",
   "danceable", "vocal", "bright", "density",

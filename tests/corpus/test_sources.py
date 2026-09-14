@@ -194,14 +194,79 @@ def test_jamendo_candidates_rotate_tags_then_featured(stub_get):
         source.candidates(step)
         assert stub_get[step] == ("tracks/", {"tags": tag,
                                               "order": "popularity_total",
-                                              "limit": jamendo.PER_PAGE})
-        assert source.candidate_label() == f"jamendo tag {tag}"
+                                              "limit": jamendo.PER_PAGE,
+                                              "offset": 0})
+        assert source.candidate_label() == f"jamendo tag {tag} +0"
     source.candidates(len(jamendo.TAGS))
-    assert stub_get[-1] == ("tracks/", {"featured": 1, "limit": jamendo.PER_PAGE})
-    assert source.candidate_label() == "jamendo featured"
+    assert stub_get[-1] == ("tracks/", {"featured": 1,
+                                        "limit": jamendo.PER_PAGE,
+                                        "offset": 0})
+    assert source.candidate_label() == "jamendo featured +0"
     # ...and then round again.
     source.candidates(len(jamendo.TAGS) + 1)
-    assert source.candidate_label() == f"jamendo tag {jamendo.TAGS[0]}"
+    assert source.candidate_label() == f"jamendo tag {jamendo.TAGS[0]} +{jamendo.PER_PAGE}"
+
+
+def test_jamendo_candidates_page_deeper_every_lap(stub_get):
+    """Without an offset the rotation re-requests the same hundred most
+    popular tracks forever, and the corpus stops growing after one lap."""
+    source = sources.get("jamendo")
+    arms = len(jamendo.TAGS) + 1
+    source.candidates(0)
+    source.candidates(arms)
+    source.candidates(2 * arms)
+    offsets = [params["offset"] for _path, params in stub_get]
+    assert offsets == [0, jamendo.PER_PAGE, 2 * jamendo.PER_PAGE]
+    assert all(params["tags"] == jamendo.TAGS[0] for _path, params in stub_get)
+
+
+def test_jamendo_pins_the_audio_format(monkeypatch):
+    """Analysis is only comparable across tracks encoded the same way, so the
+    format is pinned in the one place every call goes through."""
+    seen = {}
+
+    class Resp:
+        def read(self):
+            return b'{"headers": {"status": "success"}, "results": []}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(url, timeout=None):
+        seen["url"] = url
+        return Resp()
+
+    monkeypatch.setattr(jamendo.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jamendo, "SLEEP", 0)
+    jamendo._get("tracks/", id="1")
+    assert f"audioformat={jamendo.AUDIO_FORMAT}" in seen["url"]
+
+
+def test_jamendo_logs_an_error_inside_a_200_envelope(monkeypatch, capsys):
+    """A bad client id or an exhausted monthly quota comes back as HTTP 200
+    with an empty result list -- indistinguishable from "no tracks" unless
+    the envelope's own status is read."""
+    class Resp:
+        def read(self):
+            return (b'{"headers": {"status": "failed", '
+                    b'"error_message": "Your credits are exhausted"}, '
+                    b'"results": []}')
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(jamendo.urllib.request, "urlopen",
+                        lambda url, timeout=None: Resp())
+    monkeypatch.setattr(jamendo, "SLEEP", 0)
+    assert jamendo._get("tracks/", id="1")["results"] == []
+    out = capsys.readouterr().out
+    assert "failed" in out and "credits are exhausted" in out
 
 
 def test_jamendo_get_returns_empty_on_a_broken_response(monkeypatch):

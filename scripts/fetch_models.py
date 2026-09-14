@@ -1,14 +1,12 @@
-"""Download every model file the analysis needs into models/.
+"""Download every model file the analysis needs into models/v2/.
 
 One command from checkout to working analysis. Skips files already present.
 Usage: python3 scripts/fetch_models.py
 
-Two generations are fetched during the transition:
-
-  models/v2/  CLAP weights + the Beat This! checkpoint -- what analysis/v2.py
-              uses, and the only thing the image will need after the cutover.
-  models/     the Discogs-EffNet graph and the eleven feel heads -- v1, kept
-              until the parity test is deleted.
+Just the two files analysis/v2.py loads: the Microsoft CLAP 2023 weights and
+the Beat This! `final0` checkpoint. (The non-commercial Discogs-EffNet graph
+and its eleven classification heads used to be fetched here too; the cutover
+deleted them.)
 
 Both msclap and beat_this can fetch their own weights on first use. We do
 not let them: a container that has to reach huggingface.co the first time a
@@ -70,27 +68,9 @@ def fetch_v2() -> None:
         print(f"  warn  could not pre-cache the gpt2 tokenizer ({exc})")
 
 
-def fetch_v1() -> None:
-    """The Discogs-EffNet graph and the eleven feel heads (~0.5 MB each).
-
-    Non-commercial licence; deleted at the cutover. The heads' JSON sits
-    beside each graph because it carries the class order every positive
-    index in registry.HEADS is checked against.
-    """
-    registry.MODELS_DIR.mkdir(exist_ok=True)
-    fetch(registry.EFFNET_URL, registry.MODELS_DIR / registry.EFFNET_FILE)
-    registry.HEADS_DIR.mkdir(parents=True, exist_ok=True)
-    for head in registry.HEADS.values():
-        graph_url, meta_url = head.urls
-        fetch(graph_url, head.graph)
-        fetch(meta_url, head.metadata)
-
-
 def main() -> None:
-    print("v2 (CLAP + Beat This!):")
+    print("CLAP + Beat This!:")
     fetch_v2()
-    print("v1 (Discogs-EffNet, removed at the cutover):")
-    fetch_v1()
     print("models ready")
 
 

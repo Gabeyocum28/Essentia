@@ -3,7 +3,7 @@
   tracks  _id=track_id, title, artist, album, artwork_url,
           embedding (int8 bytes), scale (float), features_version, analyzed_at
           -- the last four are absent until the track is analyzed --
-          feel (8 floats, analysis/feel_v2.FEEL_KEYS) and rhythm (the seven
+          feel (8 floats, analysis/feel.FEEL_KEYS) and rhythm (the seven
           contract RHYTHM_KEYS) -- both absent on rows analyzed before they
           existed, and both optional to the ranking.
   jobs    _id="embed:{id}" | "attr:{seed}:{rec}", kind, state, claimed_at,
@@ -167,11 +167,11 @@ _TRACK_PROJECTION = {**{k: 1 for k in TRACK_FIELDS}, "source": 1, "attribution":
 # retired id is still a legitimate SEED (a user can search it up on Deezer
 # and press play), and refusing to look it up would 404 a playable track.
 # `features_version` is part of it since v4: the CLAP embedding shares no
-# space at all with the v3 EffNet one (analysis/schema.py), so a corpus that
-# mixes them ranks nonsense against nonsense and nothing in the numbers says
-# so. Filtering here means one predicate retires every stale row from
-# ranking, the viz snapshot and the crawl watermark at once, and the
-# re-analysis backfill (stale_ids) is what brings them back.
+# space at all with the v3 embedding it replaced (analysis/schema.py), so a
+# corpus that mixes them ranks nonsense against nonsense and nothing in the
+# numbers says so. Filtering here means one predicate retires every stale row
+# from ranking, the viz snapshot and the crawl watermark at once, and the
+# worker's re-analysis arm (stale_ids) is what brings them back.
 LIVE = {"analyzed_at": {"$exists": True}, "duplicate_of": {"$exists": False},
         "features_version": FEATURES_VERSION}
 
@@ -215,11 +215,10 @@ def _rhythm(features: dict) -> dict | None:
 def put_track(track: dict, features: dict) -> None:
     """Upsert contract fields plus the analyzed embedding (and feel/rhythm).
 
-    `feel` is optional on the way in: rows analyzed before the heads shipped
-    have none until scripts/feel_backfill.py runs, and the ranking treats a
-    missing vector as "no penalty" rather than hiding the track. `rhythm` is
-    optional the same way and for the same reason -- it only exists from
-    version 4 on, and a row without it simply takes no tempo penalty.
+    `feel` is optional on the way in: the ranking treats a missing vector as
+    "no penalty" rather than hiding the track. `rhythm` is optional the same
+    way and for the same reason -- a track whose beat tracker failed simply
+    takes no tempo penalty.
 
     `features_version` comes off the analysis dict's `_features_version`
     (VERSION_KEY) and is what LIVE filters on: a caller that omits it writes
@@ -239,7 +238,12 @@ def put_track(track: dict, features: dict) -> None:
         fields["rhythm"] = rhythm
     db().tracks.update_one(
         {"_id": track["track_id"]},
-        {"$set": fields, "$currentDate": {"analyzed_at": True}},
+        # A successful analysis clears any earlier re-analysis give-up mark:
+        # whatever was broken about this row's audio evidently is not any
+        # more, and leaving the mark would hide the row from a future
+        # version bump's backfill.
+        {"$set": fields, "$currentDate": {"analyzed_at": True},
+         "$unset": {"reanalysis_failed_at": "", "reanalysis_error": ""}},
         upsert=True,
     )
 
@@ -403,10 +407,18 @@ def corpus_size() -> int:
 
 # Rows that ARE analyzed and not retired, but under a superseded feature
 # version: exactly what LIVE now excludes. They are invisible to ranking
-# until something re-analyzes them, so the re-analysis pass (Task 4) needs
+# until something re-analyzes them, so the worker's re-analysis arm needs
 # to see both how many are left and which to take next.
+#
+# `reanalysis_failed_at` is what takes a row OUT of that queue for good. The
+# arm works oldest-first, so a row whose preview is permanently gone (a
+# delisted track, a dead id) would otherwise sit at the head of the list and
+# be retried every tick forever, and nothing else would ever be re-analyzed.
+# Marking the track document rather than the jobs collection is deliberate:
+# re-analysis is not a queued job, it is a property of the row.
 _STALE = {"analyzed_at": {"$exists": True}, "duplicate_of": {"$exists": False},
-          "features_version": {"$lt": FEATURES_VERSION}}
+          "features_version": {"$lt": FEATURES_VERSION},
+          "reanalysis_failed_at": {"$exists": False}}
 
 
 def stale_count() -> int:
@@ -427,6 +439,30 @@ def stale_ids(limit: int = 100) -> list[str]:
     cursor = (db().tracks.find(_STALE, {"_id": 1})
               .sort("analyzed_at", pymongo.ASCENDING).limit(int(limit)))
     return [d["_id"] for d in cursor]
+
+
+def fail_reanalysis(track_id: str, error: str) -> None:
+    """This row cannot be brought up to the current version; stop trying.
+
+    The preview is gone, the source no longer knows the id, or the audio
+    will not decode. Without this the row stays stale forever AND stays at
+    the head of the oldest-first queue, so the arm would re-download the
+    same dead preview every tick and never reach the rest of the corpus.
+
+    The row keeps its old vectors and stays readable by id (a seed the user
+    can still play); it is simply out of LIVE, out of `stale_ids` and out of
+    `stale_count`. Clearing the two fields is all it takes to retry it.
+    """
+    db().tracks.update_one(
+        {"_id": track_id},
+        {"$set": {"reanalysis_error": str(error)[:500]},
+         "$currentDate": {"reanalysis_failed_at": True}},
+    )
+
+
+def reanalysis_failed_count() -> int:
+    """How many rows the re-analysis arm has given up on (ops visibility)."""
+    return db().tracks.count_documents({"reanalysis_failed_at": {"$exists": True}})
 
 
 def existing_keys(keys: list[str]) -> set[str]:

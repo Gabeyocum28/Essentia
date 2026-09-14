@@ -27,8 +27,17 @@ import urllib.request
 from music_recommendations.corpus.sources.base import BaseSource, Track
 
 API = "https://api.jamendo.com/v3.0/"
-SLEEP = 0.2          # politeness delay before every call
+# Politeness delay before every call. Note what it does NOT protect: the free
+# tier's quota is 35,000 requests per MONTH, not per second, so pacing calls
+# cannot keep a runaway crawl inside it -- only the crawl's own step size can.
+SLEEP = 0.2
 TIMEOUT = 20
+
+# mp32 is the 96 kbps mono-compatible MP3 stream. Pinned, not defaulted:
+# Jamendo will hand back several encodings and the analysis is only
+# comparable across tracks that were encoded the same way. Changing it is a
+# FEATURES_VERSION bump (analysis/schema.py), exactly like changing a prompt.
+AUDIO_FORMAT = "mp32"
 
 # The rotation the crawler walks. Chosen to spread the corpus across the
 # space the embedding has to tell apart, not to mirror Jamendo's own
@@ -50,7 +59,7 @@ def _get(path: str, **params) -> dict:
     """
     global _last_call
     query = {"client_id": os.environ.get("JAMENDO_CLIENT_ID", ""),
-             "format": "json", **params}
+             "format": "json", "audioformat": AUDIO_FORMAT, **params}
     url = f"{API}{path}?{urllib.parse.urlencode(query)}"
     with _call_lock:
         elapsed = time.monotonic() - _last_call
@@ -60,9 +69,24 @@ def _get(path: str, **params) -> dict:
     try:
         with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
             payload = json.loads(response.read())
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+    except (urllib.error.URLError, TimeoutError, OSError,
+            json.JSONDecodeError) as exc:
+        # The client id is in `url`, so log the path and the error, never the
+        # URL itself.
+        print(f"[jamendo] {path} failed: {type(exc).__name__}: {exc}",
+              flush=True)
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    # Jamendo answers 200 with an error INSIDE the envelope -- a bad client
+    # id, an exhausted monthly quota and a malformed parameter all look like
+    # an empty result list otherwise, which is indistinguishable from "this
+    # tag has no tracks" and was how a dead key could go unnoticed for a day.
+    status = (payload.get("headers") or {})
+    if status.get("status") not in (None, "success"):
+        print(f"[jamendo] {path}: {status.get('status')} "
+              f"{status.get('error_message') or ''}".rstrip(), flush=True)
+    return payload
 
 
 def _results(payload: dict) -> list[dict]:
@@ -146,14 +170,24 @@ class JamendoSource(BaseSource):
         return track.get("attribution")
 
     def candidates(self, step: int) -> list[Track]:
-        """One tag's most popular tracks, or the featured list every 11th step."""
-        index = step % (len(TAGS) + 1)
+        """One tag's most popular tracks, or the featured list every 11th step.
+
+        The rotation pages: `step` walks the arms, and every full lap moves
+        one page deeper into each of them. Without the offset the crawler
+        re-requested the same hundred most popular jazz tracks forever, and
+        the corpus stopped growing after one lap -- the dedupe guard just
+        counted them as duplicates every time.
+        """
+        arms = len(TAGS) + 1
+        index = step % arms
+        offset = (step // arms) * PER_PAGE
         if index < len(TAGS):
             tag = TAGS[index]
-            self._label = f"jamendo tag {tag}"
+            self._label = f"jamendo tag {tag} +{offset}"
             payload = _get("tracks/", tags=tag, order="popularity_total",
-                           limit=PER_PAGE)
+                           limit=PER_PAGE, offset=offset)
         else:
-            self._label = "jamendo featured"
-            payload = _get("tracks/", featured=1, limit=PER_PAGE)
+            self._label = f"jamendo featured +{offset}"
+            payload = _get("tracks/", featured=1, limit=PER_PAGE,
+                           offset=offset)
         return _tracks(payload)

@@ -5,22 +5,24 @@ same query params, same JSON keys. The mock (fixture-serving) behavior
 ships first and stays as the fallback until the corpus lands.
 
 Rules:
-- No Essentia imports; call music_recommendations.analysis.analyze_track.
-  You own WHEN a track is analyzed (cache lookup, download, write-back);
-  analysis owns HOW.
+- The API process NEVER analyzes. It does not import the analysis stack at
+  all, except CLAP's text tower lazily inside GET /search/text. A cold seed
+  is handed to the worker, which is the one process that loads the audio
+  model; a second copy of it here is an OOM kill on a 5 GB container.
 - Ranking is normalize + matmul + argsort in numpy, in-process. Never add
   FAISS/pgvector/ANN — pure overhead at this scale (spec §2.2).
 - The axis registry in axes.py is the one table for adding/removing/
   reweighting axes.
 - POST /seed is one blocking HTTP request -- no polling state machine in the
-  contract. Internally, a cold seed on a host without Essentia enqueues the
-  track and polls the store for the Mac embed worker to finish before
-  responding.
+  contract. Internally, a cold seed stores the metadata, enqueues an embed
+  job and polls the store for the worker to finish, answering "ready" or
+  "unanalyzed" within _EMBED_WAIT_S.
 - Storage is MongoDB Atlas; see store.py's docstring for the three
   collections. Set MONGODB_URI (and optionally MONGODB_DB) to run.
-- Analysis failures on POST /seed return 502 with body
-  `{"detail": "analysis failed"}` -- the spec's `{"error": ...}` shape was
-  not adopted, to match every other error response in app.py.
+- POST /seed no longer 502s: nothing about the audio is known here any more,
+  so a broken preview is the worker's problem and the response is
+  `{"status": "unanalyzed"}`. Other error responses keep app.py's `detail`
+  shape rather than the spec's `{"error": ...}`.
 - While Atlas is unreachable, the API does not fail closed: `_safe()`
   swallows the store error and the endpoint falls back to serving the
   fixture with dummy scores, same as before the corpus landed. That silent

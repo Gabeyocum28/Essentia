@@ -102,38 +102,61 @@ def test_search_falls_back_to_fixture_when_deezer_down(client, monkeypatch):
 
 # ---- /seed ----
 
-def test_seed_warm_track_is_instant_and_never_analyzes(client, seeded_corpus, monkeypatch):
-    def boom(path):
-        raise AssertionError("analyze_track must not run for a warm seed")
-
-    monkeypatch.setattr(app_module, "analyze_track", boom)
+def test_seed_warm_track_is_instant_and_never_queues(client, seeded_corpus,
+                                                     fake_mongo):
     tid = seeded_corpus[0]["track_id"]
     body = client.post("/seed", json={"track_id": tid}).json()
     assert body == {"track_id": tid, "status": "ready"}
+    assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"}) is None
 
 
-def test_seed_cold_track_downloads_analyzes_and_stores(client, fake_mongo, monkeypatch):
+def test_seed_never_runs_the_model_in_the_api_process(client, fake_mongo,
+                                                      analysis_unavailable,
+                                                      monkeypatch):
+    """The API must not load CLAP. The audio tower is ~700 MB of weights and
+    ~2.5 GB resident, the worker on the same box already holds a copy, and a
+    second one on an unlucky request is an OOM kill -- so a cold seed is
+    handed to the worker instead of analyzed here.
+
+    Guarded structurally, not by stubbing: the module must not even have an
+    analyzer bound to call.
+    """
     track = dict(FIXTURE[7])
     tid = track["track_id"]
     monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-    monkeypatch.setattr(app_module, "analyze_track", lambda p: fake_features(0.5))
+
+    assert not hasattr(app_module, "analyze_track")
+    assert not hasattr(app_module, "_fetch_preview_audio")
 
     body = client.post("/seed", json={"track_id": tid}).json()
-    assert body == {"track_id": tid, "status": "ready"}
-    assert store.get_features(tid) is not None
-    # get_track never round-trips preview_url (a signed URL is never stored).
+    assert body == {"track_id": tid, "status": "unanalyzed"}
+    # The metadata IS stored for the worker to analyze against; get_track
+    # never round-trips preview_url (a signed URL is never stored).
     assert store.get_track(tid) == {**track, "preview_url": "", "source": "deezer"}
+    assert store.get_features(tid) is None
+    assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"})["state"] == "queued"
+
+
+def test_seed_does_not_fetch_the_preview_either(client, fake_mongo,
+                                                analysis_unavailable,
+                                                monkeypatch):
+    """Downloading the preview was only ever the first half of analyzing it.
+    The worker re-fetches a fresh one anyway (a Deezer signature is a
+    15-minute lease), so a download here is pure duplicated traffic."""
+    def boom(url, *a, **k):
+        raise AssertionError("/seed must not fetch audio")
+
+    monkeypatch.setattr(app_module.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[8]))
+    tid = FIXTURE[8]["track_id"]
+    assert client.post("/seed", json={"track_id": tid}).json() == {
+        "track_id": tid, "status": "unanalyzed"}
 
 
 @pytest.fixture
 def analysis_unavailable(monkeypatch):
-    """The ARM-VM condition: essentia can't import, plus instant poll timing."""
-    def not_implemented(path):
-        raise NotImplementedError
-
-    monkeypatch.setattr(app_module, "analyze_track", not_implemented)
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
+    """Instant poll timing: the worker is not running in these tests, so the
+    wait for it to deliver features should not cost 20 real seconds."""
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
     monkeypatch.setattr(app_module, "_EMBED_POLL_S", 0.0)
 
@@ -194,26 +217,17 @@ def test_seed_store_down_degrades_to_ready(client, monkeypatch):
     monkeypatch.setattr(store, "db", store_down)
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
     monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[3]))
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-
-    def not_implemented(path):
-        raise NotImplementedError
-
-    monkeypatch.setattr(app_module, "analyze_track", not_implemented)
     tid = FIXTURE[3]["track_id"]
     body = client.post("/seed", json={"track_id": tid}).json()
     assert body == {"track_id": tid, "status": "ready"}
 
 
-def test_seed_download_failure_queues_instead_of_500(client, fake_mongo, monkeypatch):
-    """A Deezer preview fetch failure (timeout, flake) must queue for the
-    embed worker like a missing-essentia host does, not 500."""
-    def boom(url):
-        raise OSError("preview fetch failed")
-
+def test_seed_unplayable_track_queues_instead_of_500(client, fake_mongo, monkeypatch):
+    """Nothing about the audio is known at /seed time any more, so a dead
+    preview is the worker's problem: the response is a 200 saying the track
+    is not analyzed yet, not a 500 and not a 502."""
     tid = FIXTURE[0]["track_id"]
     monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[0]))
-    monkeypatch.setattr(app_module, "_download_preview", boom)
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
     monkeypatch.setattr(app_module, "_EMBED_POLL_S", 0.0)
 
@@ -385,12 +399,6 @@ def no_store(monkeypatch):
 def test_seed_works_without_store(no_store, monkeypatch):
     client = TestClient(app_module.app)
     tid = FIXTURE[0]["track_id"]
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-    # This test is about the store being down, not about analysis. Stub the
-    # analyzer out: it used to be a NotImplementedError stub that app.py
-    # swallowed, but now that the lane has landed it raises FileNotFoundError
-    # for a path that does not exist, which app.py should NOT swallow.
-    monkeypatch.setattr(app_module, "analyze_track", lambda path: {})
     body = client.post("/seed", json={"track_id": tid})
     assert body.status_code == 200
     assert body.json()["status"] == "ready"
@@ -482,17 +490,12 @@ def test_seed_is_never_recommended_to_itself(client, seeded_corpus):
         assert len(results) == 4
 
 
-def test_seed_falls_back_when_essentia_unavailable(client, fake_mongo, monkeypatch):
-    """ARM VM: essentia has no aarch64 wheels, so analyze_track raises
-    ImportError there. Seed must queue for the worker, not 500, and reports
-    unanalyzed rather than the old silent-ready fixture fallback."""
-    def no_essentia(path):
-        raise ImportError("No module named 'essentia'")
-
+def test_seed_on_a_host_without_the_analysis_extra(client, fake_mongo, monkeypatch):
+    """The API image need not carry torch at all -- it never analyzes. A cold
+    seed queues for the worker and reports unanalyzed rather than the old
+    silent-ready fixture fallback."""
     tid = FIXTURE[0]["track_id"]
     monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[0]))
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-    monkeypatch.setattr(app_module, "analyze_track", no_essentia)
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
     monkeypatch.setattr(app_module, "_EMBED_POLL_S", 0.0)
     body = client.post("/seed", json={"track_id": tid})
@@ -679,6 +682,39 @@ def test_preview_audio_closes_the_upstream_response(client, deezer_previews, mon
     assert upstream.closed
 
 
+def test_preview_audio_asks_for_the_first_megabyte(client, deezer_previews,
+                                                   monkeypatch):
+    """The proxy reads the upstream into this container's memory, so it must
+    bound what it will read. A Jamendo "preview" is the whole track."""
+    import urllib.request
+
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["headers"] = dict(getattr(request, "headers", {}))
+        return _FakeUpstream(b"mp3")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert client.get("/preview/721063/audio").content == b"mp3"
+    assert seen["headers"]["Range"] == f"bytes=0-{app_module.PREVIEW_MAX_BYTES - 1}"
+
+
+def test_preview_audio_truncates_an_upstream_that_ignored_the_range(
+        client, deezer_previews, monkeypatch):
+    """A CDN may answer 200 with the whole file. The byte count in the
+    streamer, not the request header, is what actually holds -- and the
+    Content-Length must not then promise bytes that never arrive."""
+    monkeypatch.setattr(app_module, "PREVIEW_MAX_BYTES", 32)
+    payload = b"ID3" + bytes(5_000)
+    monkeypatch.setattr(app_module, "_open_upstream",
+                        lambda url: _FakeUpstream(payload, length=len(payload)))
+
+    r = client.get("/preview/721063/audio")
+    assert r.content == payload[:32]
+    assert "content-length" not in r.headers
+    assert "accept-ranges" not in r.headers
+
+
 def test_preview_audio_404s_when_deezer_has_no_preview(client, monkeypatch):
     monkeypatch.setattr(deezer_api, "fresh_preview_url", lambda t: None)
     assert client.get("/preview/nope/audio").status_code == 404
@@ -785,44 +821,7 @@ def test_recommend_serves_previews_for_corpus_tracks(client, fake_mongo,
         )
 
 
-def test_seed_resigns_when_the_stored_url_is_expired(client, fake_mongo,
-                                                     monkeypatch):
-    """The 403 on a stored URL is the norm, not a flake -- re-sign, don't punt."""
-    track = dict(FIXTURE[7])
-    downloaded = []
-
-    def download(url):
-        downloaded.append(url)
-        if "hdnea" not in url:          # the stored, expired one
-            raise OSError("403 Forbidden")
-        return Path("/tmp/x.mp3")
-
-    track["preview_url"] = "https://cdnt-preview.dzcdn.net/dead.mp3"
-    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
-    monkeypatch.setattr(deezer_api, "fresh_preview_url",
-                        lambda t: "https://cdnt-preview.dzcdn.net/live.mp3?hdnea=1")
-    monkeypatch.setattr(app_module, "_download_preview", download)
-    monkeypatch.setattr(app_module, "analyze_track", lambda p: fake_features(0.5))
-
-    body = client.post("/seed", json={"track_id": track["track_id"]}).json()
-    assert body == {"track_id": track["track_id"], "status": "ready"}
-    assert len(downloaded) == 2, "should try stored, then the re-signed URL"
-
-
-def test_seed_does_not_resign_when_the_stored_url_works(client, fake_mongo,
-                                                        monkeypatch):
-    """Re-signing costs a Deezer call; a working URL must not trigger one."""
-    track = dict(FIXTURE[7])
-    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-    monkeypatch.setattr(app_module, "analyze_track", lambda p: fake_features(0.5))
-    monkeypatch.setattr(deezer_api, "fresh_preview_url", lambda t: (_ for _ in ()).throw(
-        AssertionError("must not re-sign when the stored URL downloads")))
-
-    client.post("/seed", json={"track_id": track["track_id"]})
-
-
-# ---- _cold_matrix / 502 on bad previews ----
+# ---- _cold_matrix ----
 
 def test_cold_matrix_uses_base_matrix(fake_mongo, monkeypatch):
     for tid, vec in (("a", [1.0, 0.0]), ("b", [0.0, 1.0])):
@@ -855,23 +854,6 @@ def test_corpus_matrix_stays_float32_as_the_corpus_grows(fake_mongo):
     assert app_module._MATRIX_CACHE["embedding"].matrix.dtype == np.float32
     assert matrix.dtype == np.float32
     assert np.allclose(matrix[2], [0.5, 0.5], atol=1e-2)
-
-
-def test_seed_returns_502_when_analysis_fails(client, fake_mongo, monkeypatch, tmp_path):
-    from music_recommendations.analysis import frontend
-
-    mp3 = tmp_path / "p.mp3"
-    mp3.write_bytes(b"x")
-    monkeypatch.setattr(app_module, "_fetch_preview_audio", lambda tid, t: mp3)
-    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[0]))
-
-    def boom(path):
-        raise frontend.DecodeError("ffmpeg: bad file")
-
-    monkeypatch.setattr(app_module, "analyze_track", boom)
-    r = client.post("/seed", json={"track_id": "42"})
-    assert r.status_code == 502
-    assert r.json()["detail"] == "analysis failed"
 
 
 # ---- indexes created at API startup ----

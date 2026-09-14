@@ -30,7 +30,7 @@ FEATURE_KEYS = {
     "embedding": 1024,   # Microsoft CLAP audio tower, L2-normalized
     "feel": 8,           # eight zero-shot contrastive axes on that embedding,
                          # each a probability in [0, 1]; see
-                         # analysis/feel_v2.FEEL_KEYS for the dimension order
+                         # analysis/feel.FEEL_KEYS for the dimension order
 }
 # Arrays are 1-D float lists/ndarrays of the stated length.
 

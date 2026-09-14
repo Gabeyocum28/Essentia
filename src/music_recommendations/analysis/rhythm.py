@@ -72,7 +72,7 @@ def rhythm_features(waveform: np.ndarray, sr: int) -> dict:
 def _load_beat_tracker():
     """Beat This! frame model + minimal postprocessor, or None.
 
-    None is a supported state, not an error: the checkpoint is 58 MB and a
+    None is a supported state, not an error: the checkpoint is 81 MB and a
     host that skipped fetch_models.py, or a test run, should still get a
     tempo. Cached (including the None) so a missing checkpoint costs one
     import attempt per process rather than one per track.

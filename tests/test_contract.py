@@ -51,7 +51,7 @@ def test_feature_keys_are_the_embedding_and_the_feel_vector():
 def test_feel_dimension_matches_the_prompt_bank():
     """The contract states the width; analysis owns the names. If an axis is
     added or dropped without the contract moving, this is where it shows."""
-    from music_recommendations.analysis.feel_v2 import FEEL_KEYS, PROMPT_BANK
+    from music_recommendations.analysis.feel import FEEL_KEYS, PROMPT_BANK
     f = _features()
     assert len(FEEL_KEYS) == f.FEATURE_KEYS["feel"]
     assert FEEL_KEYS == [

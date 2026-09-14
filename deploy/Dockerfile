@@ -9,8 +9,15 @@ RUN npm run build
 
 FROM python:3.11-slim
 
+# ffmpeg  decodes previews behind librosa/audioread (a separate process, see
+#         docs/THIRD_PARTY.md on the GPL build)
+# git     the analysis extra installs beat_this from a git URL; pip needs a
+#         git binary to clone it and the build fails without one
+# libsndfile1  soundfile's shared library: librosa reads wav/flac through it
+# curl    the compose healthcheck and manual poking
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg curl \
+ && apt-get install -y --no-install-recommends \
+      ffmpeg git libsndfile1 curl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -28,10 +35,11 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
       torch torchaudio
 RUN pip install --no-cache-dir -e ".[analysis]"
 
-# Bake every model file (CLAP, Beat This!, and the v1 EffNet graph) so the
-# container needs no network at start.
+# Bake the model files (CLAP weights, the Beat This! checkpoint, the GPT-2
+# tokenizer) into /app/models/v2 so the container needs no network at start.
+# Nothing else: the non-commercial model this project existed to remove, and
+# the ~600 MB framework that ran it, both went at the cutover.
 RUN python3 scripts/fetch_models.py
 
-ENV TF_CPP_MIN_LOG_LEVEL=2
 EXPOSE 8000
 CMD ["uvicorn", "music_recommendations.server.app:app", "--host", "0.0.0.0", "--port", "8000"]

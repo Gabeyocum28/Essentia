@@ -1,7 +1,7 @@
 [project]
 name = "music-recommendations"
 version = "0.1.0"
-description = "Jazz recommender: Deezer previews + Essentia analysis + axis-based ranking"
+description = "Jazz recommender: licensed previews + CLAP analysis + axis-based ranking"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "fastapi>=0.110",
@@ -16,11 +16,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The v2 analysis stack (CLAP + Beat This! + librosa/pyloudnorm) plus, for
-# now, TensorFlow. TensorFlow is here only to keep the v1 EffNet pipeline and
-# the Essentia parity test runnable until the cutover task deletes them; it
-# is not imported by anything under analysis/v2.py, and removing it is the
-# point of this whole exercise (the EffNet model is non-commercial).
+# The analysis stack: CLAP for the embedding and the text tower, Beat This!
+# for beats, librosa/pyloudnorm/soxr for the exact DSP. Every one of them is
+# MIT/BSD/ISC (soxr LGPL, dynamically linked) -- that is the whole point of
+# the clean-room work, and tests/test_licences.py fails on anything
+# non-commercial reappearing here.
+#
+# Only the WORKER needs this extra. The API ranks stored vectors and draws
+# maps; the one thing it may load is CLAP's text tower for /search/text, on
+# a box where this extra happens to be installed.
+#
 # Every distribution named here must have a row in docs/THIRD_PARTY.md --
 # tests/test_licences.py enforces that.
 analysis = [
@@ -30,7 +35,6 @@ analysis = [
     "pyloudnorm>=0.1",
     "soxr>=0.3",
     "beat_this @ git+https://github.com/CPJKU/beat_this",
-    "tensorflow>=2.16",
 ]
 dev = ["pytest>=8.0", "httpx>=0.27", "mongomock>=4.3"]
 

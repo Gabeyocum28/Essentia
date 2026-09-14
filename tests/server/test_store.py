@@ -602,3 +602,42 @@ def test_stale_ids_are_oldest_analyzed_first_and_limited(fake_mongo):
     assert store.stale_ids(2) == ["a", "b"]
     assert store.stale_ids() == ["a", "b", "c"]
     assert store.stale_ids(0) == []
+
+
+def test_a_row_the_backfill_gave_up_on_leaves_the_queue(fake_mongo):
+    """Oldest-first means one unfixable row at the head would be retried
+    every tick and starve everything behind it."""
+    store.put_track(TRACK, {**FEATURES, "_features_version": 1})
+    assert store.stale_count() == 1
+
+    store.fail_reanalysis("42", "ValueError: no preview")
+
+    assert store.stale_count() == 0
+    assert store.stale_ids() == []
+    assert store.reanalysis_failed_count() == 1
+    assert fake_mongo.tracks.find_one({"_id": "42"})["reanalysis_error"] == \
+        "ValueError: no preview"
+
+
+def test_a_given_up_row_is_still_a_playable_seed(fake_mongo):
+    """It keeps its old vectors and its metadata: a user can still search it
+    up and press play. It is only out of the RANKING."""
+    store.put_track(TRACK, {**FEATURES, "_features_version": 1})
+    store.fail_reanalysis("42", "boom")
+
+    assert store.get_track("42")["title"] == TRACK["title"]
+    assert store.get_features("42") is not None
+    assert store.corpus_ids() == []
+
+
+def test_a_successful_analysis_clears_the_give_up_mark(fake_mongo):
+    """Otherwise the row stays hidden from the NEXT version bump's backfill
+    as well, forever."""
+    store.put_track(TRACK, {**FEATURES, "_features_version": 1})
+    store.fail_reanalysis("42", "boom")
+
+    store.put_track(TRACK, FEATURES)
+
+    assert store.reanalysis_failed_count() == 0
+    assert store.corpus_ids() == ["42"]
+    assert "reanalysis_failed_at" not in fake_mongo.tracks.find_one({"_id": "42"})

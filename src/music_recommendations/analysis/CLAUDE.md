@@ -3,7 +3,7 @@
 Pure function: audio file path in, feature dict out (spec §2.1). Knows
 nothing about HTTP, Deezer, the store, or the phone.
 
-## v2 (current)
+## The stack
 
 `analyze_tracks(paths)` -> per path either an exception or
 
@@ -18,7 +18,7 @@ nothing about HTTP, Deezer, the store, or the phone.
 - `clap.py` loads the Microsoft CLAP 2023 weights from `models/v2/` (never
   the library's own hub download) and calls the wrapper's tensor entry
   point, not its file loader. Three 7 s windows per track, mean, normalize.
-- `feel_v2.py` is the feel vector as eight *pairs* of prompts: the score is
+- `feel.py` is the feel vector as eight *pairs* of prompts: the score is
   a softmax over (positive, negative) cosine. Changing a prompt changes
   every number, so it is a FEATURES_VERSION bump.
 - `rhythm.py` is exact DSP, no model except Beat This!: tempo from the
@@ -35,12 +35,13 @@ nothing about HTTP, Deezer, the store, or the phone.
 - v2 tests (`tests/analysis/test_v2.py`) need the analysis extra and are
   skipped by the default interpreter; run them with the torch interpreter.
 
-## v1 (being removed)
+## History
 
-`analyze_tracks_v1` / `analyze_track_v1` plus `frontend.py`, `embedding.py`
-and `feel.py`: ffmpeg decode + numpy mel + Discogs-EffNet in TensorFlow, and
-eleven classifier heads. The model is CC BY-NC-SA, which is why v2 exists.
-Kept only so `tests/analysis/test_parity.py` can still run until the cutover
-deletes all of it. Do not call it from anything.
+There used to be a v1 pipeline here — `frontend.py`, `embedding.py` and a
+`feel.py` of eleven TensorFlow classifier heads over a Discogs-EffNet
+embedding. The EffNet model is CC BY-NC-SA, which is the whole reason this
+stack exists; the cutover deleted all of it, along with TensorFlow and the
+Essentia parity test. Nothing may reintroduce a non-commercial model —
+`tests/test_licences.py` fails if anything does.
 
 Bump FEATURES_VERSION in schema.py whenever the numbers change.

@@ -1,12 +1,13 @@
 """analyze_tracks v2: decode once, then CLAP + feel + rhythm off that decode.
 
-The shape of the v1 entry point is kept exactly -- a list of paths in, one
-slot per path holding either a feature dict or the exception that path
-raised -- because the worker's group loop, its retry accounting and its
-tests are all built on it. What changed is inside each slot:
+The shape of the entry point the worker was already built on is kept exactly
+-- a list of paths in, one slot per path holding either a feature dict or the
+exception that path raised -- because the worker's group loop, its retry
+accounting and its tests are all built on it. What changed at the cutover is
+inside each slot:
 
-    v1: embedding (1280, EffNet)  feel (11, trained heads)
-    v2: embedding (1024, CLAP)    feel (8, zero-shot)   rhythm (7 numbers)
+    before: embedding (1280, a non-commercial model)  feel (11, trained heads)
+    now:    embedding (1024, CLAP)   feel (8, zero-shot)   rhythm (7 numbers)
 
 Decoding is the one expensive thing every stage needs, so it happens once
 per path and the waveform is handed to all three. CLAP runs on the whole
@@ -15,8 +16,8 @@ rhythm is per track and CPU-bound but small.
 
 `_features_version` rides along in the returned dict so a caller that
 persists features cannot forget to stamp it -- mixing version-3 and
-version-4 vectors in one corpus ranks EffNet against CLAP and silently
-produces nonsense.
+version-4 vectors in one corpus ranks two unrelated embedding spaces against
+each other and silently produces nonsense.
 """
 from __future__ import annotations
 
@@ -68,7 +69,7 @@ def analyze_tracks(paths: list[Path | str]) -> list[dict | Exception]:
     404, get truncated mid-download, or turn out to be HTML error pages, and
     one of those must not cost a group of eight its analysis.
     """
-    from . import clap, feel_v2, rhythm
+    from . import clap, feel, rhythm
 
     results: list[dict | Exception | None] = [None] * len(paths)
     ready: list[int] = []
@@ -82,23 +83,39 @@ def analyze_tracks(paths: list[Path | str]) -> list[dict | Exception]:
 
     if ready:
         embeddings = clap.embed_audio(waves, sr=SAMPLE_RATE)
-        feels = feel_v2.feel_scores(embeddings)
+        feels = feel.feel_scores(embeddings)
         for slot, i in enumerate(ready):
+            features = {
+                "embedding": embeddings[slot].astype(np.float32),
+                "feel": feels[slot].astype(np.float32),
+                "_features_version": FEATURES_VERSION,
+            }
             try:
-                rhythm_features = rhythm.rhythm_features(waves[slot], SAMPLE_RATE)
+                features["rhythm"] = rhythm.rhythm_features(waves[slot],
+                                                            SAMPLE_RATE)
             except Exception as exc:  # noqa: BLE001
                 # The embedding is the part recommendations cannot work
                 # without; losing the tempo of one track costs that track a
-                # ranking term, not its place in the corpus.
-                results[i] = exc
-                continue
-            results[i] = {
-                "embedding": embeddings[slot].astype(np.float32),
-                "feel": feels[slot].astype(np.float32),
-                "rhythm": rhythm_features,
-                "_features_version": FEATURES_VERSION,
-            }
+                # ranking term (store.put_track simply stores no rhythm, and
+                # the tempo distance treats a missing BPM as no penalty), not
+                # its place in the corpus. Said once per process, because a
+                # broken Beat This! checkpoint would otherwise print per track.
+                _warn_rhythm_failed(exc)
+            results[i] = features
     return results  # type: ignore[return-value]
+
+
+_rhythm_warned = False
+
+
+def _warn_rhythm_failed(exc: Exception) -> None:
+    """Say once per process that rhythm extraction is failing."""
+    global _rhythm_warned
+    if _rhythm_warned:
+        return
+    _rhythm_warned = True
+    print(f"analysis: rhythm unavailable ({type(exc).__name__}: {exc}); "
+          f"tracks will be stored without tempo, key or loudness", flush=True)
 
 
 def analyze_track(path: Path | str) -> dict:

@@ -4,11 +4,12 @@ analyze_track handles one file and is the contract this lane owes everyone
 else. This adds throughput on top of it, which matters once a corpus is
 thousands of tracks rather than hundreds.
 
-Processes, not threads: the work is a TensorFlow forward pass plus DSP, both
-CPU-bound and holding the GIL, so threads buy nothing. Each worker builds its
-own EffNet (the module-level singletons in embedding.py are per-process), so
-there is a fixed startup cost of roughly a second per worker -- irrelevant
-across thousands of files, dominant across ten.
+Processes, not threads: the work is a torch forward pass plus DSP, both
+CPU-bound and holding the GIL, so threads buy nothing. Each worker loads its
+own copy of CLAP (the module-level singleton in clap.py is per-process), so
+there is a fixed startup cost of several seconds and ~700 MB per worker --
+irrelevant across thousands of files, dominant across ten, and the reason
+`default_workers()` is not simply the core count on a small box.
 
 Callers stay in charge of WHEN analysis happens (spec §7). This is only about
 how fast it goes once they have decided to.

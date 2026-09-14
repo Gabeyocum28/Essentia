@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from statistics import pstdev
 
-from music_recommendations.analysis.feel_v2 import FEEL_KEYS
+from music_recommendations.analysis.feel import FEEL_KEYS
 from music_recommendations.analysis.schema import FEATURES_VERSION
 from music_recommendations.server import app as app_module
 from music_recommendations.server import store, viz
@@ -1033,7 +1033,7 @@ def _map(client, **params):
 
 def test_viz_map_names_the_eight_feel_dimensions(client, feel_corpus):
     """The math panel labels the bars from this, rather than keeping its own
-    copy of an order that lives in analysis/feel_v2.PROMPT_BANK."""
+    copy of an order that lives in analysis/feel.PROMPT_BANK."""
     body = _map(client)
     assert body["feel_keys"] == [
         "energy", "valence", "tension", "acoustic",

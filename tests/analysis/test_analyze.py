@@ -1,83 +1,67 @@
+"""The package surface: the version, the metrics, and what is NOT here.
+
+The behaviour of `analyze_tracks` itself lives in test_v2.py, which needs the
+analysis extra. These run everywhere, and the removal guards below are the
+point of the clean-room work: the non-commercial stack must stay deleted.
+"""
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 
-import numpy as np
-
-from music_recommendations.analysis import (FEATURES_VERSION, METRICS,
-                                            analyze_track_v1,
-                                            analyze_tracks_v1, as_json)
-from tests.analysis.conftest import needs_effnet
+SRC = Path(__file__).resolve().parents[2] / "src"
 
 
 def test_version_and_metrics():
+    from music_recommendations.analysis import FEATURES_VERSION, METRICS
+
     assert FEATURES_VERSION == 4
     assert METRICS == {"embedding": "cosine"}
 
 
-def test_no_essentia_anywhere_in_src():
-    from pathlib import Path
-    src = Path(__file__).resolve().parents[2] / "src"
-    hits = [p for p in src.rglob("*.py")
-            if "import essentia" in p.read_text() or "from essentia" in p.read_text()]
-    assert hits == []
+def test_importing_the_package_costs_nothing_heavy():
+    """A caller that only wants FEATURES_VERSION must not load torch.
+
+    This is why analyze_tracks is a forwarder into v2 rather than a rebind:
+    the store asks "is this row stale?" on every write, and paying a torch
+    import for that would put ~700 MB into the API process.
+    """
+    import sys
+
+    import music_recommendations.analysis  # noqa: F401
+
+    assert "torch" not in sys.modules
+    assert "librosa" not in sys.modules
 
 
 def test_removed_modules_are_gone():
-    for name in ("heads", "groove"):
-        assert importlib.util.find_spec(f"music_recommendations.analysis.{name}") is None
+    """The v1 pipeline and its ancestors. `frontend`, `embedding` and the
+    eleven-head `feel` ran Discogs-EffNet, which is CC BY-NC-SA -- the whole
+    reason the v2 stack exists. Re-adding any of them re-acquires the licence
+    problem this project was done to remove."""
+    for name in ("heads", "groove", "frontend", "embedding"):
+        assert importlib.util.find_spec(
+            f"music_recommendations.analysis.{name}") is None
 
 
-@needs_effnet
-def test_analyze_track_returns_the_embedding_and_the_feel_vector(tone_wav):
-    feats = analyze_track_v1(tone_wav)
-    assert set(feats) == {"embedding", "feel"}
-    assert feats["embedding"].shape == (1280,)
-    assert feats["feel"].shape == (11,)
-    assert float(feats["feel"].min()) >= 0.0
-    assert float(feats["feel"].max()) <= 1.0
-    js = as_json(feats)
-    assert len(js["embedding"]) == 1280 and isinstance(js["embedding"][0], float)
-    assert len(js["feel"]) == 11 and isinstance(js["feel"][0], float)
+def test_feel_is_the_zero_shot_module_not_the_old_heads():
+    """`feel_v2` was renamed onto `feel` at the cutover; anything still
+    importing `feel_v2` is reading a module that no longer exists."""
+    from music_recommendations.analysis import feel
+
+    assert len(feel.FEEL_KEYS) == 8
+    assert not hasattr(feel, "feel_vectors")
+    assert importlib.util.find_spec(
+        "music_recommendations.analysis.feel_v2") is None
 
 
-@needs_effnet
-def test_analyze_tracks_keeps_a_bad_path_from_sinking_the_group(tone_wav, tmp_path):
-    """One unreadable file in a group must not cost the others their
-    analysis: its slot holds the exception, the rest hold features, and the
-    features are the same ones analyze_track would have produced alone."""
-    out = analyze_tracks_v1([tone_wav, tmp_path / "missing.mp3", tone_wav])
-
-    assert isinstance(out[1], Exception)
-    for feats in (out[0], out[2]):
-        assert set(feats) == {"embedding", "feel"}
-        assert feats["embedding"].shape == (1280,)
-        assert feats["feel"].shape == (11,)
-    assert np.allclose(out[0]["embedding"], analyze_track_v1(tone_wav)["embedding"],
-                       atol=1e-4)
-
-
-@needs_effnet
-def test_missing_feel_heads_cost_the_blend_not_the_analysis(tone_wav, monkeypatch,
-                                                            capsys):
-    """A host with the EffNet graph but no head graphs (an older image, a
-    partial fetch_models.py run) must still produce embeddings: `feel` is
-    optional everywhere downstream -- the store omits the field, the ranking
-    treats a missing vector as no penalty -- so the group comes back without
-    it rather than failing."""
-    from music_recommendations import analysis
-    from music_recommendations.analysis import feel as feel_mod
-
-    def no_heads(_embeddings):
-        raise FileNotFoundError("models/mood_happy.pb missing")
-
-    monkeypatch.setattr(feel_mod, "feel_vectors", no_heads)
-    monkeypatch.setattr(analysis, "_heads_warned", False)
-
-    out = analyze_tracks_v1([tone_wav, tone_wav])
-    assert [set(f) for f in out] == [{"embedding"}, {"embedding"}]
-    assert out[0]["embedding"].shape == (1280,)
-    # One warning for the process, not one per group or per track.
-    assert capsys.readouterr().out.count("feel heads unavailable") == 1
-    analyze_tracks_v1([tone_wav])
-    assert "feel heads unavailable" not in capsys.readouterr().out
+def test_no_tensorflow_or_essentia_anywhere_in_src():
+    """Both were removed at the cutover: TensorFlow ran the EffNet graph, and
+    Essentia was the generation before that. Neither may come back -- they
+    are ~2 GB of image between them and the model one of them loads is not
+    sellable."""
+    banned = ("import tensorflow", "from tensorflow",
+              "import essentia", "from essentia")
+    hits = [str(p) for p in SRC.rglob("*.py")
+            if any(token in p.read_text() for token in banned)]
+    assert hits == []

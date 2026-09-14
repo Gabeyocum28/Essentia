@@ -9,10 +9,10 @@ way:
      exercise exists because Discogs-EffNet is CC BY-NC-SA; re-acquiring
      that problem by accident would invalidate the work.
 
-The one NC row still in the register (the v1 EffNet model) is named here
-explicitly. That is the point: it is a tracked, scheduled removal rather
-than something the check quietly tolerates, and when the cutover deletes it
-this list goes empty and stays that way.
+NC_ALLOWED is now EMPTY, and that is the deliverable: the last
+non-commercial component (Discogs-EffNet) went at the cutover. Anything
+added back to that set is a promise to remove it again, not a way to pass
+this test.
 """
 from __future__ import annotations
 
@@ -27,9 +27,7 @@ REGISTER = ROOT / "docs" / "THIRD_PARTY.md"
 # Rows allowed to carry a non-commercial licence, with the reason. Each is a
 # component we have committed to removing; nothing may be added here without
 # the same commitment.
-NC_ALLOWED = {
-    "discogs-effnet": "v1 embedding + feel heads; deleted at the cutover",
-}
+NC_ALLOWED: dict[str, str] = {}
 
 NC_PATTERN = re.compile(r"\bNC\b|NonCommercial|Non-Commercial", re.IGNORECASE)
 
@@ -106,22 +104,31 @@ def test_no_unscheduled_non_commercial_component():
     )
 
 
-def test_the_only_tolerated_nc_component_is_the_v1_model():
-    """Shrinking NC_ALLOWED is the deliverable. If the cutover has landed and
-    this still lists EffNet, the register was not updated with the code."""
-    assert set(NC_ALLOWED) == {"discogs-effnet"}
-    nc_rows = [_strip_markup(n).lower() for n, lic in _rows()
+def test_nothing_non_commercial_is_tolerated_any_more():
+    """Emptying NC_ALLOWED was the deliverable. The register now has no
+    non-commercial row at all, and nothing is exempted from the check."""
+    assert NC_ALLOWED == {}
+    nc_rows = [_strip_markup(n) for n, lic in _rows()
                if NC_PATTERN.search(lic)]
-    assert len(nc_rows) == 1, nc_rows
-    assert "discogs-effnet" in nc_rows[0]
+    assert nc_rows == []
 
 
-def test_the_analysis_extra_is_the_v2_stack():
-    """A guard on the thing the register is about: CLAP and Beat This! are
-    installed, and TensorFlow is present only as the tracked leftover."""
+def test_the_analysis_extra_is_exactly_the_clean_room_stack():
+    """A guard on the thing the register is about. TensorFlow in particular
+    must stay out: it existed only to run the non-commercial model, and it is
+    ~600 MB of image for a graph nothing loads any more."""
     data = tomllib.loads(PYPROJECT.read_text())
     extra = {
         _normalize(re.split(r"[<>=!~\[; @]", s.strip())[0])
         for s in data["project"]["optional-dependencies"]["analysis"]
     }
-    assert {"torch", "msclap", "librosa", "pyloudnorm", "beat-this"} <= extra
+    assert extra == {"torch", "msclap", "librosa", "pyloudnorm", "soxr",
+                     "beat-this"}
+
+
+def test_tensorflow_is_gone_from_the_project():
+    """Not only from the extra: from the lockfile and the Dockerfile too, so
+    nothing quietly reinstalls it."""
+    assert "tensorflow" not in PYPROJECT.read_text().lower()
+    assert "tensorflow" not in (ROOT / "uv.lock").read_text().lower()
+    assert "tensorflow" not in (ROOT / "deploy" / "Dockerfile").read_text().lower()

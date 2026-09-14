@@ -1,7 +1,7 @@
 """Facts about the feature vectors that callers need but cannot infer.
 
-Deliberately free of essentia and numpy imports: a caller checking whether
-its cached vectors are stale should not have to load TensorFlow to find out.
+Deliberately free of torch and numpy imports: a caller checking whether its
+cached vectors are stale should not have to load a 700 MB model to find out.
 
 Two things live here, both owned by this lane because both depend on how the
 vectors are *built*, which is exactly what this lane owns:
@@ -28,8 +28,16 @@ from __future__ import annotations
 #    CLAP: the embedding is 1024-d and in a different space entirely, so a
 #    version-3 vector and a version-4 vector have no meaningful cosine at
 #    all. The feel vector went from eleven trained heads to eight zero-shot
-#    contrastive axes (analysis/feel_v2.PROMPT_BANK), and `rhythm` is new.
+#    contrastive axes (analysis/feel.PROMPT_BANK), and `rhythm` is new.
 #    Every stored row must be re-analyzed; ranking reads version-4 only.
+#    The worker's re-analysis arm (worker.reanalyze_step) is what performs
+#    that migration in place, oldest row first.
+#
+# Not only the code decides these numbers: the AUDIO a source hands over is
+# part of the analysis. corpus/sources/jamendo.AUDIO_FORMAT is pinned to
+# `mp32` for exactly that reason -- re-encoding the corpus at a different
+# bitrate would move every embedding slightly, which is a version bump even
+# though not a line of this package changed.
 # 3: Essentia replaced by ffmpeg + numpy mel + TensorFlow (Linux ARM has no
 #    Essentia wheels). Same model, same maths, but not bit-identical: cosine
 #    with v2 vectors is >0.99, yet a corpus must not mix the two. Genre head
