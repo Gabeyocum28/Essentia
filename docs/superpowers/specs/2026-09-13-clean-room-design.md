@@ -71,7 +71,7 @@ Measured on the Mac (see the plan) and to be re-measured on the VM: CLAP embed p
 
 ## 6. Deployment
 
-The Docker image installs `torch` (aarch64 CPU wheel), `msclap`, `beat_this`, `librosa`, `pyloudnorm`, and downloads the CLAP and Beat This! weights at build time into `/app/models/`. TensorFlow and the Essentia-derived model files are removed. Memory: CLAP ~600 MB resident in the worker; the API does not load models (text search embeds prompts through a small in-API CLAP text tower, ~150 MB, loaded lazily).
+The Docker image installs `torch` (aarch64 CPU wheel), `msclap`, `beat_this`, `librosa`, `pyloudnorm`, and downloads the CLAP and Beat This! weights at build time into `/app/models/`. TensorFlow and the Essentia-derived model files are removed. Memory: CLAP ~600 MB resident in the worker; the API loads no model unless `TEXT_SEARCH=1`. The ~150 MB text-tower-only load assumed here does not exist in the msclap API -- `CLAPWrapper` builds the audio encoder and loads the full state dict before the caption encoder is reachable -- so a text search costs the API the whole wrapper, ~2.5 GB resident, for the life of the process. `GET /search/text` is therefore off by default, answers 503 when off, and `GET /axes` reports `text_search` so the web hides the toggle.
 
 ## 7. Cutover
 

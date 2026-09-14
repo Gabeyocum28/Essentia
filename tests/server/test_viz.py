@@ -6,6 +6,7 @@ scores and math are attached to the recommendations.
 """
 import base64
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -1213,3 +1214,91 @@ def test_the_umap_cache_is_purged_with_the_other_subset_caches(client,
     live = [value[2] for value in app_module._SUBSET_CACHE.values()]
     assert all(any(value[0] is subset for subset in live)
                for value in app_module._UMAP_CACHE.values())
+
+
+# ---- the UMAP layout is computed OFF the request path ----
+#
+# Measured at the VIZ_MAX shape (8000 x 1024 float32): 14.5 s with the fixed
+# seed, 2.2 s without it, on a laptop far faster than the deploy VM. A cold
+# subset therefore answers with PCA and upgrades itself once the background
+# layout lands.
+
+@pytest.fixture
+def big_corpus(fake_mongo):
+    """Enough rows that project_umap does not take its PCA fallback."""
+    n = viz.UMAP_MIN_ROWS + 10
+    for i in range(n):
+        v = [0.0] * 1280
+        v[0], v[1] = float(np.cos(i * 0.05)), float(np.sin(i * 0.05))
+        store.put_track({**TRACK, "track_id": f"b{i}", "title": f"Track {i}",
+                         "artist": f"Artist {i % 7}"},
+                        {"embedding": v, "_features_version": FEATURES_VERSION})
+    return [f"b{i}" for i in range(n)]
+
+
+def _await_umap(timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if app_module._UMAP_CACHE and not app_module._UMAP_PENDING:
+            return
+        time.sleep(0.01)
+    raise AssertionError("the background UMAP layout never landed")
+
+
+# A layout no PCA could produce, so a coordinate can be traced to its source.
+def _stub_umap(matrix, seed=0):
+    return np.full((len(matrix), 2), 42.0)
+
+
+def test_viz_map_serves_pca_until_the_umap_layout_lands(client, big_corpus,
+                                                        monkeypatch):
+    monkeypatch.setattr(viz, "project_umap", _stub_umap)
+    first = client.get("/viz/map", params={"track_id": "b0", "axis": "sounds_like"}).json()
+    assert first["points"]["x"][0] != 42.0, "UMAP ran inside the request"
+
+    _await_umap()
+
+    second = client.get("/viz/map", params={"track_id": "b0", "axis": "sounds_like"}).json()
+    assert second["points"]["x"] == [42.0] * len(second["points"]["ids"])
+    assert second["seed"]["x"] == 42.0
+
+
+def test_the_background_layout_starts_once_per_subset(client, big_corpus,
+                                                      monkeypatch):
+    calls = []
+    monkeypatch.setattr(viz, "project_umap",
+                        lambda m, seed=0: (calls.append(1), _stub_umap(m))[1])
+    params = {"track_id": "b0", "axis": "sounds_like"}
+    client.get("/viz/map", params=params)
+    client.get("/viz/map", params=params)
+    _await_umap()
+    client.get("/viz/map", params=params)
+    assert len(calls) == 1
+
+
+def test_a_failed_background_layout_leaves_the_map_on_pca(client, big_corpus,
+                                                          monkeypatch):
+    """A broken layout must not break the endpoint that draws it."""
+    def boom(_matrix, seed=0):
+        raise RuntimeError("numba is unhappy")
+
+    monkeypatch.setattr(viz, "project_umap", boom)
+    body = client.get("/viz/map", params={"track_id": "b0", "axis": "sounds_like"}).json()
+    assert len(body["points"]["x"]) == len(body["points"]["ids"])
+    deadline = time.monotonic() + 5.0
+    while app_module._UMAP_PENDING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not app_module._UMAP_PENDING
+    assert client.get("/viz/map", params={"track_id": "b0",
+                                          "axis": "sounds_like"}).status_code == 200
+
+
+def test_a_small_corpus_still_gets_its_layout_inline(client, seeded_corpus,
+                                                     monkeypatch):
+    """Under UMAP_MIN_ROWS project_umap IS the PCA fallback: nothing to wait
+    for, and no thread worth starting."""
+    monkeypatch.setattr(viz, "project_umap", _stub_umap)
+    body = client.get("/viz/map", params={"track_id": seeded_corpus[0]["track_id"],
+                                          "axis": "sounds_like"}).json()
+    assert body["points"]["x"] == [42.0] * len(body["points"]["ids"])
+    assert not app_module._UMAP_PENDING

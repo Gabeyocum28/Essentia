@@ -20,6 +20,12 @@ def clear_matrix_cache():
     app._VIZ_SNAPSHOT = None
     app._ROW_NORMS = None
     app._FEEL_ALIGN_CACHE = None
+    app._RHYTHM_ALIGN_CACHE = None
+    # Grow-only in production (a corpus id is only ever added); a test that
+    # empties the store and re-uses an id would otherwise be served the
+    # previous test's tempo.
+    app._TEMPO_BY_ID.clear()
+    app._UMAP_CACHE.clear()
     viz.clear_geometry_cache()
     yield
     app._MATRIX_CACHE.clear()
@@ -32,6 +38,12 @@ def clear_matrix_cache():
     app._VIZ_SNAPSHOT = None
     app._ROW_NORMS = None
     app._FEEL_ALIGN_CACHE = None
+    app._RHYTHM_ALIGN_CACHE = None
+    # Grow-only in production (a corpus id is only ever added); a test that
+    # empties the store and re-uses an id would otherwise be served the
+    # previous test's tempo.
+    app._TEMPO_BY_ID.clear()
+    app._UMAP_CACHE.clear()
     viz.clear_geometry_cache()
 
 

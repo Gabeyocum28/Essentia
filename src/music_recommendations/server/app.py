@@ -388,7 +388,15 @@ class SeedRequest(BaseModel):
 
 @app.get("/axes")
 def get_axes() -> dict:
-    return {"axes": AXES}
+    """The contract's axis list, plus one host capability flag.
+
+    `text_search` rides along here rather than on an endpoint of its own
+    because every client already fetches /axes before it can show anything,
+    and the flag is exactly the same kind of thing: what this deployment can
+    do. Clients that predate it ignore an unknown key (the contract has
+    always been "these keys are present", not "only these").
+    """
+    return {"axes": AXES, "text_search": _text_search_enabled()}
 
 
 @app.get("/search")
@@ -431,6 +439,23 @@ def search(q: str) -> dict:
 TEXT_LIMIT_DEFAULT = 25
 TEXT_LIMIT_MAX = 50
 
+# OFF unless the host says otherwise, because the cost is not the endpoint,
+# it is the PROCESS: the only text tower msclap exposes comes attached to the
+# whole CLAP wrapper, so the first text search leaves ~2.5 GB resident in the
+# API for the lifetime of the container -- beside the worker's own copy, on a
+# 12 GB two-core VM. That is a deployment decision, not a per-request one, so
+# it is an env var that /axes reports and the web toggle follows. There is no
+# text-tower-only load in the msclap API (CLAPWrapper.load_clap builds the
+# audio encoder and loads the full state dict before anything else is
+# reachable); doing it by hand means reimplementing their loader against a
+# private state-dict layout, which is not a thing to write blind.
+TEXT_SEARCH_ENV = "TEXT_SEARCH"
+
+
+def _text_search_enabled() -> bool:
+    """Read per call, not at import, so a test (or a redeploy) can flip it."""
+    return os.environ.get(TEXT_SEARCH_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
 
 @app.get("/search/text")
 def search_text(q: str,
@@ -445,17 +470,23 @@ def search_text(q: str,
     all.
 
     MEMORY: the first call LOADS CLAP INTO THE API PROCESS -- ~700 MB of
-    weights and roughly **2.5 GB resident** once torch's allocator is warm.
-    That is why the import is inside the handler rather than at module
-    scope: an API container that never serves a text search never pays it,
-    and the box does not have room for a copy in every process by accident.
-    On a 2-CPU VM running the API beside the embed worker, this is the
-    number to size `mem_limit` against (see deploy/.env.example).
+    weights and roughly **2.5 GB resident** once torch's allocator is warm,
+    and it stays there. That is why the endpoint is OFF by default
+    (TEXT_SEARCH=1 to switch it on, see TEXT_SEARCH_ENV above and
+    deploy/.env.example) and why the import is inside the handler: an API
+    container that never serves a text search never pays it.
 
-    503, not 500, when CLAP is unavailable (not installed, or the weights
-    were never fetched): the rest of the API is fine, and a client should
-    hide the toggle rather than report the service down.
+    503, not 500, whenever it cannot answer -- switched off, CLAP not
+    installed, weights never fetched: the rest of the API is fine, and the
+    client hides the toggle (GET /axes reports `text_search`) rather than
+    reporting the service down.
     """
+    if not _text_search_enabled():
+        raise HTTPException(
+            503, "text search is switched off on this host "
+                 f"(set {TEXT_SEARCH_ENV}=1; it costs ~2.5 GB resident in the "
+                 "API process)"
+        )
     query = q.strip()
     if not query:
         raise HTTPException(400, "q must not be empty")
@@ -776,7 +807,7 @@ class _FeelRows(NamedTuple):
 # the array it named be freed and a later array at the same address would be
 # served someone else's alignment. Either matrix growing (a crawl, a backfill)
 # hands back a new object and invalidates this for free.
-# (matrix, feel_matrix, rows, present, mean, std)
+# (matrix, feel_matrix, rows, present, std)
 _FEEL_ALIGN_CACHE: tuple[np.ndarray, ...] | None = None
 _FEEL_ALIGN_LOCK = threading.Lock()
 # Rows with no feel vector are a deploy-time fact, not a per-request one: say
@@ -786,14 +817,19 @@ _FEEL_MISSING_LOGGED = False
 
 def _feel_alignment(ids: list[str], matrix: np.ndarray, feel_ids: list[str],
                     feel_matrix: np.ndarray
-                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """(rows, present, mean, std) for `ids`, drawn from the feel matrix.
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(rows, present, std) for `ids`, drawn from the feel matrix.
 
-    `mean`/`std` are per-dimension over the WHOLE feel matrix (every scored
-    row in the corpus, not just this request's), which is what makes the
-    z-score a statement about the corpus rather than about the candidate
-    list. They are computed here, once, because this is the one place that
-    already runs exactly when the feel matrix changes identity.
+    `std` is the per-dimension standard deviation over the WHOLE feel matrix
+    (every scored row in the corpus, not just this request's), which is what
+    makes the z-score a statement about the corpus rather than about the
+    candidate list. It is computed here, once, because this is the one place
+    that already runs exactly when the feel matrix changes identity.
+
+    The matching MEAN is deliberately absent: the distance is a DIFFERENCE of
+    z-scores, |(r - m)/s - (v - m)/s| = |r - v| / s, so the mean cancels
+    exactly and computing it would only invite the reader to believe it does
+    something.
     """
     global _FEEL_ALIGN_CACHE, _FEEL_MISSING_LOGGED
 
@@ -801,7 +837,7 @@ def _feel_alignment(ids: list[str], matrix: np.ndarray, feel_ids: list[str],
         cached = _FEEL_ALIGN_CACHE
         if (cached is not None and cached[0] is matrix
                 and cached[1] is feel_matrix):
-            return cached[2], cached[3], cached[4], cached[5]
+            return cached[2], cached[3], cached[4]
 
     at = {track_id: row for row, track_id in enumerate(feel_ids)}
     take = np.array([at.get(track_id, -1) for track_id in ids], dtype=np.int64)
@@ -819,15 +855,13 @@ def _feel_alignment(ids: list[str], matrix: np.ndarray, feel_ids: list[str],
 
     scored = np.asarray(feel_matrix, dtype=np.float32)
     if scored.ndim == 2 and scored.shape[0]:
-        mean = scored.mean(axis=0)
         std = np.maximum(scored.std(axis=0), _FEEL_STD_FLOOR)
     else:
-        mean = np.zeros(width, dtype=np.float32)
         std = np.ones(width, dtype=np.float32)
 
     with _FEEL_ALIGN_LOCK:
-        _FEEL_ALIGN_CACHE = (matrix, feel_matrix, rows, present, mean, std)
-    return rows, present, mean, std
+        _FEEL_ALIGN_CACHE = (matrix, feel_matrix, rows, present, std)
+    return rows, present, std
 
 
 def _feel_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
@@ -849,11 +883,13 @@ def _feel_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
                                               want_correction=False)
     if not feel_ids:
         return None
-    rows, present, mean, std = _feel_alignment(ids, matrix, feel_ids, feel_matrix)
+    rows, present, std = _feel_alignment(ids, matrix, feel_ids, feel_matrix)
     seed_vec = np.asarray(seed, dtype=np.float32).ravel()
     if rows.shape[1] != seed_vec.shape[0]:
         return None
-    distance = np.abs((rows - mean) / std - (seed_vec - mean) / std).mean(axis=1)
+    # The corpus mean cancels out of the difference of z-scores; see
+    # _feel_alignment.
+    distance = (np.abs(rows - seed_vec) / std).mean(axis=1)
     distance[~present] = 0.0
     return _FeelRows(distance.astype(np.float32), rows, present, seed_vec)
 
@@ -890,17 +926,37 @@ class _RhythmRows(NamedTuple):
     seed: dict                  # the seed's own rhythm dict
 
 
-# Keyed and re-checked on the embedding matrix's identity, exactly like
-# _FEEL_ALIGN_CACHE (and for the same reason: a bare id() can be reused by a
-# later array). One Mongo read of `rhythm` for the whole corpus per matrix
-# identity, not per request.
+# The tempo column, aligned to the embedding matrix's rows. Keyed and
+# re-checked on that matrix's identity, exactly like _FEEL_ALIGN_CACHE (and
+# for the same reason: a bare id() can be reused by a later array).
 #
-# Only the TEMPO column is kept, not the rhythm dicts it was read out of: a
-# dict per corpus row is tens of megabytes of Python objects at 90k rows, and
-# the only rows whose whole rhythm anyone ever sees are the handful the math
-# panel draws (_fill_rec_rhythm reads those back in one query per request).
+# Only the TEMPO is kept, not the rhythm dicts it was read out of: a dict per
+# corpus row is tens of megabytes of Python objects at 90k rows, and the only
+# rows whose whole rhythm anyone ever sees are the handful the math panel
+# draws (_fill_rec_rhythm reads those back in one query per request).
 _RHYTHM_ALIGN_CACHE: "tuple[np.ndarray, np.ndarray, np.ndarray] | None" = None
 _RHYTHM_ALIGN_LOCK = threading.Lock()
+
+# id -> tempo_bpm (0.0 meaning "no beat was found", which is how the contract
+# spells absence) for every corpus id ever looked up, INDEPENDENT of any one
+# matrix. The cache above is invalidated by identity, and the matrix is a new
+# object every time the corpus grows -- which during a re-analysis backfill is
+# every couple of seconds. Without this memo each of those invalidations meant
+# a `rhythm` read of the WHOLE corpus on the /recommend path; with it, only
+# ids never seen before are fetched, and the aligned column is rebuilt from
+# memory.
+#
+# Grow-only, like _CorpusMatrix.attempted and for the same reason: a row only
+# enters the corpus once (rows below FEATURES_VERSION are not in it, so a
+# re-analysis lands as a first sighting), and an id that came back without a
+# rhythm has none to gain without a re-analysis. A store that is emptied under
+# a live process (only tests do that) must clear this with the other caches.
+_TEMPO_BY_ID: dict[str, float] = {}
+
+# Distinguishes "the store said no rhythm" from "the store was unreachable":
+# memoizing 0.0 for the second would make a transient Atlas failure a
+# permanent "this track has no tempo".
+_READ_FAILED = object()
 
 
 def _rhythm_alignment(ids: list[str], matrix: np.ndarray
@@ -912,21 +968,25 @@ def _rhythm_alignment(ids: list[str], matrix: np.ndarray
         cached = _RHYTHM_ALIGN_CACHE
         if cached is not None and cached[0] is matrix:
             return cached[1], cached[2]
+        fresh = [i for i in ids if i not in _TEMPO_BY_ID]
 
-    rows = _safe(store.get_many_rhythm, list(ids), default=None)
-    if rows is None or len(rows) != len(ids):
-        rows = [None] * len(ids)
-    tempo = np.array(
-        [float(r.get("tempo_bpm") or 0.0) if isinstance(r, dict) else 0.0
-         for r in rows],
-        dtype=np.float32,
-    )
-    del rows                    # the dicts die here, only the column survives
-    # A stored 0.0 means "no beat could be found" (contract/features.py), so
-    # it is an absence, not a tempo of zero.
-    present = tempo > 0.0
+    if fresh:
+        rows = _safe(store.get_many_rhythm, fresh, default=_READ_FAILED)
+        if rows is not _READ_FAILED and rows is not None and len(rows) == len(fresh):
+            found = {track_id: (float(row.get("tempo_bpm") or 0.0)
+                                if isinstance(row, dict) else 0.0)
+                     for track_id, row in zip(fresh, rows)}
+            del rows            # the dicts die here, only the tempi survive
+            with _RHYTHM_ALIGN_LOCK:
+                _TEMPO_BY_ID.update(found)
 
     with _RHYTHM_ALIGN_LOCK:
+        tempo = np.fromiter((_TEMPO_BY_ID.get(i, 0.0) for i in ids),
+                            dtype=np.float32, count=len(ids))
+        # A stored 0.0 means "no beat could be found" (contract/features.py),
+        # so it is an absence, not a tempo of zero; a NaN from a corrupt row
+        # is the same kind of absence and must not reach the log below.
+        present = np.isfinite(tempo) & (tempo > 0.0)
         _RHYTHM_ALIGN_CACHE = (matrix, tempo, present)
     return tempo, present
 
@@ -939,7 +999,7 @@ def _tempo_distance(seed_bpm: float, tempo: np.ndarray,
     penalty, or a partial backfill would quietly hide half the corpus.
     """
     distance = np.zeros(tempo.shape, dtype=np.float32)
-    if seed_bpm <= 0.0 or not present.any():
+    if not np.isfinite(seed_bpm) or seed_bpm <= 0.0 or not present.any():
         return distance
     ratio = np.log2(seed_bpm / np.where(present, tempo, 1.0))
     folded = np.minimum(np.abs(ratio),
@@ -959,9 +1019,17 @@ def _rhythm_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
     seed = seed_features.get("rhythm")
     if not isinstance(seed, dict) or not ids:
         return None
+    try:
+        seed_bpm = float(seed.get("tempo_bpm") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    # A seed with no beat (0.0, or a NaN off a corrupt row) is a seed with no
+    # rhythm: there is no ratio to take, so the term cannot apply and the math
+    # panel must say `tempo_dist: null` rather than a confident 0.
+    if not np.isfinite(seed_bpm) or seed_bpm <= 0.0:
+        return None
     tempo, present = _rhythm_alignment(ids, matrix)
-    distance = _tempo_distance(float(seed.get("tempo_bpm") or 0.0),
-                               tempo, present)
+    distance = _tempo_distance(seed_bpm, tempo, present)
     return _RhythmRows(distance, present, seed)
 
 
@@ -1273,14 +1341,18 @@ def recommend(track_id: str, axis: str,
         # The blend is what is RANKED and what is REPORTED: a result whose
         # score was not the number it was sorted by would read as an
         # out-of-order list in the client.
+        # Both terms are sounds_like-only (see _feel_blend / _tempo_blend),
+        # so the matrices behind them are built only there: `tempo`'s nonzero
+        # default otherwise put a corpus-wide `rhythm` read on every
+        # `surprise` request for a number that was then discarded.
+        blend = axis == "sounds_like"
         blended = _feel_blend(
-            axis, feel,
-            similarity,
-            _feel_rows(corpus, ids, matrix, seed_features) if feel else None,
+            axis, feel, similarity,
+            _feel_rows(corpus, ids, matrix, seed_features) if blend and feel else None,
         )
         blended = _tempo_blend(
             axis, tempo, blended,
-            _rhythm_rows(corpus, ids, matrix, seed_features) if tempo else None,
+            _rhythm_rows(corpus, ids, matrix, seed_features) if blend and tempo else None,
         )
         order = rank_mod.rank(
             seed_vec, matrix, direction=direction, limit=_scan_width(limit),
@@ -1358,17 +1430,67 @@ def _top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # not an option. Same identity discipline -- matrix in the value, re-checked
 # with `is` -- and purged with the others when its subset is superseded.
 _UMAP_CACHE: "OrderedDict[int, tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+# Matrix identities a background layout is already running for, so a burst of
+# requests against one cold subset starts ONE thread, not one per request.
+_UMAP_PENDING: set[int] = set()
+
+
+def _remember_umap(matrix: np.ndarray, xy: np.ndarray) -> None:
+    with _VIZ_CACHE_LOCK:
+        _UMAP_CACHE[id(matrix)] = (matrix, xy)
+        _UMAP_CACHE.move_to_end(id(matrix))
+        while len(_UMAP_CACHE) > _CACHE_KEEP:
+            _UMAP_CACHE.popitem(last=False)
+
+
+def _start_umap(matrix: np.ndarray) -> None:
+    """Compute this subset's UMAP layout in the background, once."""
+    key = id(matrix)
+    with _VIZ_CACHE_LOCK:
+        if key in _UMAP_PENDING:
+            return
+        _UMAP_PENDING.add(key)
+
+    def work() -> None:
+        try:
+            _remember_umap(matrix, viz.project_umap(matrix))
+        except Exception as exc:  # noqa: BLE001 - a failed layout is not a failed request
+            print(f"viz: UMAP layout failed ({exc!r}); staying on PCA")
+        finally:
+            with _VIZ_CACHE_LOCK:
+                _UMAP_PENDING.discard(key)
+
+    # Daemon: a half-finished picture must never hold up a shutdown. The
+    # thread holds a reference to the subset matrix (a few tens of MB at
+    # VIZ_MAX) for as long as it runs, and there is at most one per subset.
+    threading.Thread(target=work, name=f"umap-{key:x}", daemon=True).start()
 
 
 def _projection(matrix: np.ndarray) -> np.ndarray:
-    """The (n, 2) galaxy coordinates: UMAP, cached per subset identity.
+    """The (n, 2) galaxy coordinates: UMAP when it is ready, PCA until then.
 
     /viz/map and /viz/walk only. /viz/tour and /viz/extremes stay on _top8
     because they are ABOUT the principal components -- a UMAP axis has no
     variance fraction to report and no "most extreme on PC3" to rank by.
 
-    Under viz.UMAP_MIN_ROWS rows project_umap falls back to the same top-2
-    PCA columns this used to return, so small corpora are unchanged.
+    UMAP IS NOT COMPUTED IN THE REQUEST. Measured at the VIZ_MAX shape,
+    8000 x 1024 float32 on this laptop: 14.5 s seeded (a fixed random_state
+    forces it single-threaded, which it warns about), 2.2 s unseeded -- and
+    the deploy target is a 2-core ARM VM, so both numbers are worse there.
+    Either is far too long to hold a request, and the subset matrix changes
+    identity every time the corpus grows, which during a re-analysis backfill
+    is every couple of seconds.
+
+    So the first request for a cold subset starts the layout on a background
+    thread and answers with the top-2 PCA columns -- the picture this
+    endpoint served before UMAP existed. Once the thread lands, every later
+    request for that same subset gets the UMAP layout from memory. The seed
+    stays fixed (determinism is what stops points jumping between redraws);
+    the price is paid off the request path instead.
+
+    Under viz.UMAP_MIN_ROWS rows project_umap IS the PCA fallback, so it is
+    computed inline: there is nothing to wait for and no thread worth
+    starting.
     """
     key = id(matrix)
     with _VIZ_CACHE_LOCK:
@@ -1376,14 +1498,14 @@ def _projection(matrix: np.ndarray) -> np.ndarray:
         if cached is not None and cached[0] is matrix:
             _UMAP_CACHE.move_to_end(key)
             return cached[1]
-    # Outside the lock, like _top8: it is the expensive part, and two threads
-    # racing on one matrix would only compute it twice.
-    xy = viz.project_umap(matrix)
-    with _VIZ_CACHE_LOCK:
-        _UMAP_CACHE[key] = (matrix, xy)
-        while len(_UMAP_CACHE) > _CACHE_KEEP:
-            _UMAP_CACHE.popitem(last=False)
-    return xy
+
+    if len(matrix) < viz.UMAP_MIN_ROWS:
+        xy = viz.project_umap(matrix)
+        _remember_umap(matrix, xy)
+        return xy
+
+    _start_umap(matrix)
+    return _top8(matrix)[0][:, :2]
 
 
 def _mst(matrix: np.ndarray) -> list[tuple[int, int, float]]:

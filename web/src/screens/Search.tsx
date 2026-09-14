@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import { TrackRow } from "../components/TrackRow";
@@ -11,11 +11,29 @@ const DEFAULT_ERROR = "Something went wrong";
 
 export function Search() {
   const [query, setQuery] = useState("");
+  // The query the CURRENT results answer -- not what is in the box now. The
+  // toggle re-asks this one, so flipping it after editing the box (but
+  // before pressing Search) cannot silently search for something else.
+  const [asked, setAsked] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [byDescription, setByDescription] = useState(false);
   const [error, setError] = useState(DEFAULT_ERROR);
   const [results, setResults] = useState<Track[]>([]);
+  // Whether THIS host can answer a text search at all: /search/text needs
+  // CLAP resident in the API process, so it is a deployment decision the
+  // server reports (GET /axes). Undefined until the answer arrives, and the
+  // toggle simply is not offered unless it comes back true -- a toggle that
+  // can only 503 is worse than no toggle.
+  const [textSearch, setTextSearch] = useState(false);
   const navigate = useNavigate();
+
+  useEffect(() => {
+    let live = true;
+    api.axes()
+      .then((r) => { if (live) setTextSearch(r.text_search === true); })
+      .catch(() => { /* an older or unreachable server: no toggle */ });
+    return () => { live = false; };
+  }, []);
 
   // Two different questions, deliberately one box: by NAME asks the
   // catalogue ("Kind of Blue"), by DESCRIPTION asks the analyzed corpus what
@@ -24,6 +42,7 @@ export function Search() {
   // detail is shown rather than a generic failure.
   const runSearch = async (q: string, description: boolean) => {
     if (!q.trim()) return;
+    setAsked(q);
     setStatus("loading");
     try {
       const { results } = description ? await api.searchText(q) : await api.search(q);
@@ -42,9 +61,9 @@ export function Search() {
 
   const onToggle = (next: boolean) => {
     setByDescription(next);
-    // Re-answer the question they already asked, rather than leaving the
-    // previous mode's results under the new label.
-    if (status !== "idle") void runSearch(query, next);
+    // Re-answer the question the current results answer, rather than leaving
+    // the previous mode's results under the new label.
+    if (status !== "idle") void runSearch(asked, next);
   };
 
   return (
@@ -71,15 +90,17 @@ export function Search() {
         </button>
       </form>
 
-      <label className="search-mode">
-        <input
-          type="checkbox"
-          checked={byDescription}
-          onChange={(e) => onToggle(e.target.checked)}
-          aria-label="Search by description"
-        />
-        <span>by description</span>
-      </label>
+      {textSearch && (
+        <label className="search-mode">
+          <input
+            type="checkbox"
+            checked={byDescription}
+            onChange={(e) => onToggle(e.target.checked)}
+            aria-label="Search by description"
+          />
+          <span>by description</span>
+        </label>
+      )}
 
       {status === "idle" && (
         <p className="hint">

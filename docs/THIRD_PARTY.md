@@ -57,6 +57,14 @@ the image too:
 | Beat This! `final0` checkpoint | code MIT; weights CC BY 4.0 (upstream statement: https://github.com/CPJKU/beat_this#license — attribute Foscarin, Schlüter & Widmer, ISMIR 2024) | tempo and beat strength | https://github.com/CPJKU/beat_this |
 | GPT-2 tokenizer | MIT | CLAP's text tower | https://huggingface.co/gpt2 |
 
+Nothing under a non-commercial licence is shipped any more. The two
+`models/msd-musicnn-1.*` files (MSD-MusiCNN, **CC BY-NC-SA 4.0**) were
+tracked in git until this commit even though only the frozen `legacy/` MVP
+ever loaded them; they are now out of the repo. Running anything in
+`legacy/` therefore means downloading those weights yourself from
+https://essentia.upf.edu/models.html into `models/` — and doing so under a
+licence this project does not sell against.
+
 ## System
 
 | Component | Licence | Used for |

@@ -91,6 +91,14 @@ def ensure_indexes() -> None:
     # batch (existing_keys), and the backfill groups the whole collection on
     # it; neither is affordable as a scan at corpus scale.
     d.tracks.create_index("dedupe_key")
+    # The re-analysis arm asks "how many rows are below the current version,
+    # and which are the oldest" every tick (stale_count / stale_ids, _STALE).
+    # On the bare `analyzed_at` index that is a scan of the whole corpus for
+    # a count that is usually zero once the backfill has drained; leading on
+    # features_version (an equality-style range) and following with
+    # analyzed_at lets the sort come off the index too.
+    d.tracks.create_index([("features_version", pymongo.ASCENDING),
+                           ("analyzed_at", pymongo.ASCENDING)])
     d.jobs.create_index([("state", pymongo.ASCENDING), ("created_at", pymongo.ASCENDING)])
     d.cache.create_index("expires_at", expireAfterSeconds=0)
     _indexes_ready = True

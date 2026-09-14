@@ -132,7 +132,9 @@ export function decodeCoords8(b64: string, n: number): Float32Array[] {
 export const api = {
   search: (query: string) => request<{ results: T.Track[] }>(`/search${q({ q: query })}`),
   seed: (track_id: string) => request<T.SeedResponse>("/seed", { method: "POST", body: JSON.stringify({ track_id }) }),
-  axes: () => request<{ axes: T.Axis[] }>("/axes"),
+  // `text_search` is this host's capability flag, not part of the axis list:
+  // absent from an older server, in which case the web offers no toggle.
+  axes: () => request<{ axes: T.Axis[]; text_search?: boolean }>("/axes"),
   // Search the CORPUS by description rather than the catalogue by name: the
   // phrase is embedded by CLAP's text tower and cosined against every
   // analyzed track. 503 (an ApiError, with the server's detail) when CLAP is

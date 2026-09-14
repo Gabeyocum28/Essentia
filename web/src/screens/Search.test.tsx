@@ -8,7 +8,7 @@ vi.mock("../api/client", async () => {
   const actual = await vi.importActual<typeof import("../api/client")>("../api/client");
   return {
     ...actual,
-    api: { ...actual.api, search: vi.fn(), searchText: vi.fn() },
+    api: { ...actual.api, search: vi.fn(), searchText: vi.fn(), axes: vi.fn() },
   };
 });
 
@@ -33,7 +33,14 @@ function submit(text: string) {
 beforeEach(() => {
   vi.mocked(api.search).mockResolvedValue({ results: [track("a", "By Name")] });
   vi.mocked(api.searchText).mockResolvedValue({ results: [track("b", "By Description")] });
+  // The toggle only exists where the host can answer a text search.
+  vi.mocked(api.axes).mockResolvedValue({ axes: [], text_search: true });
 });
+
+async function toggle() {
+  const box = await screen.findByLabelText("Search by description");
+  fireEvent.click(box);
+}
 
 test("searches the catalogue by name by default", async () => {
   renderSearch();
@@ -46,7 +53,7 @@ test("searches the catalogue by name by default", async () => {
 
 test("the by-description toggle searches the corpus instead", async () => {
   renderSearch();
-  fireEvent.click(screen.getByLabelText("Search by description"));
+  await toggle();
   submit("hazy late-night trumpet");
 
   await waitFor(() => expect(screen.getByText("By Description")).toBeInTheDocument());
@@ -59,7 +66,7 @@ test("toggling after a search re-asks the same question the other way", async ()
   submit("piano");
   await waitFor(() => expect(screen.getByText("By Name")).toBeInTheDocument());
 
-  fireEvent.click(screen.getByLabelText("Search by description"));
+  await toggle();
 
   await waitFor(() => expect(screen.getByText("By Description")).toBeInTheDocument());
   expect(api.searchText).toHaveBeenCalledWith("piano");
@@ -70,7 +77,7 @@ test("a 503 from the text search shows the server's own detail", async () => {
     new ApiError(503, "text search unavailable: CLAP could not be loaded"),
   );
   renderSearch();
-  fireEvent.click(screen.getByLabelText("Search by description"));
+  await toggle();
   submit("jazz");
 
   await waitFor(() =>
@@ -82,4 +89,35 @@ test("an empty query searches nothing", async () => {
   submit("   ");
   expect(api.search).not.toHaveBeenCalled();
   expect(api.searchText).not.toHaveBeenCalled();
+});
+
+test("toggling re-asks the query the current results answer, not the edited box", async () => {
+  renderSearch();
+  submit("piano");
+  await waitFor(() => expect(screen.getByText("By Name")).toBeInTheDocument());
+
+  // The user starts typing something else but never presses Search.
+  fireEvent.change(screen.getByLabelText("Search"), { target: { value: "drums" } });
+  await toggle();
+
+  await waitFor(() => expect(api.searchText).toHaveBeenCalled());
+  expect(api.searchText).toHaveBeenCalledWith("piano");
+});
+
+test("no toggle at all when the host cannot answer a text search", async () => {
+  vi.mocked(api.axes).mockResolvedValue({ axes: [], text_search: false });
+  renderSearch();
+  submit("piano");
+  await waitFor(() => expect(screen.getByText("By Name")).toBeInTheDocument());
+
+  expect(screen.queryByLabelText("Search by description")).not.toBeInTheDocument();
+});
+
+test("an older server that does not send the flag offers no toggle", async () => {
+  vi.mocked(api.axes).mockResolvedValue({ axes: [] });
+  renderSearch();
+  submit("piano");
+  await waitFor(() => expect(screen.getByText("By Name")).toBeInTheDocument());
+
+  expect(screen.queryByLabelText("Search by description")).not.toBeInTheDocument();
 });

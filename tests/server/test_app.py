@@ -68,7 +68,12 @@ def seeded_corpus(fake_mongo):
 # ---- /axes ----
 
 def test_axes_serves_contract_list_verbatim(client):
-    assert client.get("/axes").json() == {"axes": AXES}
+    body = client.get("/axes").json()
+    assert body["axes"] == AXES
+    # The axis list is the contract; `text_search` is this host's capability
+    # flag beside it (see get_axes), and is always present as a bool.
+    assert set(body) == {"axes", "text_search"}
+    assert isinstance(body["text_search"], bool)
 
 
 # ---- /search ----
@@ -1354,6 +1359,29 @@ def text_corpus(fake_mongo):
     return ["t0", "t1", "t2", "t3"]
 
 
+@pytest.fixture(autouse=True)
+def text_search_on(monkeypatch):
+    """The host default is OFF. Module-wide (autouse), which is harmless
+    everywhere except /axes, whose flag the two tests below assert both ways."""
+    monkeypatch.setenv(app_module.TEXT_SEARCH_ENV, "1")
+
+
+def test_axes_reports_whether_this_host_can_answer_a_text_search(client, monkeypatch):
+    assert client.get("/axes").json()["text_search"] is True
+    monkeypatch.delenv(app_module.TEXT_SEARCH_ENV)
+    assert client.get("/axes").json()["text_search"] is False
+
+
+def test_search_text_is_503_when_the_host_has_it_switched_off(client, text_corpus,
+                                                              monkeypatch):
+    """It is off by default: CLAP in the API process is ~2.5 GB resident, and
+    that is a deployment decision rather than a per-request one."""
+    monkeypatch.delenv(app_module.TEXT_SEARCH_ENV)
+    res = client.get("/search/text", params={"q": "jazz"})
+    assert res.status_code == 503
+    assert "switched off" in res.json()["detail"]
+
+
 def test_search_text_ranks_the_corpus_by_cosine_to_the_phrase(client, text_corpus,
                                                               monkeypatch):
     monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.8))
@@ -1428,3 +1456,76 @@ def test_search_text_on_an_empty_corpus_is_empty_not_an_error(client, fake_mongo
                                                               monkeypatch):
     monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
     assert client.get("/search/text", params={"q": "jazz"}).json() == {"results": []}
+
+
+def test_only_new_ids_are_read_when_the_corpus_grows(client, tempo_corpus,
+                                                     monkeypatch):
+    """The alignment is keyed on the matrix, and the matrix is a NEW object
+    every time the corpus grows -- which during a re-analysis backfill is
+    every couple of seconds. Re-reading `rhythm` for the whole corpus on each
+    of those would put an Atlas full-collection read on the /recommend path.
+    """
+    asked = []
+    real = store.get_many_rhythm
+    monkeypatch.setattr(store, "get_many_rhythm",
+                        lambda ids: (asked.append(list(ids)), real(ids))[1])
+    params = {"track_id": "s", "axis": "sounds_like", "tempo": 1}
+    client.get("/recommend", params=params)
+    assert asked and set(asked[0]) == {t[0] for t in TEMPO_CORPUS}
+
+    store.put_track({"track_id": "late", "title": "Late", "artist": "A",
+                     "album": "Kind of Blue", "artwork_url": "u"},
+                    _with_tempo(0.9, 128.0))
+    asked.clear()
+    client.get("/recommend", params=params)
+
+    assert asked == [["late"]], "the whole corpus was re-read for one new row"
+
+
+def test_a_transient_store_failure_is_not_memoized_as_no_tempo(client,
+                                                               tempo_corpus,
+                                                               monkeypatch):
+    """Memoizing 0.0 for a read that never happened would turn one unreachable
+    Atlas into a permanently tempo-less corpus."""
+    real = store.get_many_rhythm
+    down = [True]
+
+    def maybe(ids):
+        if down[0]:
+            raise RuntimeError("connection reset")
+        return real(ids)
+
+    monkeypatch.setattr(store, "get_many_rhythm", maybe)
+    scores = _tempo_scores(client, tempo=3)
+    assert scores["near"] == pytest.approx(math.cos(0.30), abs=2e-3)  # no penalty
+    assert not app_module._TEMPO_BY_ID
+
+    down[0] = False             # Atlas comes back
+    app_module._RHYTHM_ALIGN_CACHE = None
+    assert _tempo_scores(client, tempo=1)["near"] == pytest.approx(
+        math.cos(0.30) - abs(math.log2(120.0 / 160.0)), abs=2e-3)
+
+
+def test_surprise_reads_no_rhythm_at_all(client, tempo_corpus, monkeypatch):
+    """`tempo` defaults to 0.2, and the term is sounds_like-only, so a
+    `surprise` request must not build the column it would then discard."""
+    asked = []
+    monkeypatch.setattr(store, "get_many_rhythm",
+                        lambda ids: (asked.append(list(ids)), [])[1])
+    client.get("/recommend", params={"track_id": "s", "axis": "surprise"})
+    assert asked == []
+
+
+def test_a_seed_with_no_beat_reports_no_tempo_distance(client, fake_mongo):
+    """0.0 BPM is the contract's "no beat could be found", not a tempo: there
+    is no ratio to take, so the panel must say nothing rather than 0."""
+    for track_id, theta, bpm in (("s", 0.0, 0.0), ("other", 0.3, 120.0)):
+        store.put_track({"track_id": track_id, "title": track_id, "artist": "A",
+                         "album": "Kind of Blue", "artwork_url": "u"},
+                        _with_tempo(theta, bpm))
+    body = client.get("/viz/map", params={"track_id": "s", "axis": "sounds_like",
+                                          "tempo": 2}).json()
+    math_ = body["recs"][0]["math"]
+    assert math_["tempo_dist"] is None
+    assert math_["rhythm"] is None
+    assert body["recs"][0]["score"] == pytest.approx(math.cos(0.30), abs=2e-3)
