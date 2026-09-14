@@ -96,11 +96,16 @@ nonisolated struct VizExtremesResponse: Decodable {
         let album: String
         let artworkURL: URL?
         let previewURL: URL?
+        var source: String? = nil
+        var attributionURL: URL? = nil
 
         var id: String { trackID }
         var track: Track {
-            Track(trackID: trackID, title: title, artist: artist, album: album,
-                  artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            var t = Track(trackID: trackID, title: title, artist: artist, album: album,
+                          artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            t.source = source
+            t.attributionURL = attributionURL
+            return t
         }
 
         enum CodingKeys: String, CodingKey {
@@ -108,6 +113,8 @@ nonisolated struct VizExtremesResponse: Decodable {
             case title, artist, album
             case artworkURL = "artwork_url"
             case previewURL = "preview_url"
+            case source
+            case attributionURL = "attribution_url"
         }
     }
 

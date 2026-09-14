@@ -1,7 +1,7 @@
 """int8 storage form for embeddings: 1 byte per dimension plus one scale.
 
 Ranking is cosine, so direction is what matters and a per-vector scale
-loses nothing that changes an ordering. 1280 floats -> 1280 bytes + 1 float.
+loses nothing that changes an ordering. 1024 floats -> 1024 bytes + 1 float.
 """
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
 """worker.py: embed queued tracks, run attributions, crawl when idle."""
+import json
+from datetime import timedelta
 from types import SimpleNamespace
 
 import numpy as np
@@ -718,12 +720,69 @@ def test_a_tick_with_nothing_stale_still_crawls(fake_mongo, monkeypatch):
     assert crawled == [1]
 
 
+def test_a_tick_whose_reanalysis_group_all_fails_still_does_not_crawl(
+        fake_mongo, monkeypatch):
+    """The bug this guards against: gating the crawl on `reanalyze_step`'s
+    return value (how many rows it FIXED) rather than on whether stale rows
+    still exist meant a group whose downloads all failed looked exactly like
+    "nothing was stale" and reopened the crawl on a corpus that still could
+    not be shown."""
+    _stale("42")
+    monkeypatch.setattr(deezer_source.DeezerSource, "preview_url",
+                        lambda self, track_id: None)   # every download fails
+    crawled = []
+    monkeypatch.setattr(worker, "crawl_step", lambda: crawled.append(1) or 0)
+    monkeypatch.setattr(worker, "_last_crawl", 0.0)
+    monkeypatch.setattr(store, "dequeue_job", lambda timeout=5: None)
+
+    worker._tick()
+
+    assert store.stale_count() == 1     # still stale: the download failed
+    assert crawled == []                # and the crawl must not have opened
+
+
 def test_a_store_blip_in_the_arm_is_not_fatal(fake_mongo, monkeypatch):
     def boom(limit):
         raise ConnectionError("atlas blip")
 
     monkeypatch.setattr(store, "stale_ids", boom)
     assert worker.reanalyze_step() == 0
+
+
+def test_prioritize_stale_fixture_jumps_stale_fixture_rows_to_the_front(
+        fake_mongo, reanalysis_ok):
+    """Boot-time, after an analysis upgrade: the fixture is what a fresh
+    /seed most often hits, so its stale rows should be re-analyzed before
+    the ordinary backlog (spec Sec8), not wait their turn behind whatever
+    else the corpus already had queued for re-analysis."""
+    fixture_tracks = json.loads(worker.FIXTURE.read_text())["tracks"]
+    fixture_id = fixture_tracks[0]["track_id"]
+    store.put_track({**TRACK, "track_id": fixture_id}, dict(OLD))
+    # A backlog row, analyzed long before the fixture row -- the ordinary
+    # sort would serve this one first.
+    _stale("999", "Backlog Row")
+    fake_mongo.tracks.update_one(
+        {"_id": "999"}, {"$set": {"analyzed_at": store._now() - timedelta(days=1)}})
+
+    n = worker.prioritize_stale_fixture()
+
+    assert n == 1
+    assert store.stale_ids(limit=10)[0] == fixture_id
+
+
+def test_prioritize_stale_fixture_ignores_rows_already_current(fake_mongo):
+    fixture_tracks = json.loads(worker.FIXTURE.read_text())["tracks"]
+    fixture_id = fixture_tracks[0]["track_id"]
+    store.put_track({**TRACK, "track_id": fixture_id}, dict(FEATURES))
+
+    assert worker.prioritize_stale_fixture() == 0
+
+
+def test_prioritize_stale_fixture_ignores_unanalyzed_fixture_rows(fake_mongo):
+    """A fixture id with no row at all (nothing analyzed yet, or freshly
+    queued by seed_fixture_if_empty) is not stale -- there is nothing to
+    prioritize, only something to wait for."""
+    assert worker.prioritize_stale_fixture() == 0
 
 
 # ---- crawl + first-boot seed ----

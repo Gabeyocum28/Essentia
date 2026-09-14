@@ -173,7 +173,10 @@ def _fresh_preview(track_id: str) -> str | None:
     source = sources.for_id(track_id)
     if source is None:
         return None
-    url = source.preview_url(track_id)
+    try:
+        url = source.preview_url(track_id)
+    except Exception:
+        return None
     if url:
         _safe(store.put_cached_preview, track_id, url)
     return url
@@ -704,8 +707,8 @@ def _rows_for(track_ids: list[str], feature_key: str) -> tuple[list[str], list[n
     """Fetch and vectorize a set of tracks, skipping any without this feature."""
     ids, rows = [], []
     if feature_key == "feel":
-        # Eleven floats per row, so the generic read below was fetching a
-        # 1280-byte int8 embedding and dequantizing it to float32 for every
+        # Eight floats per row, so the generic read below was fetching a
+        # 1024-byte int8 embedding and dequantizing it to float32 for every
         # candidate purely to throw it away. store.get_many_feel projects
         # `feel` alone and does no dequantization at all.
         for track_id, vector in zip(track_ids, store.get_many_feel(track_ids)):

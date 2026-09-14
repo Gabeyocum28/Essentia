@@ -269,14 +269,19 @@ def test_jamendo_logs_an_error_inside_a_200_envelope(monkeypatch, capsys):
     assert "failed" in out and "credits are exhausted" in out
 
 
-def test_jamendo_get_returns_empty_on_a_broken_response(monkeypatch):
-    """A dead API must not raise into the crawl loop."""
+def test_jamendo_get_raises_on_a_broken_response(monkeypatch):
+    """A transport failure must propagate (not disappear into {}): callers
+    that need to tell "network is down" from "no results" -- app.search's
+    per-source `failures` counter, in particular -- can only do that if a
+    dead API looks like an exception rather than an empty envelope. The
+    error is still logged here, once, before it is re-raised."""
     def boom(url, timeout=None):
         raise OSError("no network")
 
     monkeypatch.setattr(jamendo.urllib.request, "urlopen", boom)
     monkeypatch.setattr(jamendo, "SLEEP", 0)
-    assert jamendo._get("tracks/", id="1") == {}
+    with pytest.raises(OSError):
+        jamendo._get("tracks/", id="1")
 
 
 # ---- Deezer ----

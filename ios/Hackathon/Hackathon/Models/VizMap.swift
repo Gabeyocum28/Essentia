@@ -29,10 +29,15 @@ nonisolated struct VizMap: Decodable {
         let x: Double
         let y: Double
         let groove: [Double]?
+        var source: String? = nil
+        var attributionURL: URL? = nil
 
         var track: Track {
-            Track(trackID: trackID, title: title, artist: artist, album: album,
-                  artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            var t = Track(trackID: trackID, title: title, artist: artist, album: album,
+                          artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            t.source = source
+            t.attributionURL = attributionURL
+            return t
         }
 
         enum CodingKeys: String, CodingKey {
@@ -41,6 +46,8 @@ nonisolated struct VizMap: Decodable {
             case artworkURL = "artwork_url"
             case previewURL = "preview_url"
             case x, y, groove
+            case source
+            case attributionURL = "attribution_url"
         }
     }
 
@@ -57,12 +64,17 @@ nonisolated struct VizMap: Decodable {
         let y: Double
         let groove: [Double]?
         let math: ScoreMath
+        var source: String? = nil
+        var attributionURL: URL? = nil
 
         var id: String { trackID }
 
         var track: Track {
-            Track(trackID: trackID, title: title, artist: artist, album: album,
-                  artworkURL: artworkURL, previewURL: previewURL, score: score)
+            var t = Track(trackID: trackID, title: title, artist: artist, album: album,
+                          artworkURL: artworkURL, previewURL: previewURL, score: score)
+            t.source = source
+            t.attributionURL = attributionURL
+            return t
         }
 
         enum CodingKeys: String, CodingKey {
@@ -71,6 +83,8 @@ nonisolated struct VizMap: Decodable {
             case artworkURL = "artwork_url"
             case previewURL = "preview_url"
             case score, x, y, groove, math
+            case source
+            case attributionURL = "attribution_url"
         }
     }
 

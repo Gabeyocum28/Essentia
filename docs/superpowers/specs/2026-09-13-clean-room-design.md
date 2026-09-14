@@ -56,7 +56,7 @@ Track ids: Deezer ids stay bare (existing corpus); other sources are prefixed `j
 
 - `clap.py`: loads Microsoft CLAP 2023 once; `embed_audio(paths) -> (n, 1024)`; `embed_text(prompts) -> (k, 1024)`; batched.
 - `feel.py`: a prompt bank of contrastive pairs producing continuous scores in [0, 1] as `softmax(cos(audio, pos), cos(audio, neg))`: energy (energetic/calm), valence (happy/sad), tension (tense/relaxed), acoustic (acoustic/electronic), danceable (danceable/not), vocal (vocals/instrumental), brightness (bright/dark), density (busy/sparse), plus the CLAP audio embedding's own cosine. The bank lives in one table so prompts can be tuned by ear.
-- `rhythm.py`: Beat This! → `tempo_bpm`, `beat_strength` (mean beat activation), `downbeat_ratio`; pyloudnorm → `loudness_lufs`, `loudness_range`; librosa → `key`, `mode`, `key_strength`.
+- `rhythm.py`: Beat This! → `tempo_bpm`, `beat_strength` (mean beat activation); pyloudnorm → `loudness_lufs`, `loudness_range`; librosa → `key`, `mode`, `key_strength`. `downbeat_ratio` (this section's original plan) was dropped from the implementation; `loudness_range`, `key`, `mode`, and `key_strength` took its place in `RHYTHM_KEYS` (contract/features.py).
 - `analyze_tracks(paths) -> list[dict | Exception]` returns `{"embedding": (1024,), "feel": (8,), "rhythm": {...}}`. `FEATURES_VERSION = 4`. `contract/features.py FEATURE_KEYS = {"embedding": 1024, "feel": 8}` plus `RHYTHM_KEYS`.
 - The worker gains a `reanalyze` arm: while any live track has `features_version < 4`, it re-downloads and re-analyzes those first (before crawling); progress is logged. Ranking uses only version-4 rows (`store.LIVE` gains `features_version: 4`), so the visible corpus shrinks at cutover and grows back over the re-analysis window.
 

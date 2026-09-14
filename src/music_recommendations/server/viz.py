@@ -8,7 +8,7 @@ keeps neighbourhoods rather than variance); /viz/tour and /viz/extremes stay
 on PCA, because those two are ABOUT the principal components.
 
 PCA over eigen-libraries: the corpus is numpy-sized, the projection is two
-principal components of an (n, 1280) matrix, and we already hold that matrix
+principal components of an (n, 1024) matrix, and we already hold that matrix
 in process (app._MATRIX_CACHE). Rows are L2-normalized first so the picture
 matches the cosine geometry the ranking actually uses — otherwise loudness
 becomes the first principal component.
@@ -200,7 +200,7 @@ def project_2d(matrix: np.ndarray) -> np.ndarray:
 
 
 # Rows per pass of the covariance accumulation. Bounds the float64 working
-# copy (2048 x 1280 x 8 B = 21 MB) while the normalized matrix itself stays
+# copy (2048 x 1024 x 8 B = 16 MB) while the normalized matrix itself stays
 # float32; the seam does not change the answer, only the summation order.
 _PCA_BLOCK = 2048
 
@@ -211,10 +211,10 @@ def project_top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     Same row-normalization, mean-centering, and per-component sign-fixing
     rule as project_2d, extended to all 8 components — columns 0 and 1 agree
     with project_2d's output to float noise (same components as the thin
-    SVD, computed via the 1280×1280 covariance: 7× faster at 8k rows),
+    SVD, computed via the 1024×1024 covariance: 7× faster at 8k rows),
     so one decomposition serves /viz/map, /viz/walk, and /viz/tour.
 
-    Covariance rather than a thin SVD because d is fixed at 1280 while n
+    Covariance rather than a thin SVD because d is fixed at 1024 while n
     grows: `Xc.T @ Xc` is (d, d) whatever n is, and its eigenvectors ARE the
     SVD's right singular vectors with eigenvalues s^2, so `Xc @ V[:, :k]`
     reproduces `U[:, :k] * s[:k]` to float noise. Accumulated in float64 in

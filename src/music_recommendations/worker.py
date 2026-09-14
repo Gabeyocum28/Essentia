@@ -25,9 +25,11 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from music_recommendations.analysis import analyze_tracks
+from music_recommendations.analysis.schema import FEATURES_VERSION
 from music_recommendations.corpus import sources
 from music_recommendations.server import store, viz
 from music_recommendations.server.dedupe import dedupe_key
+from music_recommendations.server.store import VERSION_KEY
 
 CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "300000"))
 CORPUS_BYTES_CAP = int(os.environ.get("CORPUS_BYTES_CAP", str(450 * 1024 * 1024)))
@@ -619,6 +621,27 @@ def seed_fixture_if_empty() -> int:
     return n
 
 
+def prioritize_stale_fixture() -> int:
+    """Boot-time: put every fixture row still on a superseded features
+    version at the FRONT of the re-analysis queue (spec Sec8).
+
+    The fixture is what the app falls back to and what a fresh /seed most
+    often hits, so after an analysis upgrade its rows should be the first
+    the backfill re-analyzes rather than waiting their turn in the ordinary
+    (oldest-analyzed-first) backlog.
+    """
+    ids = [track["track_id"] for track in json.loads(FIXTURE.read_text())["tracks"]]
+    features = store.get_many_features(ids)
+    n = 0
+    for track_id, feats in zip(ids, features):
+        if feats is not None and feats.get(VERSION_KEY, 0) < FEATURES_VERSION:
+            store.prioritize_reanalysis(track_id)
+            n += 1
+    if n:
+        print(f"[worker] fixture: prioritized {n} stale rows for re-analysis", flush=True)
+    return n
+
+
 def crawl_step() -> int:
     """One bounded slice of crawling, round-robin across the active sources.
 
@@ -738,12 +761,24 @@ def _tick() -> None:
         store.requeue_stale()
     except Exception as exc:
         print(f"[worker] requeue_stale error {exc}", flush=True)
-    reanalyzed = reanalyze_step(_reanalyze_budget())
+    # Checked BEFORE the arm runs, and used as-is below: whether this tick's
+    # group ends up fixing every one of these rows or fixing none of them,
+    # a stale row existed when the tick started and crawling cannot help it
+    # -- so the gate must not depend on how the attempt turned out. Reading
+    # `reanalyze_step`'s return value instead was the bug: a group whose
+    # downloads all failed returned 0, which looked exactly like "nothing
+    # stale" and reopened the crawl on a corpus that still could not be shown.
+    try:
+        stale_before = store.stale_count() > 0
+    except Exception as exc:  # noqa: BLE001 - a store blip must not open the gate
+        print(f"[worker] stale_count error {exc}", flush=True)
+        stale_before = True
+    reanalyze_step(_reanalyze_budget())
     try:
         group, leftover = _claim_group()
         if not group and leftover is None:
             global _last_crawl, _crawl_backoff_s
-            if reanalyzed:
+            if stale_before:
                 # A backfill is running. Crawling now would queue tracks the
                 # corpus cannot show yet AND compete with it for the same two
                 # cores; the rotation cursor is in Atlas, so nothing is lost
@@ -784,6 +819,10 @@ def main() -> None:
         seed_fixture_if_empty()
     except Exception as exc:  # noqa: BLE001
         print(f"[worker] seed error {exc}", flush=True)
+    try:
+        prioritize_stale_fixture()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[worker] fixture prioritize error {exc}", flush=True)
     while True:
         _tick()
 

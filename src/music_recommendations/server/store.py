@@ -199,8 +199,8 @@ def _live_since(stamp: datetime) -> dict:
     return {**LIVE, "analyzed_at": {"$gte": stamp}}
 
 
-# The feel vector is eleven probabilities in [0, 1], stored as plain BSON
-# doubles rather than quantized like the embedding: 11 numbers is ~90 bytes a
+# The feel vector is eight probabilities in [0, 1], stored as plain BSON
+# doubles rather than quantized like the embedding: 8 numbers is ~65 bytes a
 # row, and rounding them to four decimals keeps the document small while
 # staying far finer than the heads themselves are calibrated.
 FEEL_DP = 4
@@ -327,8 +327,8 @@ def get_many_feel(track_ids: list[str]) -> list[list[float] | None]:
     """The feel vector per requested id, in order; None where the row has none.
 
     A projection of `feel` alone, deliberately NOT get_many_features: the
-    ranking's feel matrix wants eleven floats a row, and the generic read
-    hands back a 1280-int8 embedding per candidate that has to be
+    ranking's feel matrix wants eight floats a row, and the generic read
+    hands back a 1024-int8 embedding per candidate that has to be
     dequantized to float32 before it can be discarded. Same no-LIVE-filter
     reasoning as get_many_features -- an id asked for by name is answered.
     """

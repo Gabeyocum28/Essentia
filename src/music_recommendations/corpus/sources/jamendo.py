@@ -52,10 +52,17 @@ _call_lock = threading.Lock()
 
 
 def _get(path: str, **params) -> dict:
-    """One GET against the v3 API, rate-limited. Returns {} rather than raising.
+    """One GET against the v3 API, rate-limited. Raises on a transport failure.
 
     The single HTTP choke point for this module: `client_id` and
     `format=json` are added here, and tests stub exactly this function.
+
+    A transport failure (network error, timeout, malformed JSON) is
+    re-raised rather than swallowed into {}: app.search's per-source
+    `failures` counter (and worker.crawl_step's own try/except) need to see
+    this call actually failed, not "this query had zero results" -- the two
+    look identical to every caller here if this returns {} either way, and a
+    Jamendo outage would otherwise skip the fixture fallback silently.
     """
     global _last_call
     query = {"client_id": os.environ.get("JAMENDO_CLIENT_ID", ""),
@@ -75,7 +82,7 @@ def _get(path: str, **params) -> dict:
         # URL itself.
         print(f"[jamendo] {path} failed: {type(exc).__name__}: {exc}",
               flush=True)
-        return {}
+        raise
     if not isinstance(payload, dict):
         return {}
     # Jamendo answers 200 with an error INSIDE the envelope -- a bad client

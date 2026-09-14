@@ -47,7 +47,7 @@ services:
     # and ~2.5 GB resident once torch's allocator is warm, plus Beat This!
     # and a group of decoded 30 s waveforms. Raised from 3g accordingly.
     mem_limit: 4g
-    cpus: 1.0
+    cpus: 2.0
 
 networks:
   web:

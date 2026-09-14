@@ -49,7 +49,7 @@ def centrality(matrix: np.ndarray, metric: str = "cosine") -> np.ndarray:
     """Each row's mean similarity to the whole corpus.
 
     Used to stop `surprise` collapsing onto the same handful of tracks. In a
-    1280-d space some tracks sit far from *everything*, so a plain argmin
+    1024-d space some tracks sit far from *everything*, so a plain argmin
     returns them for every seed regardless of what was seeded — measured on a
     150-track pool, one track was the top answer for 22% of seeds.
 
