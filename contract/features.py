@@ -16,11 +16,27 @@ AXES = [
     {"id": "surprise",    "label": "Nothing like this"},
 ]
 
-# analyze_track(mp3_path) -> dict with exactly these keys.
+# analyze_track(mp3_path) -> dict with exactly these keys, plus "rhythm"
+# (below) and "_features_version".
 FEATURE_KEYS = {
-    "embedding": 1280,   # Discogs-EffNet penultimate layer, patch-mean
-    "feel": 11,          # eleven classifier heads on that embedding, each a
-                         # probability in [0, 1]; see analysis/feel.FEEL_KEYS
-                         # for the dimension order
+    "embedding": 1024,   # Microsoft CLAP audio tower, L2-normalized
+    "feel": 8,           # eight zero-shot contrastive axes on that embedding,
+                         # each a probability in [0, 1]; see
+                         # analysis/feel_v2.FEEL_KEYS for the dimension order
 }
 # Arrays are 1-D float lists/ndarrays of the stated length.
+
+# analyze_track(...)["rhythm"] -> dict with exactly these keys. Unlike the two
+# vectors above these are named, human-readable quantities: the app can show
+# "92 BPM · F minor · -9.4 LUFS" and the ranking can prefer a similar tempo.
+#   tempo_bpm      float, 0.0 when no beat could be found
+#   beat_strength  float in [0, 1], confidence that those beats are real
+#   loudness_lufs  float, integrated BS.1770 loudness, floored at -70
+#   loudness_range float in LU, 0.0 when undefined
+#   key            int 0-11, 0 = C
+#   mode           "major" | "minor"
+#   key_strength   float in [0, 1]; 0 means the key field means nothing
+RHYTHM_KEYS = (
+    "tempo_bpm", "beat_strength", "loudness_lufs", "loudness_range",
+    "key", "mode", "key_strength",
+)

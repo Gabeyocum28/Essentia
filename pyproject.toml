@@ -11,7 +11,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-analysis = ["tensorflow>=2.16"]
+# The v2 analysis stack (CLAP + Beat This! + librosa/pyloudnorm) plus, for
+# now, TensorFlow. TensorFlow is here only to keep the v1 EffNet pipeline and
+# the Essentia parity test runnable until the cutover task deletes them; it
+# is not imported by anything under analysis/v2.py, and removing it is the
+# point of this whole exercise (the EffNet model is non-commercial).
+# Every distribution named here must have a row in docs/THIRD_PARTY.md --
+# tests/test_licences.py enforces that.
+analysis = [
+    "torch>=2.2",
+    "msclap>=1.3",
+    "librosa>=0.10",
+    "pyloudnorm>=0.1",
+    "soxr>=0.3",
+    "beat_this @ git+https://github.com/CPJKU/beat_this",
+    "tensorflow>=2.16",
+]
 dev = ["pytest>=8.0", "httpx>=0.27", "mongomock>=4.3"]
 
 [build-system]

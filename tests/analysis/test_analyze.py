@@ -5,13 +5,13 @@ import importlib.util
 import numpy as np
 
 from music_recommendations.analysis import (FEATURES_VERSION, METRICS,
-                                            analyze_track, analyze_tracks,
-                                            as_json)
+                                            analyze_track_v1,
+                                            analyze_tracks_v1, as_json)
 from tests.analysis.conftest import needs_effnet
 
 
 def test_version_and_metrics():
-    assert FEATURES_VERSION == 3
+    assert FEATURES_VERSION == 4
     assert METRICS == {"embedding": "cosine"}
 
 
@@ -30,7 +30,7 @@ def test_removed_modules_are_gone():
 
 @needs_effnet
 def test_analyze_track_returns_the_embedding_and_the_feel_vector(tone_wav):
-    feats = analyze_track(tone_wav)
+    feats = analyze_track_v1(tone_wav)
     assert set(feats) == {"embedding", "feel"}
     assert feats["embedding"].shape == (1280,)
     assert feats["feel"].shape == (11,)
@@ -46,14 +46,14 @@ def test_analyze_tracks_keeps_a_bad_path_from_sinking_the_group(tone_wav, tmp_pa
     """One unreadable file in a group must not cost the others their
     analysis: its slot holds the exception, the rest hold features, and the
     features are the same ones analyze_track would have produced alone."""
-    out = analyze_tracks([tone_wav, tmp_path / "missing.mp3", tone_wav])
+    out = analyze_tracks_v1([tone_wav, tmp_path / "missing.mp3", tone_wav])
 
     assert isinstance(out[1], Exception)
     for feats in (out[0], out[2]):
         assert set(feats) == {"embedding", "feel"}
         assert feats["embedding"].shape == (1280,)
         assert feats["feel"].shape == (11,)
-    assert np.allclose(out[0]["embedding"], analyze_track(tone_wav)["embedding"],
+    assert np.allclose(out[0]["embedding"], analyze_track_v1(tone_wav)["embedding"],
                        atol=1e-4)
 
 
@@ -74,10 +74,10 @@ def test_missing_feel_heads_cost_the_blend_not_the_analysis(tone_wav, monkeypatc
     monkeypatch.setattr(feel_mod, "feel_vectors", no_heads)
     monkeypatch.setattr(analysis, "_heads_warned", False)
 
-    out = analyze_tracks([tone_wav, tone_wav])
+    out = analyze_tracks_v1([tone_wav, tone_wav])
     assert [set(f) for f in out] == [{"embedding"}, {"embedding"}]
     assert out[0]["embedding"].shape == (1280,)
     # One warning for the process, not one per group or per track.
     assert capsys.readouterr().out.count("feel heads unavailable") == 1
-    analyze_tracks([tone_wav])
+    analyze_tracks_v1([tone_wav])
     assert "feel heads unavailable" not in capsys.readouterr().out

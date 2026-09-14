@@ -36,19 +36,35 @@ def test_track_fields():
 
 def test_feature_keys_are_the_embedding_and_the_feel_vector():
     f = _features()
-    assert f.FEATURE_KEYS == {"embedding": 1280, "feel": 11}
+    assert f.FEATURE_KEYS == {"embedding": 1024, "feel": 8}
 
 
-def test_feel_dimension_matches_the_head_table():
-    """The contract states the width; analysis owns the names. If a head is
+def test_feel_dimension_matches_the_prompt_bank():
+    """The contract states the width; analysis owns the names. If an axis is
     added or dropped without the contract moving, this is where it shows."""
-    from music_recommendations.analysis.feel import FEEL_KEYS
+    from music_recommendations.analysis.feel_v2 import FEEL_KEYS, PROMPT_BANK
     f = _features()
     assert len(FEEL_KEYS) == f.FEATURE_KEYS["feel"]
     assert FEEL_KEYS == [
-        "danceable", "happy", "sad", "aggressive", "relaxed", "party",
-        "acoustic", "electronic", "bright", "tonal", "instrumental",
+        "energy", "valence", "tension", "acoustic",
+        "danceable", "vocal", "bright", "density",
     ]
+    # Every axis is a contrastive pair: a single prompt would score every
+    # track high, because CLAP similarities sit in a narrow positive band.
+    assert [name for name, _p, _n in PROMPT_BANK] == FEEL_KEYS
+    for _name, pos, neg in PROMPT_BANK:
+        assert pos and neg and pos != neg
+
+
+def test_rhythm_keys_match_the_analysis_module():
+    """The seven named numbers the app renders and the ranking reads."""
+    from music_recommendations.analysis.rhythm import RHYTHM_KEYS
+    f = _features()
+    assert f.RHYTHM_KEYS == RHYTHM_KEYS
+    assert f.RHYTHM_KEYS == (
+        "tempo_bpm", "beat_strength", "loudness_lufs", "loudness_range",
+        "key", "mode", "key_strength",
+    )
 
 
 def test_fixture_thirty_contract_tracks():

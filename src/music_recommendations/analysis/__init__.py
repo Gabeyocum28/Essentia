@@ -1,17 +1,23 @@
 """analyze_track: MP3 path in, dict of named feature vectors out (spec §2.1).
 
-analyze_tracks takes several paths and runs them through one packed EffNet
-pass, returning a dict or an exception per path; analyze_track is the
-one-path case of it.
+analyze_tracks takes several paths and runs them through one batched pass,
+returning a dict or an exception per path; analyze_track is the one-path
+case of it.
 
 Pure — no cache, no HTTP, no store access. Callers (server, corpus/ingest)
 decide when to run it and where results live. Returned dict keys must
 match contract/features.py FEATURE_KEYS.
 
+`analyze_tracks` is v2 (analysis/v2.py: CLAP embedding, zero-shot feel,
+rhythm/loudness/key). The v1 EffNet pipeline is still here as
+`analyze_tracks_v1` / `analyze_track_v1` — only so the Essentia parity test
+has something to compare against until the cutover deletes it. Nothing in
+the running system should call the v1 pair.
+
 Callers that persist or compare these vectors also want FEATURES_VERSION
 and METRICS from .schema — the version to know when cached vectors went
 stale, the metrics to know how to compare them. Import them from
-music_recommendations.analysis.schema directly to skip loading TensorFlow.
+music_recommendations.analysis.schema directly to skip loading torch.
 """
 from __future__ import annotations
 
@@ -21,8 +27,30 @@ import numpy as np
 
 from .schema import FEATURES_VERSION, METRICS
 
-__all__ = ["analyze_track", "analyze_tracks", "as_json", "FEATURES_VERSION",
-           "METRICS"]
+__all__ = ["analyze_track", "analyze_tracks", "analyze_track_v1",
+           "analyze_tracks_v1", "as_json", "FEATURES_VERSION", "METRICS"]
+
+
+def analyze_tracks(paths: list[Path | str]) -> list[dict | Exception]:
+    """v2: one slot per path, holding features or that path's exception.
+
+    A thin forwarder rather than `analyze_tracks = v2.analyze_tracks`, so
+    that importing this package stays free: v2 pulls in torch, librosa and
+    ~700 MB of CLAP weights the first time it actually runs, and callers
+    that only want FEATURES_VERSION (the store deciding whether a cached row
+    is stale) must not pay for that.
+    """
+    from . import v2
+
+    return v2.analyze_tracks(paths)
+
+
+def analyze_track(path: Path | str) -> dict:
+    """v2 features for one file: `embedding` (1024,), `feel` (8,),
+    `rhythm` (a dict of the seven RHYTHM_KEYS), `_features_version`."""
+    from . import v2
+
+    return v2.analyze_track(path)
 
 
 _heads_warned = False
@@ -38,7 +66,7 @@ def _warn_missing_heads(exc: Exception) -> None:
           f"analyzed without a feel vector", flush=True)
 
 
-def analyze_tracks(paths: list[Path | str]) -> list[dict | Exception]:
+def analyze_tracks_v1(paths: list[Path | str]) -> list[dict | Exception]:
     """Analyze several files in one inference pass; one slot per input path.
 
     A slot holds either the feature dict or the exception that path raised,
@@ -95,19 +123,35 @@ def analyze_tracks(paths: list[Path | str]) -> list[dict | Exception]:
     return results  # type: ignore[return-value]
 
 
-def analyze_track(mp3_path: Path | str) -> dict:
+def analyze_track_v1(mp3_path: Path | str) -> dict:
     """Run EffNet + the feel heads; returns {"embedding": (1280,) float32,
     "feel": (11,) float32}. "feel" is omitted when the head graphs are not
     installed on this host."""
-    result = analyze_tracks([mp3_path])[0]
+    result = analyze_tracks_v1([mp3_path])[0]
     if isinstance(result, Exception):
         raise result
     return result
 
 
 def as_json(features: dict) -> dict:
-    """Feature dict with ndarrays flattened to lists, for storage or transport."""
-    return {
-        k: v.tolist() if isinstance(v, np.ndarray) else float(v)
-        for k, v in features.items()
-    }
+    """Feature dict with ndarrays flattened to lists, for storage or transport.
+
+    `rhythm` is already a dict of plain numbers and strings and passes
+    through as-is; only the vectors need converting.
+    """
+    out: dict = {}
+    for k, v in features.items():
+        if isinstance(v, np.ndarray):
+            out[k] = v.tolist()
+        elif isinstance(v, dict):
+            out[k] = {kk: (vv if isinstance(vv, str) else
+                           (int(vv) if isinstance(vv, (int, np.integer))
+                            else float(vv)))
+                      for kk, vv in v.items()}
+        elif isinstance(v, str):
+            out[k] = v
+        elif isinstance(v, (int, np.integer)):
+            out[k] = int(v)
+        else:
+            out[k] = float(v)
+    return out

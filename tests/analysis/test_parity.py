@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from music_recommendations.analysis import analyze_track
+from music_recommendations.analysis import analyze_track_v1
 from tests.analysis.conftest import needs_effnet, needs_essentia, run_essentia
 
 FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"
@@ -70,7 +70,7 @@ def test_fixture_tracks_cosine_above_099(tmp_path):
         mp3 = _download(track, tmp_path)
         if mp3 is None:
             continue
-        new = analyze_track(mp3)["embedding"]
+        new = analyze_track_v1(mp3)["embedding"]
         old = _essentia_embedding(mp3, tmp_path / f"{track['track_id']}.npy")
         track_id = track["track_id"]
         title = track["title"]

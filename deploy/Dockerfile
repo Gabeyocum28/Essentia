@@ -19,9 +19,17 @@ COPY src ./src
 COPY contract ./contract
 COPY scripts ./scripts
 COPY --from=web /web/dist ./web/dist
+
+# Torch from the CPU-only index first: the default PyPI wheel drags in the
+# CUDA runtime (~2 GB of it) that a CPU VM will never load. aarch64 wheels
+# for cp311 exist on this index. Installed as its own layer so the rest of
+# the extra resolves against the torch that is already there.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+      torch torchaudio
 RUN pip install --no-cache-dir -e ".[analysis]"
 
-# Bake the EffNet graph so the container needs no network at start.
+# Bake every model file (CLAP, Beat This!, and the v1 EffNet graph) so the
+# container needs no network at start.
 RUN python3 scripts/fetch_models.py
 
 ENV TF_CPP_MIN_LOG_LEVEL=2
