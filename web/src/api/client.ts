@@ -10,13 +10,32 @@ export class ApiError extends Error {
   }
 }
 
+/** 409 from a ranking endpoint: the seed is waiting to be re-analyzed.
+ *
+ * Not an error the user can do anything about and not a failure of ours --
+ * the track was analyzed by a superseded version of the audio model and the
+ * worker is redoing it. The screens retry instead of reporting a fault. */
+export const UNANALYZED = 409;
+
+export function isUnanalyzed(err: unknown): boolean {
+  return err instanceof ApiError && err.status === UNANALYZED;
+}
+
 const BASE = "/api";
 
 async function request<R>(path: string, init?: RequestInit): Promise<R> {
   const res = await fetch(BASE + path, { headers: { "content-type": "application/json" }, ...init });
   if (!res.ok) {
     let detail = res.statusText;
-    try { detail = (await res.json()).detail ?? detail; } catch { /* non-JSON error body */ }
+    try {
+      const body = await res.json();
+      // `detail` is FastAPI's own error shape; `reason` is the flat
+      // {status, track_id, reason} body the 409 unanalyzed-seed handler
+      // sends. Both are strings -- a nested object here is what produced
+      // "409: [object Object]" on screen.
+      const said = body?.detail ?? body?.reason;
+      if (typeof said === "string" && said) detail = said;
+    } catch { /* non-JSON error body */ }
     throw new ApiError(res.status, detail);
   }
   return res.json() as Promise<R>;
@@ -76,6 +95,47 @@ export function storeFeel(value: number): void {
 const feelParam = (feel?: number) =>
   feel === undefined || feel === DEFAULT_FEEL ? undefined : feel;
 
+// ---- the tempo weight ----
+//
+// The same arrangement as the feel weight above, for the same reason: the
+// DEFAULT lives on the server (app.py's TEMPO_DEFAULT) and `tempoParam`
+// omits the parameter at that value, so it can be retuned without shipping
+// a bundle. Separate storage key, because the two sliders are separate
+// decisions -- "same mood" and "same speed" are not the same request.
+export const DEFAULT_TEMPO = 0.2;
+export const TEMPO_MIN = 0;
+export const TEMPO_MAX = 2;
+export const TEMPO_STORAGE_KEY = "essentia.tempo";
+
+/** A user-supplied weight, clamped to the slider's range; DEFAULT_TEMPO if unusable. */
+export function clampTempo(value: unknown): number {
+  if (value === null || value === undefined || value === "") return DEFAULT_TEMPO;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_TEMPO;
+  return Math.min(TEMPO_MAX, Math.max(TEMPO_MIN, n));
+}
+
+/** The weight the user last chose on the Recommendations slider. */
+export function loadStoredTempo(): number {
+  try {
+    const raw = localStorage.getItem(TEMPO_STORAGE_KEY);
+    return raw === null ? DEFAULT_TEMPO : clampTempo(raw);
+  } catch {
+    return DEFAULT_TEMPO;
+  }
+}
+
+export function storeTempo(value: number): void {
+  try {
+    localStorage.setItem(TEMPO_STORAGE_KEY, String(value));
+  } catch {
+    /* localStorage unavailable (private mode, blocked site data) */
+  }
+}
+
+const tempoParam = (tempo?: number) =>
+  tempo === undefined || tempo === DEFAULT_TEMPO ? undefined : tempo;
+
 export const previewUrl = (trackId: string) => `${BASE}/preview/${trackId}`;
 
 // Same-origin mp3 bytes, for SOUND mode only: decodeAudioData needs the
@@ -91,11 +151,22 @@ export function decodeCoords8(b64: string, n: number): Float32Array[] {
 export const api = {
   search: (query: string) => request<{ results: T.Track[] }>(`/search${q({ q: query })}`),
   seed: (track_id: string) => request<T.SeedResponse>("/seed", { method: "POST", body: JSON.stringify({ track_id }) }),
-  axes: () => request<{ axes: T.Axis[] }>("/axes"),
-  recommend: (track_id: string, axis: string, limit = 10, feel?: number) =>
-    request<T.RecommendResponse>(`/recommend${q({ track_id, axis, limit, feel: feelParam(feel) })}`),
-  vizMap: (track_id: string, axis: string, limit = 10, correction?: "on" | "off", feel?: number) =>
-    request<T.VizMap>(`/viz/map${q({ track_id, axis, limit, correction, feel: feelParam(feel) })}`),
+  // `text_search` is this host's capability flag, not part of the axis list:
+  // absent from an older server, in which case the web offers no toggle.
+  axes: () => request<{ axes: T.Axis[]; text_search?: boolean }>("/axes"),
+  // Search the CORPUS by description rather than the catalogue by name: the
+  // phrase is embedded by CLAP's text tower and cosined against every
+  // analyzed track. 503 (an ApiError, with the server's detail) when CLAP is
+  // not loadable on the API host.
+  searchText: (query: string, limit?: number) =>
+    request<{ results: T.Track[] }>(`/search/text${q({ q: query, limit })}`),
+  recommend: (track_id: string, axis: string, limit = 10, feel?: number, tempo?: number) =>
+    request<T.RecommendResponse>(
+      `/recommend${q({ track_id, axis, limit, feel: feelParam(feel), tempo: tempoParam(tempo) })}`),
+  vizMap: (track_id: string, axis: string, limit = 10, correction?: "on" | "off",
+           feel?: number, tempo?: number) =>
+    request<T.VizMap>(
+      `/viz/map${q({ track_id, axis, limit, correction, feel: feelParam(feel), tempo: tempoParam(tempo) })}`),
   vizWalk: (from: string, to: string, k = 8) => request<T.VizWalk>(`/viz/walk${q({ from, to, k })}`),
   vizHistogram: (track_id: string) => request<T.VizHistogram>(`/viz/histogram${q({ track_id })}`),
   vizHubs: (track_id?: string, recs?: string[]) =>

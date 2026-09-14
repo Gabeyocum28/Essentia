@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { fireEvent } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { Insights } from "./Insights";
-import { api, ApiError, DEFAULT_FEEL } from "../api/client";
+import { api, ApiError, DEFAULT_FEEL, DEFAULT_TEMPO } from "../api/client";
 import { PlayerProvider } from "../player/usePlayer";
 import type { VizMap } from "../api/types";
 
@@ -61,8 +61,19 @@ test("shows the unanalyzed message when seed is not ready", async () => {
   renderInsights();
 
   await waitFor(() =>
-    expect(screen.getByText("This track is not analyzed on the server yet.")).toBeInTheDocument(),
+    expect(screen.getByText(/not analyzed on the server yet/)).toBeInTheDocument(),
   );
+});
+
+test("a 409 from vizMap reads as re-analyzing, not as a failure", async () => {
+  vi.mocked(api.seed).mockResolvedValue({ track_id: "42", status: "ready" });
+  vi.mocked(api.vizMap).mockRejectedValue(
+    new ApiError(409, "queued for re-analysis"));
+  renderInsights();
+  await waitFor(() =>
+    expect(screen.getByText(/not analyzed on the server yet/)).toBeInTheDocument(),
+  );
+  expect(screen.queryByText("Something went wrong")).toBeNull();
 });
 
 test("shows the not-analyzed message when vizMap 404s", async () => {
@@ -71,7 +82,7 @@ test("shows the not-analyzed message when vizMap 404s", async () => {
   renderInsights();
 
   await waitFor(() =>
-    expect(screen.getByText("This track is not analyzed on the server yet.")).toBeInTheDocument(),
+    expect(screen.getByText(/not analyzed on the server yet/)).toBeInTheDocument(),
   );
 });
 
@@ -105,7 +116,7 @@ test("uses the feel weight from the query string", async () => {
 
   renderInsights("seed", "energy", "?feel=0.8");
   await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
-  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 0.8);
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 0.8, DEFAULT_TEMPO);
   localStorage.clear();
 });
 
@@ -116,14 +127,14 @@ test("falls back to the stored slider position, then to the default", async () =
 
   const stored = renderInsights();
   await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
-  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 1.5);
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 1.5, DEFAULT_TEMPO);
   stored.unmount();
 
   localStorage.clear();
   vi.mocked(api.vizMap).mockClear();
   renderInsights();
   await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
-  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, DEFAULT_FEEL);
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, DEFAULT_FEEL, DEFAULT_TEMPO);
 });
 
 test("a hand-edited weight in the query string is clamped", async () => {
@@ -132,5 +143,20 @@ test("a hand-edited weight in the query string is clamped", async () => {
 
   renderInsights("seed", "energy", "?feel=99");
   await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
-  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 2);
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 2, DEFAULT_TEMPO);
+});
+
+test("uses the tempo weight from the query string, and clamps a hand-edited one", async () => {
+  vi.mocked(api.seed).mockResolvedValue({ track_id: "seed", status: "ready" });
+  vi.mocked(api.vizMap).mockResolvedValue(makeMap());
+
+  const first = renderInsights("seed", "energy", "?feel=0.8&tempo=1.4");
+  await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, 0.8, 1.4);
+  first.unmount();
+
+  vi.mocked(api.vizMap).mockClear();
+  renderInsights("seed", "energy", "?tempo=99");
+  await waitFor(() => expect(api.vizMap).toHaveBeenCalled());
+  expect(api.vizMap).toHaveBeenCalledWith("seed", "energy", 10, undefined, DEFAULT_FEEL, 2);
 });

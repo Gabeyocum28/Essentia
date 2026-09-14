@@ -52,6 +52,44 @@ struct TrackDecodingTests {
         #expect(track.score == 0.91)
     }
 
+    /// The two contract TRACK_OPTIONAL_FIELDS. The server omits the keys
+    /// entirely when there is nothing to say, so "absent" is the normal case
+    /// and must decode, not throw.
+    @Test func decodesTrackWithoutSourceOrAttribution() throws {
+        let track = try JSONDecoder().decode(Track.self, from: Data(Self.fixtureTrackJSON.utf8))
+        #expect(track.source == nil)
+        #expect(track.attributionURL == nil)
+    }
+
+    @Test func decodesJamendoSourceAndAttribution() throws {
+        let json = """
+        {
+          "track_id": "jamendo:168",
+          "title": "Sunrise",
+          "artist": "Jasmine",
+          "album": "Dawn",
+          "artwork_url": "https://example.com/a.jpg",
+          "preview_url": "https://example.com/a.mp3",
+          "source": "jamendo",
+          "attribution_url": "https://www.jamendo.com/track/168/sunrise"
+        }
+        """
+        let track = try JSONDecoder().decode(Track.self, from: Data(json.utf8))
+        #expect(track.source == "jamendo")
+        #expect(track.attributionURL?.absoluteString == "https://www.jamendo.com/track/168/sunrise")
+    }
+
+    /// The credit line's label comes off the deed URL, never off a field, so
+    /// it cannot drift out of step with the link it points at.
+    @Test func readsTheLicenceOffTheDeedURL() {
+        #expect(licenceLabel(URL(string: "http://creativecommons.org/licenses/by-sa/3.0/")!)
+                == "CC BY-SA 3.0")
+        #expect(licenceLabel(URL(string: "http://creativecommons.org/licenses/by/4.0/")!)
+                == "CC BY 4.0")
+        #expect(licenceLabel(URL(string: "https://www.jamendo.com/track/168/sunrise")!) == nil)
+        #expect(licenceLabel(nil) == nil)
+    }
+
     @Test func decodesAxis() throws {
         let json = """
         { "id": "groove", "label": "Keep the groove" }

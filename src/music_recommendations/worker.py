@@ -1,9 +1,17 @@
-"""The one background process: embed queued tracks, answer attribution jobs,
-and grow the corpus by crawling Deezer whenever the queue is empty.
+"""The one background process: re-analyze superseded rows, embed queued
+tracks, answer attribution jobs, and grow the corpus by crawling the active
+sources whenever the queue is empty.
+
+It is also the ONLY process that loads the CLAP audio tower. The API loads
+at most the text tower (GET /search/text) and hands every unknown seed here
+instead of analyzing it itself.
 
     python -m music_recommendations.worker
 
 Runs on the VM next to the API (deploy/docker-compose.yml). Needs MONGODB_URI.
+
+Which catalogues it crawls is SOURCES (default `deezer`); see
+corpus/sources/__init__.py.
 """
 from __future__ import annotations
 
@@ -12,26 +20,27 @@ import os
 import tempfile
 import time
 import urllib.request
-import wave
 from pathlib import Path
 
 from concurrent.futures import ThreadPoolExecutor
 
 from music_recommendations.analysis import analyze_tracks
-from music_recommendations.corpus import crawl
-from music_recommendations.server import deezer, store, viz
+from music_recommendations.analysis.schema import FEATURES_VERSION
+from music_recommendations.corpus import sources
+from music_recommendations.server import store, viz
 from music_recommendations.server.dedupe import dedupe_key
+from music_recommendations.server.store import VERSION_KEY
 
 CORPUS_CAP = int(os.environ.get("CORPUS_CAP", "300000"))
 CORPUS_BYTES_CAP = int(os.environ.get("CORPUS_BYTES_CAP", str(450 * 1024 * 1024)))
 CRAWL_INTERVAL_S = float(os.environ.get("CRAWL_INTERVAL_S", "60"))
 MAX_QUEUED = 200          # don't flood the queue; the worker drains ~12 tracks/min
 
-# Embed jobs are claimed in groups so their patches can share one 64-patch
-# inference batch: a 30 s preview is 28 patches, so three tracks fill a
-# batch that one track would have left 56% zero padding. Three is also the
-# download fan-out, which keeps the network wait roughly the length of the
-# slowest preview instead of the sum of three.
+# Embed jobs are claimed in groups so the whole group goes through CLAP in
+# one forward pass rather than one per track, and so their previews download
+# in parallel -- the group then costs roughly the slowest download plus one
+# batched inference, not the sum of three of each. It is also the size of a
+# re-analysis group (reanalyze_step).
 GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "3"))
 DOWNLOAD_THREADS = int(os.environ.get("DOWNLOAD_THREADS", "3"))
 FIXTURE = Path(__file__).resolve().parents[2] / "contract" / "fixture.json"
@@ -46,13 +55,23 @@ _crawl_backoff_s = CRAWL_INTERVAL_S
 CRAWL_BACKOFF_MAX_S = 3600.0
 
 
+# A 30 s preview is ~960 KB at 256 kbps, so one megabyte is the whole thing
+# with room to spare -- and analysis only ever reads the first 30 s anyway
+# (Jamendo hands back the FULL track, which can be ten minutes and 20 MB).
+# The Range header asks; the read cap below is what actually holds, because a
+# CDN may ignore Range and answer 200 with the entire file.
+PREVIEW_MAX_BYTES = 1024 * 1024
+
+
 def download_preview(url: str) -> Path:
     fd, name = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
     path = Path(name)
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            path.write_bytes(resp.read())
+        request = urllib.request.Request(
+            url, headers={"Range": f"bytes=0-{PREVIEW_MAX_BYTES - 1}"})
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            path.write_bytes(resp.read(PREVIEW_MAX_BYTES))
     except BaseException:
         # mkstemp already created the file, and the caller only unlinks
         # previews it was handed back — so a failed fetch (expired preview
@@ -70,13 +89,22 @@ def _to_plain(features: dict) -> dict:
 
 
 def _fresh_track(track_id: str) -> dict | None:
-    """Fetch straight from Deezer: preview URLs expire in ~15 min (hdnea
-    token), so a job that waited in the queue would 403 on download if we
-    trusted a stored URL. There is no usable fallback to the store's own
-    record -- store.get_track() always answers "" for preview_url (it is
-    never persisted) -- so a Deezer failure here fails the job outright."""
+    """Fetch straight from the source that owns the id.
+
+    Deezer preview URLs expire in ~15 min (hdnea token), so a job that
+    waited in the queue would 403 on download if we trusted a stored URL.
+    There is no usable fallback to the store's own record --
+    store.get_track() always answers "" for preview_url (it is never
+    persisted) -- so a source failure here fails the job outright.
+
+    The track comes back carrying its `source` and, where the licence asks
+    for one, its `attribution`; store._meta persists both.
+    """
+    source = sources.for_id(track_id)
+    if source is None:
+        return None
     try:
-        return deezer.get_track(track_id)
+        return source.track(track_id)
     except Exception:
         return None
 
@@ -132,10 +160,10 @@ def process_jobs(track_ids: list[str]) -> int:
     stored. Logs and swallows every failure, so one bad track costs only its
     own job and never kills the loop.
 
-    The group exists for the inference batch: EffNet's graph is frozen at 64
-    patches and one 30 s preview is 28 of them, so tracks analyzed alone pay
-    full price for mostly-empty batches. Downloads are issued in parallel for
-    the same reason -- the group is only as fast as its slowest step.
+    The group exists for the inference batch: CLAP embeds the whole group in
+    one forward pass, and the per-track fixed cost of a torch forward is what
+    a group amortizes. Downloads are issued in parallel for the same reason
+    -- the group is only as fast as its slowest step.
 
     Success clears the embed marker (clear_embed_marker) so the track can be
     re-analyzed later (e.g. a features-version bump).
@@ -158,7 +186,7 @@ def process_jobs(track_ids: list[str]) -> int:
         paths = [mp3 for _, _, mp3 in ready]
         try:
             results = _analyze(paths) if paths else []
-        except Exception as exc:  # noqa: BLE001 - a dead graph fails the group
+        except Exception as exc:  # noqa: BLE001 - a dead model fails the group
             results = [exc] * len(paths)
 
         for (track_id, track, _mp3), features in zip(ready, results):
@@ -189,27 +217,212 @@ def process_job(track_id: str) -> bool:
     return process_jobs([track_id]) == 1
 
 
-def _write_wav(samples: "np.ndarray", sample_rate: int) -> Path:
-    """16-bit PCM temp file at the audio's OWN level: MonoLoader wants a
-    path, not an array.
+class UnfetchableTrack(Exception):
+    """This row's audio cannot be obtained, and that is a fact about the ROW.
 
-    Deliberately no normalization. Any gain here — even one shared by every
-    band — moves the counterfactuals away from the level the clean track was
-    analyzed at, and a log-mel front end reads a level shift as a change in
-    the spectrum, folding a constant bias into all ten deltas.
+    No metadata, no source that owns the id, no preview URL any more. Its own
+    type rather than a ValueError so `_classifiable` is a type check and not
+    a string match on an error message.
     """
-    import numpy as np
 
-    fd, name = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    path = Path(name)
-    pcm = np.clip(samples, -1.0, 1.0)
-    with wave.open(str(path), "wb") as out:
-        out.setnchannels(1)
-        out.setsampwidth(2)
-        out.setframerate(sample_rate)
-        out.writeframes((pcm * 32767).astype("<i2").tobytes())
-    return path
+
+def _classifiable(exc: BaseException) -> bool:
+    """Is this failure a verdict about the TRACK, or about the world?
+
+    Only a verdict about the track may ever retire a row (after
+    store.REANALYSIS_MAX_ATTEMPTS of them). A CDN 500, a socket timeout, a
+    broken checkpoint, an Atlas blip -- none of those are evidence that this
+    particular recording is unanalyzable, and charging them to the row is how
+    a bad afternoon quietly deletes a third of the corpus.
+    """
+    if isinstance(exc, UnfetchableTrack):
+        return True
+    # Imported by name, lazily: analysis.v2 pulls numpy and the schema at
+    # module scope but nothing heavy, and a host without the analysis extra
+    # must still be able to run the rest of the worker.
+    try:
+        from music_recommendations.analysis.v2 import DecodeError
+    except Exception:  # noqa: BLE001 - no analysis stack here; nothing is classifiable
+        return False
+    return isinstance(exc, DecodeError)
+
+
+def _reanalyze_one(track_id: str) -> tuple[dict, Path] | Exception:
+    """Stored metadata plus a freshly downloaded preview, or the failure.
+
+    The metadata comes from the STORE, not from the source: this row is
+    already in the corpus, its title/artist/attribution were written when it
+    was crawled, and re-fetching them would turn a re-analysis into a
+    re-crawl. Only the audio has to come back over the network, and only the
+    source can produce a URL for it (Deezer's are 15-minute leases and the
+    store never persists one).
+
+    Runs on a pool thread: nothing here but HTTP and a file write.
+    """
+    try:
+        track = store.get_track(track_id)
+        if track is None:
+            raise UnfetchableTrack("no metadata in the store")
+        source = sources.for_id(track_id)
+        if source is None:
+            raise UnfetchableTrack(f"no source owns {track_id!r}")
+        url = source.preview_url(track_id)
+        if not url:
+            raise UnfetchableTrack("source has no preview for this track any more")
+        # NOT UnfetchableTrack: a download that fails is the network, the CDN
+        # or an expired signature, none of which is a verdict about the track.
+        return track, download_preview(url)
+    except Exception as exc:  # noqa: BLE001 - reported per id by the caller
+        return exc
+
+
+def _fail_reanalysis(track_id: str, exc: Exception) -> None:
+    """Record one failed attempt against this row, and say why.
+
+    Every attempt is recorded because the attempt TIMESTAMP is the queue's
+    backoff key (and because recording one SPENDS any /seed priority stamp,
+    so a row whose preview is dead cannot be handed back every tick): without
+    it a row that fails keeps the head of the sort and the rest of the corpus
+    never gets a turn. Whether the row can ever be RETIRED by this depends on
+    `_classifiable` -- only a verdict about the track counts, and only after
+    store.REANALYSIS_MAX_ATTEMPTS of them. Two network blips plus one
+    DecodeError is one verdict, not three.
+
+    A retired row keeps its old vectors, stays playable by id, and is simply
+    out of the ranking; a later successful put_track clears every one of
+    these fields.
+    """
+    classifiable = _classifiable(exc)
+    print(f"[worker] reanalyze {track_id}: FAILED  {type(exc).__name__}: {exc}"
+          f"{'' if classifiable else '  (not charged against the track)'}",
+          flush=True)
+    try:
+        verdicts = store.record_reanalysis_failure(
+            track_id, f"{type(exc).__name__}: {exc}", classifiable=classifiable)
+    except Exception:  # noqa: BLE001 - a store blip must not kill the group
+        return
+    if classifiable and verdicts >= store.REANALYSIS_MAX_ATTEMPTS:
+        print(f"[worker] reanalyze {track_id}: giving up after {verdicts} "
+              f"failures of its own; the row stays playable but leaves the "
+              f"ranking", flush=True)
+
+
+# The circuit breaker. `analyze_tracks` RAISING (rather than putting an
+# exception in each slot) means the model is broken, not the audio: a missing
+# checkpoint, an OOM, a bad image. That fails instantly and fails every
+# group, so without a breaker the arm spins through the whole corpus at full
+# speed doing nothing but logging. Three consecutive group-wide failures halt
+# it for REANALYZE_HALT_S; the halt is announced once, not every tick.
+REANALYZE_MAX_GROUP_FAILURES = 3
+REANALYZE_HALT_S = 600.0
+_group_failures = 0
+_halted_until = 0.0
+
+
+def _group_failed(exc: BaseException) -> None:
+    """One group-wide analysis failure: count it, and halt at the cap."""
+    global _group_failures, _halted_until
+    _group_failures += 1
+    print(f"[worker] reanalyze: the whole group failed to analyze "
+          f"({type(exc).__name__}: {exc}); no row charged for it", flush=True)
+    if _group_failures >= REANALYZE_MAX_GROUP_FAILURES:
+        _halted_until = time.monotonic() + REANALYZE_HALT_S
+        print(f"[worker] halting the re-analysis arm for "
+              f"{REANALYZE_HALT_S / 60:.0f} min after {_group_failures} "
+              f"group-wide failures; fix the model, or it retries by itself",
+              flush=True)
+
+
+def reanalyze_step(limit: int | None = None) -> int:
+    """Bring up to `limit` (default GROUP_SIZE) stale rows up to the current
+    feature version.
+
+    Stale rows are live-analyzed tracks whose `features_version` is below
+    the current one (store.stale_ids). They are invisible to ranking until
+    this runs -- at a version bump the visible corpus drops to whatever was
+    analyzed by the new stack and refills from here -- so this arm runs
+    before the crawl every tick: re-earning a track we already hold beats
+    discovering one we do not.
+
+    Returns how many rows were brought up to version. Never raises. Failures
+    are attributed carefully, because the cost of getting it wrong is a
+    silently deleted corpus:
+
+      * the whole group failing to analyze charges NOTHING to any row
+        (_group_failed, and the breaker above);
+      * a put_track failure charges nothing either -- the analysis worked,
+        the store did not;
+      * a per-track failure records an attempt, and only a classifiable one
+        can retire the row, at store.REANALYSIS_MAX_ATTEMPTS.
+    """
+    global _group_failures
+    size = GROUP_SIZE if limit is None else limit
+    if size <= 0:
+        return 0
+    if time.monotonic() < _halted_until:
+        return 0
+    try:
+        ids = store.stale_ids(size)
+    except Exception as exc:  # noqa: BLE001 - an Atlas blip is not fatal
+        print(f"[worker] reanalyze error {exc}", flush=True)
+        return 0
+    if not ids:
+        return 0
+
+    started = time.monotonic()
+    ready: list[tuple[str, dict, Path]] = []
+    stored = 0
+    group_failed = False
+    try:
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS) as pool:
+            prepared = list(pool.map(_reanalyze_one, ids))
+        for track_id, outcome in zip(ids, prepared):
+            if isinstance(outcome, Exception):
+                _fail_reanalysis(track_id, outcome)
+                continue
+            track, mp3 = outcome
+            ready.append((track_id, track, mp3))
+
+        paths = [mp3 for _, _, mp3 in ready]
+        if paths:
+            try:
+                results = _analyze(paths)
+            except Exception as exc:  # noqa: BLE001 - the MODEL, not the audio
+                _group_failed(exc)
+                group_failed = True
+                return 0
+        else:
+            results = []
+
+        for (track_id, track, _mp3), features in zip(ready, results):
+            if isinstance(features, Exception):
+                # This path's own slot: the group ran, this file did not.
+                _fail_reanalysis(track_id, features)
+                continue
+            try:
+                store.put_track(track, _to_plain(features))
+            except Exception as exc:  # noqa: BLE001 - the store, not the track
+                print(f"[worker] reanalyze {track_id}: could not store "
+                      f"({type(exc).__name__}: {exc}); leaving the row alone",
+                      flush=True)
+                continue
+            stored += 1
+        if paths:
+            _group_failures = 0          # a group that ran clears the breaker
+        return stored
+    finally:
+        for _, _, mp3 in ready:
+            mp3.unlink(missing_ok=True)
+        if not group_failed:
+            try:
+                remaining = store.stale_count()
+                gave_up = store.reanalysis_failed_count()
+            except Exception:  # noqa: BLE001
+                remaining = gave_up = -1
+            elapsed = time.monotonic() - started
+            print(f"[worker] reanalyzed {stored}, remaining {remaining} "
+                  f"(gave up on {gave_up}; {elapsed:.1f}s for {len(ids)})",
+                  flush=True)
 
 
 # Attribution analysis window. Long enough that the narrowest log-spaced
@@ -228,14 +441,19 @@ def _shared_gain(signals: "list[np.ndarray]", headroom: float = 0.98) -> float:
     return headroom / peak if peak > headroom else 1.0
 
 
-def _embed_waveform(embed_mod, samples: "np.ndarray") -> "np.ndarray":
-    """Mean EffNet embedding of a raw waveform, via a temp wav (the model's
-    loader takes a path). Always cleans the file up."""
-    wav = _write_wav(samples, embed_mod.SAMPLE_RATE)
-    try:
-        return embed_mod.effnet_frames(wav).mean(axis=0)
-    finally:
-        wav.unlink(missing_ok=True)
+def _embed_waveform(samples: "np.ndarray") -> "np.ndarray":
+    """The CLAP embedding of a raw waveform.
+
+    Deliberately no normalization of the samples: any gain here -- even one
+    shared by every band -- moves the counterfactuals away from the level the
+    clean track was analyzed at, and a log-mel front end reads a level shift
+    as a change in the spectrum, folding a constant bias into all ten deltas.
+    The one gain that IS applied is `_shared_gain`, chosen once for the whole
+    set by the caller for exactly that reason.
+    """
+    from music_recommendations.analysis import clap, v2
+
+    return clap.embed_audio([samples], sr=v2.SAMPLE_RATE)[0]
 
 
 def _cosine(a: "np.ndarray", b: "np.ndarray") -> float:
@@ -257,7 +475,7 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
     """
     import numpy as np
 
-    from music_recommendations.analysis import embedding as embed_mod
+    from music_recommendations.analysis import v2
 
     mp3 = None
     try:
@@ -275,7 +493,7 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
         if track is None:
             raise ValueError("no seed metadata in the store or on Deezer")
         mp3 = download_preview(track["preview_url"])
-        audio = embed_mod.load_audio(mp3)          # mono, 16 kHz — model rate
+        audio = v2.decode(mp3)                     # mono float32, 44.1 kHz
 
         edges = viz.band_edges()
         # A long window on purpose: at 2048 the bins are 7.8 Hz and the
@@ -283,7 +501,7 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
         # bands would come out as the same filter and their attributions
         # would be indistinguishable.
         counterfactuals = [
-            viz.band_stop(audio, embed_mod.SAMPLE_RATE, lo_hz, hi_hz,
+            viz.band_stop(audio, v2.SAMPLE_RATE, lo_hz, hi_hz,
                           fft_size=ATTRIBUTION_FFT, hop=ATTRIBUTION_HOP)
             for lo_hz, hi_hz in edges
         ]
@@ -301,13 +519,13 @@ def process_attribution(seed_id: str, rec_id: str) -> bool:
         # differences would land in every delta as a constant. `base` still
         # reports the stored cosine, so the number on screen matches the
         # score the rest of the app shows.
-        reference = _embed_waveform(embed_mod, audio * gain)
+        reference = _embed_waveform(audio * gain)
         reference_similarity = _cosine(reference, rec_vec)
 
         bands = []
         for (lo_hz, hi_hz), filtered in zip(edges, counterfactuals):
             started = time.monotonic()
-            occluded = _embed_waveform(embed_mod, filtered * gain)
+            occluded = _embed_waveform(filtered * gain)
             delta = reference_similarity - _cosine(occluded, rec_vec)
             bands.append({"lo_hz": round(lo_hz, 1), "hi_hz": round(hi_hz, 1),
                           "delta": float(delta)})
@@ -403,39 +621,40 @@ def seed_fixture_if_empty() -> int:
     return n
 
 
-def _grow_roots(roots: list[str], tracks: list[dict]) -> None:
-    """Add up to 5 newly-discovered artist names to the `crawl_roots` state,
-    so the snowball/deep-cuts graph expands from what the corpus actually
-    contains instead of staying pinned to the 8 seed roots forever."""
-    discovered = []
-    for track in tracks:
-        name = track.get("artist")
-        if name and name not in roots and name not in discovered:
-            discovered.append(name)
-        if len(discovered) >= 5:
-            break
-    if not discovered:
-        return
-    state = store.get_state("crawl_roots") or {"names": []}
-    names = list(state.get("names", []))
-    for name in discovered:
-        if name not in names:
-            names.append(name)
-    store.put_state("crawl_roots", {"names": names[:200]})
+def prioritize_stale_fixture() -> int:
+    """Boot-time: put every fixture row still on a superseded features
+    version at the FRONT of the re-analysis queue (spec Sec8).
+
+    The fixture is what the app falls back to and what a fresh /seed most
+    often hits, so after an analysis upgrade its rows should be the first
+    the backfill re-analyzes rather than waiting their turn in the ordinary
+    (oldest-analyzed-first) backlog.
+    """
+    ids = [track["track_id"] for track in json.loads(FIXTURE.read_text())["tracks"]]
+    features = store.get_many_features(ids)
+    n = 0
+    for track_id, feats in zip(ids, features):
+        if feats is not None and feats.get(VERSION_KEY, 0) < FEATURES_VERSION:
+            store.prioritize_reanalysis(track_id)
+            n += 1
+    if n:
+        print(f"[worker] fixture: prioritized {n} stale rows for re-analysis", flush=True)
+    return n
 
 
 def crawl_step() -> int:
-    """One bounded slice of crawling, rotating over three sources: a genre
-    chart, one root's snowball neighbours, or a root's deep album cuts.
+    """One bounded slice of crawling, round-robin across the active sources.
 
-    Breadth (charts across genres), depth (the artist-relatedness graph),
-    and obscurity (album tracks that never show up in a /top or /related
-    call) all keep growing this way. The cursor lives in Atlas so a restart
-    continues where it left off.
+    Each source decides what its own slice is (`Source.candidates`): for
+    Deezer that is the chart / snowball / deep-cuts rotation, for Jamendo a
+    tag list. The cursor lives in Atlas so a restart continues where it left
+    off, and it is divided by the number of sources before being handed
+    over, so every source walks its own rotation one step at a time rather
+    than skipping N-1 of them.
 
-    Runs inline in `_tick`, so a slow Deezer response (or backoff) delays
-    job processing by up to a few minutes -- acceptable for a background
-    crawl, not for the embed/attribution queue it shares the loop with.
+    Runs inline in `_tick`, so a slow API response (or backoff) delays job
+    processing by up to a few minutes -- acceptable for a background crawl,
+    not for the embed/attribution queue it shares the loop with.
     """
     size = store.data_size_bytes()
     if size >= CORPUS_BYTES_CAP or store.corpus_size() >= CORPUS_CAP \
@@ -443,34 +662,18 @@ def crawl_step() -> int:
         if size >= CORPUS_BYTES_CAP:
             print(f"[worker] byte cap reached: {size/1e6:.1f} MB of {CORPUS_BYTES_CAP/1e6:.0f} MB", flush=True)
         return 0
+    active = sources.active()
+    if not active:
+        print("[worker] crawl: no active sources", flush=True)
+        return 0
     state = store.get_state("crawl") or {"step": 0}
     step = int(state.get("step", 0))
-    genres = list(crawl.GENRES)
-    roots_state = store.get_state("crawl_roots")
-    roots = crawl.ROOTS + (roots_state["names"] if roots_state else [])
-    arm = step % 3
-    grow_from = None
-    if arm == 0:
-        genre = genres[(step // 3) % len(genres)]
-        tracks = crawl.from_charts([genre], per_genre=100)
-        source = f"chart {crawl.GENRES[genre]}"
-        grow_from = tracks
-    elif arm == 1:
-        root = roots[(step // 3) % len(roots)]
-        tracks = crawl.snowball([root], hops=1, per_artist=10)
-        source = f"snowball {root}"
-        grow_from = tracks
-    else:
-        root = roots[(step // 3) % len(roots)]
-        ids = crawl.resolve_artists([root])
-        tracks = list(crawl.deep_cuts(ids, albums_per_artist=3))
-        source = f"deep cuts {root}"
+    source = active[step % len(active)]
+    tracks = source.candidates(step // len(active))
     n = _enqueue_new(tracks)
-    if grow_from is not None:
-        _grow_roots(roots, grow_from)
     store.put_state("crawl", {"step": step + 1})
-    print(f"[worker] crawl {source}: {len(tracks)} candidates, {n} queued, "
-          f"{_last_duplicates_skipped} duplicates skipped"
+    print(f"[worker] crawl {source.candidate_label()}: {len(tracks)} candidates, "
+          f"{n} queued, {_last_duplicates_skipped} duplicates skipped"
           f"  db {size/1e6:.1f} MB", flush=True)
     return n
 
@@ -519,11 +722,35 @@ def _run_job(job: tuple[str, str]) -> None:
         print(f"[worker] bad attribution job {payload!r}", flush=True)
 
 
+def _reanalyze_budget() -> int:
+    """How many stale rows this tick may take: one if somebody is queued.
+
+    `queued_count` is one indexed count against the jobs collection, which is
+    cheap next to the group of downloads and a torch forward it decides.
+    A store blip answers "as usual" rather than stalling the backfill.
+    """
+    try:
+        if store.queued_count() > 0:
+            return 1
+    except Exception as exc:  # noqa: BLE001 - not worth stalling the arm over
+        print(f"[worker] queued_count error {exc}", flush=True)
+    return GROUP_SIZE
+
+
 def _tick() -> None:
-    """One loop iteration: sweep stale claims, then claim and process a
-    group of embed jobs (or a single attribution job), if there is any work.
-    When there is none, crawl for more corpus -- rate-limited so we don't
-    hammer Deezer while idle.
+    """One loop iteration: sweep stale claims, re-analyze a group of
+    superseded rows, then claim and process a group of embed jobs (or a
+    single attribution job), if there is any work. When there is none, crawl
+    for more corpus -- rate-limited so we don't hammer the sources while idle.
+
+    The re-analysis arm goes first because a stale row is a track the corpus
+    already paid to discover and currently cannot show; a crawl candidate is
+    one it has not. It does ONE group per tick rather than draining the
+    backlog in a loop, and it SHRINKS to a single row whenever an embed job
+    is waiting: a cold /seed blocks a client for 20 s, and spending that wait
+    behind a full re-analysis group is how a day-long backfill makes the app
+    look broken. The backfill still creeps forward, so it cannot be starved
+    by a busy queue either.
 
     The process_* helpers never raise, but store.dequeue_job (and
     requeue_stale) can (a transient connection error while polling Atlas)
@@ -534,10 +761,29 @@ def _tick() -> None:
         store.requeue_stale()
     except Exception as exc:
         print(f"[worker] requeue_stale error {exc}", flush=True)
+    # Checked BEFORE the arm runs, and used as-is below: whether this tick's
+    # group ends up fixing every one of these rows or fixing none of them,
+    # a stale row existed when the tick started and crawling cannot help it
+    # -- so the gate must not depend on how the attempt turned out. Reading
+    # `reanalyze_step`'s return value instead was the bug: a group whose
+    # downloads all failed returned 0, which looked exactly like "nothing
+    # stale" and reopened the crawl on a corpus that still could not be shown.
+    try:
+        stale_before = store.stale_count() > 0
+    except Exception as exc:  # noqa: BLE001 - a store blip must not open the gate
+        print(f"[worker] stale_count error {exc}", flush=True)
+        stale_before = True
+    reanalyze_step(_reanalyze_budget())
     try:
         group, leftover = _claim_group()
         if not group and leftover is None:
             global _last_crawl, _crawl_backoff_s
+            if stale_before:
+                # A backfill is running. Crawling now would queue tracks the
+                # corpus cannot show yet AND compete with it for the same two
+                # cores; the rotation cursor is in Atlas, so nothing is lost
+                # by not stepping it this tick.
+                return
             if time.monotonic() - _last_crawl >= _crawl_backoff_s:
                 _last_crawl = time.monotonic()
                 try:
@@ -564,10 +810,19 @@ def main() -> None:
         while True:
             time.sleep(60)
     print("[worker] up: embed + attribution jobs, crawling when idle (Ctrl-C to stop)", flush=True)
+    # Deliberately not guarded: a typo in SOURCES, or Jamendo as the only
+    # source with no client id, must stop the process here rather than
+    # surface as a crawl that silently never yields anything.
+    print(f"[worker] sources: {', '.join(s.name for s in sources.active())}",
+          flush=True)
     try:
         seed_fixture_if_empty()
     except Exception as exc:  # noqa: BLE001
         print(f"[worker] seed error {exc}", flush=True)
+    try:
+        prioritize_stale_fixture()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[worker] fixture prioritize error {exc}", flush=True)
     while True:
         _tick()
 

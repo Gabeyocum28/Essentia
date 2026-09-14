@@ -26,6 +26,46 @@ def test_env_example_has_placeholders_only():
     text = (DEPLOY / ".env.example").read_text()
     assert "MONGODB_URI=" in text and "mongodb+srv://" not in text.split("MONGODB_URI=")[1].splitlines()[0]
     assert "PUBLIC_BASE_URL=https://essentia.gabeyocum.com/api" in text
+    # No real credential of any kind, ever, in a committed file.
+    assert "mongodb+srv://" not in text
+
+
+def test_env_example_documents_the_source_switches():
+    """SOURCES is what separates the development catalogue from the one we
+    could ship, so the file a VM is configured from has to name both."""
+    text = (DEPLOY / ".env.example").read_text()
+    assert "SOURCES=deezer" in text
+    assert "JAMENDO_CLIENT_ID=" in text
+    assert text.split("JAMENDO_CLIENT_ID=")[1].splitlines()[0] == ""
+
+
+def test_the_containers_are_sized_for_the_models_they_can_load():
+    """The worker always loads CLAP's audio tower (~2.5 GB resident). The API
+    loads nothing by default but pulls the WHOLE model on the first
+    /search/text when TEXT_SEARCH=1 -- msclap has no text-tower-only load --
+    so its limit has to cover that or the feature OOM-kills the API the first
+    time anyone uses it. Both still fit the 12 GB box beside Caddy."""
+    text = (DEPLOY / "docker-compose.yml").read_text()
+    limits = re.findall(r"mem_limit: (\d+)g", text)
+    assert limits == ["6", "4"]
+
+
+def test_the_image_installs_git_for_the_beat_tracker():
+    """beat_this is installed from a git URL; pip cannot clone without it,
+    and the failure is a build-time one nobody sees until a rebuild."""
+    text = (DEPLOY / "Dockerfile").read_text()
+    apt = next(line for line in text.splitlines()
+               if "ffmpeg" in line and not line.lstrip().startswith("#"))
+    assert "git" in apt.split()
+
+
+def test_the_image_carries_no_tensorflow():
+    text = (DEPLOY / "Dockerfile").read_text()
+    code = "\n".join(line for line in text.splitlines()
+                     if not line.lstrip().startswith("#"))
+    assert "tensorflow" not in code.lower()
+    assert "TF_CPP" not in code
+    assert "scripts/fetch_models.py" in code
 
 
 def test_caddy_block_routes_api_and_strips_prefix():

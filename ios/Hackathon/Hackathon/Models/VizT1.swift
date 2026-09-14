@@ -17,11 +17,16 @@ nonisolated struct VizWalk: Decodable {
         let previewURL: URL?
         let x: Double
         let y: Double
+        var source: String? = nil
+        var attributionURL: URL? = nil
 
         var id: String { trackID }
         var track: Track {
-            Track(trackID: trackID, title: title, artist: artist, album: album,
-                  artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            var t = Track(trackID: trackID, title: title, artist: artist, album: album,
+                          artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            t.source = source
+            t.attributionURL = attributionURL
+            return t
         }
 
         enum CodingKeys: String, CodingKey {
@@ -30,6 +35,8 @@ nonisolated struct VizWalk: Decodable {
             case artworkURL = "artwork_url"
             case previewURL = "preview_url"
             case x, y
+            case source
+            case attributionURL = "attribution_url"
         }
     }
 
@@ -68,11 +75,16 @@ nonisolated struct VizHubs: Decodable {
         let artworkURL: URL?
         let previewURL: URL?
         let count: Int
+        var source: String? = nil
+        var attributionURL: URL? = nil
 
         var id: String { trackID }
         var track: Track {
-            Track(trackID: trackID, title: title, artist: artist, album: album,
-                  artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            var t = Track(trackID: trackID, title: title, artist: artist, album: album,
+                          artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            t.source = source
+            t.attributionURL = attributionURL
+            return t
         }
 
         enum CodingKeys: String, CodingKey {
@@ -80,6 +92,8 @@ nonisolated struct VizHubs: Decodable {
             case title, artist, album, count
             case artworkURL = "artwork_url"
             case previewURL = "preview_url"
+            case source
+            case attributionURL = "attribution_url"
         }
     }
 
@@ -91,11 +105,16 @@ nonisolated struct VizHubs: Decodable {
         let artworkURL: URL?
         let previewURL: URL?
         let centrality: Double
+        var source: String? = nil
+        var attributionURL: URL? = nil
 
         var id: String { trackID }
         var track: Track {
-            Track(trackID: trackID, title: title, artist: artist, album: album,
-                  artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            var t = Track(trackID: trackID, title: title, artist: artist, album: album,
+                          artworkURL: artworkURL, previewURL: previewURL, score: nil)
+            t.source = source
+            t.attributionURL = attributionURL
+            return t
         }
 
         enum CodingKeys: String, CodingKey {
@@ -103,6 +122,8 @@ nonisolated struct VizHubs: Decodable {
             case title, artist, album, centrality
             case artworkURL = "artwork_url"
             case previewURL = "preview_url"
+            case source
+            case attributionURL = "attribution_url"
         }
     }
 

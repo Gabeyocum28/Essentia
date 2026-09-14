@@ -1,11 +1,14 @@
 """Math for GET /viz/map — the demo/debug galaxy of embedding space.
 
-NOT part of contract/contract.md (like GET /). The map is always a 2D PCA of
-the EMBEDDING matrix regardless of axis: the picture answers "where does the
-music lie", the axis only changes which scores are attached to the recs.
+NOT part of contract/contract.md (like GET /). The map is always a 2D
+projection of the EMBEDDING matrix regardless of axis: the picture answers
+"where does the music lie", the axis only changes which scores are attached
+to the recs. /viz/map and /viz/walk draw it with UMAP (project_umap, which
+keeps neighbourhoods rather than variance); /viz/tour and /viz/extremes stay
+on PCA, because those two are ABOUT the principal components.
 
 PCA over eigen-libraries: the corpus is numpy-sized, the projection is two
-principal components of an (n, 1280) matrix, and we already hold that matrix
+principal components of an (n, 1024) matrix, and we already hold that matrix
 in process (app._MATRIX_CACHE). Rows are L2-normalized first so the picture
 matches the cosine geometry the ranking actually uses — otherwise loudness
 becomes the first principal component.
@@ -197,7 +200,7 @@ def project_2d(matrix: np.ndarray) -> np.ndarray:
 
 
 # Rows per pass of the covariance accumulation. Bounds the float64 working
-# copy (2048 x 1280 x 8 B = 21 MB) while the normalized matrix itself stays
+# copy (2048 x 1024 x 8 B = 16 MB) while the normalized matrix itself stays
 # float32; the seam does not change the answer, only the summation order.
 _PCA_BLOCK = 2048
 
@@ -208,10 +211,10 @@ def project_top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     Same row-normalization, mean-centering, and per-component sign-fixing
     rule as project_2d, extended to all 8 components — columns 0 and 1 agree
     with project_2d's output to float noise (same components as the thin
-    SVD, computed via the 1280×1280 covariance: 7× faster at 8k rows),
+    SVD, computed via the 1024×1024 covariance: 7× faster at 8k rows),
     so one decomposition serves /viz/map, /viz/walk, and /viz/tour.
 
-    Covariance rather than a thin SVD because d is fixed at 1280 while n
+    Covariance rather than a thin SVD because d is fixed at 1024 while n
     grows: `Xc.T @ Xc` is (d, d) whatever n is, and its eigenvectors ARE the
     SVD's right singular vectors with eigenvalues s^2, so `Xc @ V[:, :k]`
     reproduces `U[:, :k] * s[:k]` to float noise. Accumulated in float64 in
@@ -273,6 +276,55 @@ def project_top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if total_variance > 0.0:
         variance[:k] = values[:k] / total_variance
     return coords, variance
+
+
+# Below this many rows UMAP has nothing to work with: it builds a k-NN graph
+# on n_neighbors=15 and then optimizes a fuzzy simplicial set over it, so at
+# 20 or 30 points the "neighbourhood" is most of the corpus and the layout is
+# noise with a confident shape. PCA is the honest answer there -- it is also
+# what every fixture-sized test corpus gets.
+UMAP_MIN_ROWS = 50
+UMAP_NEIGHBORS = 15
+UMAP_MIN_DIST = 0.1
+
+
+def project_umap(matrix: np.ndarray, seed: int = 0) -> np.ndarray:
+    """(n, d) -> (n, 2) UMAP coordinates on cosine distance.
+
+    PCA answers "which two directions carry the most variance", which in a
+    1024-d contrastive embedding is a nearly uniform ball: the galaxy came
+    out as one blob because that is genuinely what the top two components
+    look like. UMAP answers a different question -- keep near neighbours
+    near -- and that is the one the picture is being asked.
+
+    `random_state=seed` makes the layout reproducible, which matters because
+    the client redraws the same subset across requests and points jumping
+    between renders reads as a bug. It also forces UMAP single-threaded (it
+    warns about exactly this); at VIZ_MAX rows that is the cost of a stable
+    picture.
+
+    Under UMAP_MIN_ROWS rows it falls back to the top-2 PCA columns rather
+    than erroring: small corpora (every test fixture, a cold deploy) still
+    get a map, just the old one.
+
+    umap is imported inside the function: it pulls numba and llvmlite and
+    costs seconds of JIT on first import, and nothing that merely imports
+    this module for its other primitives should pay that.
+    """
+    matrix = np.asarray(matrix)
+    n = int(matrix.shape[0])
+    if n < UMAP_MIN_ROWS:
+        return np.asarray(project_top8(matrix)[0][:, :2], dtype=float)
+
+    import umap
+
+    reducer = umap.UMAP(n_neighbors=UMAP_NEIGHBORS, min_dist=UMAP_MIN_DIST,
+                        metric="cosine", random_state=int(seed))
+    # Row-normalized first, like every other projection here: cosine is the
+    # geometry the ranking uses, and the metric argument alone would leave
+    # the k-NN graph built on unnormalized rows.
+    return np.asarray(reducer.fit_transform(normalized_rows(matrix)),
+                      dtype=float)
 
 
 def minimum_spanning_tree(matrix: np.ndarray) -> list[tuple[int, int, float]]:
@@ -342,9 +394,13 @@ def score_math(seed_vec: np.ndarray, rec_vec: np.ndarray, metric: str,
 # ---- occlusion attribution (T2.6): which frequencies carry a similarity ----
 
 ATTRIBUTION_BANDS = 10
-# EffNet consumes 16 kHz mono, so the model literally cannot see anything
-# above 8 kHz: bands stop just under that Nyquist rather than at the 12 kHz
-# a 44.1 kHz display spectrogram could show.
+# These edges are a CONTRACT, not a tuning choice: the phone's band-solo
+# player filters with the exact complement of this mask, so changing them
+# silently desynchronizes what the user hears from what the bars claim. They
+# were chosen when the model ran at 16 kHz (nothing above its 8 kHz Nyquist
+# was worth probing); CLAP runs at 44.1 kHz and could see higher, but the
+# audible payoff above 8 kHz on a 30 s lossy preview is small and the cost of
+# moving them is a client change in lockstep.
 ATTRIBUTION_LO_HZ = 60.0
 ATTRIBUTION_HI_HZ = 7800.0
 

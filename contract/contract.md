@@ -10,12 +10,17 @@ POST /seed  { "track_id": "3135556" }
    preview download), warm instant.
 
 GET /axes
-→ { "axes": [ { "id": "sounds_like", "label": "Sounds like this" },
-              { "id": "groove",      "label": "Keep the groove"   },
-              { "id": "surprise",    "label": "Surprise me"       } ] }
+→ { "axes": [ { "id": "sounds_like", "label": "More sounds like this" },
+              { "id": "surprise",    "label": "Nothing like this"      } ],
+    "text_search": false }
 
-GET /recommend?track_id=3135556&axis=groove&limit=10
-→ { "seed_track_id": "3135556", "axis": "groove", "results": [ Track, ... ] }
+   `text_search` says whether THIS HOST can answer GET /search/text (the
+   CLAP text tower costs the API process ~2.5 GB resident, so it is off
+   unless TEXT_SEARCH=1). A client that does not know the key ignores it;
+   a client that offers a "by description" search hides it when false.
+
+GET /recommend?track_id=3135556&axis=surprise&limit=10
+→ { "seed_track_id": "3135556", "axis": "surprise", "results": [ Track, ... ] }
 ```
 
 Every `Track` object is the same shape at every endpoint:

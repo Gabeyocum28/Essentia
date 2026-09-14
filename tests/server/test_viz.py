@@ -6,12 +6,17 @@ scores and math are attached to the recommendations.
 """
 import base64
 import json
+import time
 from pathlib import Path
 
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from statistics import pstdev
+
+from music_recommendations.analysis.feel import FEEL_KEYS
+from music_recommendations.analysis.schema import FEATURES_VERSION
 from music_recommendations.server import app as app_module
 from music_recommendations.server import store, viz
 
@@ -98,6 +103,67 @@ def test_project_top8_handles_single_row():
     assert np.all(np.isfinite(coords8))
 
 
+# ---- project_umap (pure math; the galaxy layout for /viz/map and /viz/walk) ----
+#
+# UMAP costs seconds even at these sizes and pulls numba's JIT in on first
+# import, so the two runs the determinism check needs are computed ONCE for
+# the whole module rather than per test.
+
+def _umap_matrix(n: int = 60, d: int = 24) -> np.ndarray:
+    """Three well-separated blobs -- a layout question UMAP can answer."""
+    rng = np.random.default_rng(0)
+    centres = rng.normal(size=(3, d)).astype(np.float32)
+    return np.stack([centres[i % 3] + 0.1 * rng.normal(size=d).astype(np.float32)
+                     for i in range(n)])
+
+
+@pytest.fixture(scope="module")
+def umap_runs():
+    matrix = _umap_matrix()
+    return matrix, viz.project_umap(matrix), viz.project_umap(matrix)
+
+
+def test_project_umap_shape(umap_runs):
+    matrix, xy, _again = umap_runs
+    assert xy.shape == (len(matrix), 2)
+    assert np.all(np.isfinite(xy))
+
+
+def test_project_umap_is_deterministic_for_a_seed(umap_runs):
+    """The client redraws the same subset across requests; points jumping
+    between renders reads as a bug, not as a different random init."""
+    _matrix, xy, again = umap_runs
+    assert np.allclose(xy, again)
+
+
+def test_project_umap_keeps_neighbourhoods_together(umap_runs):
+    """The whole reason for the change: PCA of a contrastive embedding is a
+    uniform ball, UMAP separates the blobs that are actually there."""
+    matrix, xy, _again = umap_runs
+    labels = np.arange(len(matrix)) % 3
+    within = np.mean([np.linalg.norm(xy[i] - xy[j])
+                      for i in range(len(xy)) for j in range(len(xy))
+                      if i < j and labels[i] == labels[j]])
+    between = np.mean([np.linalg.norm(xy[i] - xy[j])
+                       for i in range(len(xy)) for j in range(len(xy))
+                       if labels[i] != labels[j]])
+    assert within < between
+
+
+def test_project_umap_falls_back_to_pca_below_the_minimum():
+    """Under UMAP_MIN_ROWS the neighbourhood IS the corpus, so the layout
+    would be noise with a confident shape. Every test fixture and every cold
+    deploy lands here, and gets exactly the coordinates it used to."""
+    matrix = np.random.default_rng(1).normal(size=(20, 12))
+    assert 20 < viz.UMAP_MIN_ROWS
+    assert np.allclose(viz.project_umap(matrix), viz.project_top8(matrix)[0][:, :2])
+
+
+def test_project_umap_fallback_matches_project_2d():
+    matrix = np.random.default_rng(2).normal(size=(10, 6))
+    assert np.allclose(viz.project_umap(matrix), viz.project_2d(matrix), atol=1e-6)
+
+
 # ---- minimum_spanning_tree (pure math) ----
 
 def test_minimum_spanning_tree_known_by_inspection():
@@ -161,7 +227,7 @@ def fake_features(i: int, n: int) -> dict:
     v[0] = 1.0
     v[1] = i / max(n - 1, 1)
     v[2] = float(i % 3)
-    return {"embedding": v}
+    return {"embedding": v, "_features_version": FEATURES_VERSION}
 
 
 @pytest.fixture
@@ -198,7 +264,7 @@ def duplicate_corpus(fake_mongo):
         v = [0.0] * 1280
         v[0], v[1] = float(np.cos(theta)), float(np.sin(theta))
         store.put_track({**TRACK, "track_id": track_id, "title": title,
-                         "artist": artist}, {"embedding": v})
+                         "artist": artist}, {"embedding": v, "_features_version": FEATURES_VERSION})
     return VIZ_DUPLICATES
 
 
@@ -775,7 +841,7 @@ def test_viz_subset_is_seed_nearest_and_bounded(fake_mongo, monkeypatch):
     # five tracks on a line; seed "c" in the middle
     vecs = {"a": [1, 0], "b": [0.9, 0.1], "c": [0.7, 0.3], "d": [0.5, 0.5], "e": [0, 1]}
     for tid, v in vecs.items():
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v, "_features_version": FEATURES_VERSION})
     ids, matrix = app_mod._viz_subset("c")
     assert "c" in ids and len(ids) == 3
     assert set(ids) == {"b", "c", "d"}            # the two nearest plus the seed
@@ -789,7 +855,7 @@ def test_viz_subset_without_seed_is_the_first_rows(fake_mongo, monkeypatch):
     from music_recommendations.server import app as app_mod
     monkeypatch.setattr(app_mod, "VIZ_MAX", 2)
     for tid in ("a", "b", "c"):
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": [1.0, 0.0]})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
     ids, matrix = app_mod._viz_subset(None)
     assert ids == ["a", "b"] and matrix.shape == (2, 2)
 
@@ -802,11 +868,11 @@ def test_viz_subset_cache_tracks_a_grown_full_matrix(client, fake_mongo, monkeyp
     from music_recommendations.server import app as app_mod
     monkeypatch.setattr(app_mod, "VIZ_MAX", 10)
     for tid, v in {"a": [1, 0], "b": [0.9, 0.1]}.items():
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v, "_features_version": FEATURES_VERSION})
     ids, _ = app_mod._viz_subset("a")
     assert set(ids) == {"a", "b"}
 
-    store.put_track({**TRACK, "track_id": "c"}, {"embedding": [0.5, 0.5]})
+    store.put_track({**TRACK, "track_id": "c"}, {"embedding": [0.5, 0.5], "_features_version": FEATURES_VERSION})
     # Force _MATRIX_CACHE to grow via a fresh request through the client.
     client.get("/viz/hubs", params={"track_id": "a"})
 
@@ -823,7 +889,7 @@ def test_tour_and_mst_share_the_subset_for_a_seed(client, fake_mongo, monkeypatc
     from music_recommendations.server import app as app_mod
     monkeypatch.setattr(app_mod, "VIZ_MAX", 3)
     for tid, v in {"a": [1, 0], "b": [0.9, 0.1], "c": [0.7, 0.3], "d": [0, 1]}.items():
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v, "_features_version": FEATURES_VERSION})
     tour = client.get("/viz/tour?track_id=a").json()
     mst = client.get("/viz/mst?track_id=a").json()
     assert tour["ids"] == mst["ids"] and len(tour["ids"]) == 3 and "d" not in tour["ids"]
@@ -835,7 +901,7 @@ def test_map_subset_includes_surprise_recs(client, fake_mongo, monkeypatch):
     from music_recommendations.server import app as app_mod
     monkeypatch.setattr(app_mod, "VIZ_MAX", 2)
     for tid, v in {"a": [1, 0], "b": [0.99, 0.01], "c": [0.98, 0.02], "d": [0, 1]}.items():
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v, "_features_version": FEATURES_VERSION})
     body = client.get("/viz/map?track_id=a&axis=surprise&limit=1&correction=off").json()
     rec_ids = {r["track_id"] for r in body["recs"]}
     assert rec_ids <= set(body["points"]["ids"])   # far recs are still drawn
@@ -849,7 +915,7 @@ def test_viz_tour_includes_requested_recs_even_when_far(client, fake_mongo,
     monkeypatch.setattr(app_mod, "VIZ_MAX", 2)
     for tid, v in {"a": [1, 0], "b": [0.99, 0.01], "c": [0.98, 0.02],
                    "d": [0, 1]}.items():
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v, "_features_version": FEATURES_VERSION})
 
     plain = client.get("/viz/tour", params={"track_id": "a"}).json()
     assert "d" not in plain["ids"]
@@ -868,7 +934,7 @@ def test_viz_tour_ignores_unknown_and_overlong_rec_lists(client, fake_mongo,
     from music_recommendations.server import app as app_mod
     monkeypatch.setattr(app_mod, "VIZ_MAX", 2)
     for tid, v in {"a": [1, 0], "b": [0.99, 0.01], "d": [0, 1]}.items():
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v, "_features_version": FEATURES_VERSION})
     body = client.get("/viz/tour",
                       params={"track_id": "a", "recs": "nope, ,d"}).json()
     assert "d" in body["ids"] and "nope" not in body["ids"]
@@ -915,13 +981,13 @@ def test_viz_subset_miss_purges_a_superseded_full_matrix(client, fake_mongo,
     from music_recommendations.server import app as app_mod
     monkeypatch.setattr(app_mod, "VIZ_MAX", 10)
     for tid, v in {"a": [1, 0], "b": [0.9, 0.1]}.items():
-        store.put_track({**TRACK, "track_id": tid}, {"embedding": v})
+        store.put_track({**TRACK, "track_id": tid}, {"embedding": v, "_features_version": FEATURES_VERSION})
     app_mod._viz_subset("a")
     app_mod._viz_subset("b")
     old_matrix = app_mod._MATRIX_CACHE["embedding"].matrix
     assert len(app_mod._SUBSET_CACHE) == 2
 
-    store.put_track({**TRACK, "track_id": "c"}, {"embedding": [0.5, 0.5]})
+    store.put_track({**TRACK, "track_id": "c"}, {"embedding": [0.5, 0.5], "_features_version": FEATURES_VERSION})
     client.get("/viz/hubs", params={"track_id": "a"})      # grows the matrix
 
     assert all(value[0] is not old_matrix
@@ -934,14 +1000,19 @@ def test_viz_subset_miss_purges_a_superseded_full_matrix(client, fake_mongo,
 
 # ---- /viz/map: the feel comparison behind the score ----
 
-FEEL_DIM = 11
+FEEL_DIM = len(FEEL_KEYS)
+
+# Every scored row here carries the same value on all eight dimensions, so
+# the corpus spread the z-score divides by is the population std of the three
+# stored values -- and a raw difference of 0.5 is that many sigma.
+FEEL_SPREAD = pstdev([0.5, 1.0, 0.5])
 
 
 def _feel_track(track_id: str, title: str, theta: float,
                 feel: float | None) -> None:
     v = [0.0] * 1280
     v[0], v[1] = float(np.cos(theta)), float(np.sin(theta))
-    features = {"embedding": v}
+    features = {"embedding": v, "_features_version": FEATURES_VERSION}
     if feel is not None:
         features["feel"] = [feel] * FEEL_DIM
     store.put_track({**TRACK, "track_id": track_id, "title": title,
@@ -961,19 +1032,21 @@ def _map(client, **params):
                                           **params}).json()
 
 
-def test_viz_map_names_the_eleven_feel_dimensions(client, feel_corpus):
+def test_viz_map_names_the_eight_feel_dimensions(client, feel_corpus):
     """The math panel labels the bars from this, rather than keeping its own
-    copy of an order that lives in analysis/registry.HEADS."""
+    copy of an order that lives in analysis/feel.PROMPT_BANK."""
     body = _map(client)
     assert body["feel_keys"] == [
-        "danceable", "happy", "sad", "aggressive", "relaxed", "party",
-        "acoustic", "electronic", "bright", "tonal", "instrumental",
+        "energy", "valence", "tension", "acoustic",
+        "danceable", "vocal", "bright", "density",
     ]
+    assert body["feel_keys"] == list(FEEL_KEYS)
 
 
 def test_viz_map_rec_math_carries_the_feel_comparison(client, feel_corpus):
     math = {rec["track_id"]: rec["math"] for rec in _map(client)["recs"]}
-    assert math["near"]["feel_dist"] == pytest.approx(0.5, abs=1e-3)
+    assert math["near"]["feel_dist"] == pytest.approx(0.5 / FEEL_SPREAD, abs=1e-3)
+    # The bars are the RAW probabilities; only the distance is z-scored.
     assert math["near"]["feel"]["seed"] == [0.5] * FEEL_DIM
     assert math["near"]["feel"]["rec"] == [1.0] * FEEL_DIM
     assert math["feely"]["feel_dist"] == pytest.approx(0.0, abs=1e-3)
@@ -988,7 +1061,7 @@ def test_viz_map_math_says_nothing_where_there_is_no_vector(client, feel_corpus)
 def test_viz_map_reports_the_feel_comparison_even_at_zero_weight(client, feel_corpus):
     """The slider is meant to be turned back down and still explain itself."""
     math = {rec["track_id"]: rec["math"] for rec in _map(client, feel=0)["recs"]}
-    assert math["near"]["feel_dist"] == pytest.approx(0.5, abs=1e-3)
+    assert math["near"]["feel_dist"] == pytest.approx(0.5 / FEEL_SPREAD, abs=1e-3)
 
 
 def test_viz_map_ranking_follows_the_feel_weight(client, feel_corpus):
@@ -1003,3 +1076,265 @@ def test_viz_map_surprise_math_has_the_feel_keys_but_no_comparison(client, feel_
     for rec in body["recs"]:
         assert rec["math"]["feel_dist"] is None
         assert rec["math"]["feel"] is None
+        assert rec["math"]["tempo_dist"] is None
+        assert rec["math"]["rhythm"] is None
+
+
+# ---- the feel distance is z-scored, so no one axis can dominate ----
+
+def _spread_track(track_id: str, theta: float, wide: float, narrow: float) -> None:
+    """One row whose feel is flat except for dimension 0 (which varies a lot
+    across this corpus) and dimension 1 (which barely varies at all)."""
+    v = [0.0] * 1280
+    v[0], v[1] = float(np.cos(theta)), float(np.sin(theta))
+    feel = [0.0] * FEEL_DIM
+    feel[0], feel[1] = wide, narrow
+    store.put_track({**TRACK, "track_id": track_id, "title": track_id,
+                     "artist": f"Artist {track_id}"},
+                    {"embedding": v, "feel": feel,
+                     "_features_version": FEATURES_VERSION})
+
+
+@pytest.fixture
+def spread_corpus(fake_mongo):
+    """Dimension 0 spans 0.5 across the corpus; dimension 1 spans 0.05.
+
+    "wide" differs from the seed by 0.5 on dimension 0; "narrow" by 0.05 on
+    dimension 1. In RAW units that is a 10:1 difference and the wide axis
+    decides the ranking on its own. In standard deviations the two are the
+    same distance -- which is the point: 0.05 on an axis that never moves is
+    as unusual as 0.5 on an axis that always does.
+    """
+    _spread_track("s", 0.00, 0.5, 0.50)
+    _spread_track("wide", 0.30, 1.0, 0.50)
+    _spread_track("narrow", 0.60, 0.5, 0.55)
+
+
+def test_a_wide_feel_dimension_no_longer_dominates(client, spread_corpus):
+    math = {rec["track_id"]: rec["math"] for rec in _map(client)["recs"]}
+    wide, narrow = math["wide"]["feel_dist"], math["narrow"]["feel_dist"]
+    assert wide == pytest.approx(narrow, rel=1e-3)
+    # The raw distances this replaces, for the record: 10x apart.
+    assert (0.5 / FEEL_DIM) == pytest.approx(10 * (0.05 / FEEL_DIM))
+
+
+# ---- /viz/map: the rhythm comparison behind the score ----
+
+def _rhythm_track(track_id: str, theta: float, bpm: float | None) -> None:
+    v = [0.0] * 1280
+    v[0], v[1] = float(np.cos(theta)), float(np.sin(theta))
+    features = {"embedding": v, "_features_version": FEATURES_VERSION}
+    if bpm is not None:
+        features["rhythm"] = {"tempo_bpm": bpm, "beat_strength": 0.9,
+                              "loudness_lufs": -9.4, "loudness_range": 5.0,
+                              "key": 5, "mode": "minor", "key_strength": 0.7}
+    store.put_track({**TRACK, "track_id": track_id, "title": track_id,
+                     "artist": f"Artist {track_id}"}, features)
+
+
+@pytest.fixture
+def rhythm_corpus(fake_mongo):
+    _rhythm_track("s", 0.00, 120.0)
+    _rhythm_track("off", 0.30, 160.0)
+    _rhythm_track("blank", 0.45, None)
+
+
+def test_viz_map_rec_math_carries_the_rhythm_comparison(client, rhythm_corpus):
+    math = {rec["track_id"]: rec["math"] for rec in _map(client)["recs"]}
+    assert math["off"]["tempo_dist"] == pytest.approx(
+        abs(np.log2(120.0 / 160.0)), abs=1e-3)
+    assert math["off"]["rhythm"]["seed"]["tempo_bpm"] == 120.0
+    assert math["off"]["rhythm"]["rec"]["tempo_bpm"] == 160.0
+    # The panel shows the whole dict, not just the number it ranked on.
+    assert math["off"]["rhythm"]["rec"]["mode"] == "minor"
+    assert math["off"]["rhythm"]["rec"]["loudness_lufs"] == -9.4
+
+
+def test_viz_map_rhythm_math_says_nothing_where_there_is_no_tempo(client,
+                                                                  rhythm_corpus):
+    math = {rec["track_id"]: rec["math"] for rec in _map(client)["recs"]}
+    assert math["blank"]["tempo_dist"] is None
+    assert math["blank"]["rhythm"] is None
+
+
+def test_viz_map_reports_the_rhythm_comparison_even_at_zero_weight(client,
+                                                                   rhythm_corpus):
+    math = {rec["track_id"]: rec["math"] for rec in _map(client, tempo=0)["recs"]}
+    assert math["off"]["tempo_dist"] is not None
+
+
+def test_viz_map_ranking_follows_the_tempo_weight(client, rhythm_corpus):
+    assert _viz_rec_ids(client, tempo=0, feel=0)[0] == "off"
+    assert _viz_rec_ids(client, tempo=3, feel=0)[0] == "blank"
+
+
+# ---- the galaxy layout is cached per subset, like every other viz array ----
+
+def test_viz_map_draws_with_project_umap(client, seeded_corpus, monkeypatch):
+    """/viz/map and /viz/walk are the two UMAP consumers; /viz/tour and
+    /viz/extremes stay on PCA because they are ABOUT the components."""
+    calls = []
+    real = viz.project_umap
+    monkeypatch.setattr(viz, "project_umap",
+                        lambda m, seed=0: (calls.append(m.shape), real(m, seed))[1])
+    app_module._UMAP_CACHE.clear()
+    body = client.get("/viz/map", params={"track_id": seeded_corpus[0]["track_id"],
+                                          "axis": "sounds_like"}).json()
+    assert calls, "the map was projected some other way"
+    assert len(body["points"]["x"]) == len(body["points"]["ids"])
+
+
+def test_the_umap_layout_is_computed_once_per_subset(client, seeded_corpus,
+                                                     monkeypatch):
+    """Single-threaded UMAP at VIZ_MAX rows is seconds of work; recomputing
+    it per request would put it in the request path."""
+    calls = []
+    real = viz.project_umap
+    monkeypatch.setattr(viz, "project_umap",
+                        lambda m, seed=0: (calls.append(1), real(m, seed))[1])
+    app_module._UMAP_CACHE.clear()
+    params = {"track_id": seeded_corpus[0]["track_id"], "axis": "sounds_like"}
+    client.get("/viz/map", params=params)
+    client.get("/viz/map", params=params)
+    assert len(calls) == 1
+
+
+def test_the_umap_cache_is_purged_with_the_other_subset_caches(client,
+                                                               seeded_corpus):
+    """It pins a subset matrix exactly as _TOP8_CACHE does, so a superseded
+    entry would hold that memory for as long as the process lives."""
+    tid = seeded_corpus[0]["track_id"]
+    client.get("/viz/map", params={"track_id": tid, "axis": "sounds_like"})
+    assert app_module._UMAP_CACHE
+    store.put_track({**TRACK, "track_id": "grown"},
+                    {"embedding": [1.0] + [0.0] * 1279,
+                     "_features_version": FEATURES_VERSION})
+    app_module._VIZ_SNAPSHOT = None
+    client.get("/viz/map", params={"track_id": tid, "axis": "sounds_like"})
+    live = [value[2] for value in app_module._SUBSET_CACHE.values()]
+    assert all(any(value[0] is subset for subset in live)
+               for value in app_module._UMAP_CACHE.values())
+
+
+# ---- the UMAP layout is computed OFF the request path ----
+#
+# Measured at the VIZ_MAX shape (8000 x 1024 float32): 14.5 s with the fixed
+# seed, 2.2 s without it, on a laptop far faster than the deploy VM. A cold
+# subset therefore answers with PCA and upgrades itself once the background
+# layout lands.
+
+@pytest.fixture
+def big_corpus(fake_mongo):
+    """Enough rows that project_umap does not take its PCA fallback."""
+    n = viz.UMAP_MIN_ROWS + 10
+    for i in range(n):
+        v = [0.0] * 1280
+        v[0], v[1] = float(np.cos(i * 0.05)), float(np.sin(i * 0.05))
+        store.put_track({**TRACK, "track_id": f"b{i}", "title": f"Track {i}",
+                         "artist": f"Artist {i % 7}"},
+                        {"embedding": v, "_features_version": FEATURES_VERSION})
+    return [f"b{i}" for i in range(n)]
+
+
+def _await_umap(timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if app_module._UMAP_CACHE and not app_module._UMAP_PENDING:
+            return
+        time.sleep(0.01)
+    raise AssertionError("the background UMAP layout never landed")
+
+
+# A layout no PCA could produce, so a coordinate can be traced to its source.
+def _stub_umap(matrix, seed=0):
+    return np.full((len(matrix), 2), 42.0)
+
+
+def test_viz_map_serves_pca_until_the_umap_layout_lands(client, big_corpus,
+                                                        monkeypatch):
+    monkeypatch.setattr(viz, "project_umap", _stub_umap)
+    first = client.get("/viz/map", params={"track_id": "b0", "axis": "sounds_like"}).json()
+    assert first["points"]["x"][0] != 42.0, "UMAP ran inside the request"
+
+    _await_umap()
+
+    second = client.get("/viz/map", params={"track_id": "b0", "axis": "sounds_like"}).json()
+    assert second["points"]["x"] == [42.0] * len(second["points"]["ids"])
+    assert second["seed"]["x"] == 42.0
+
+
+def test_the_background_layout_starts_once_per_subset(client, big_corpus,
+                                                      monkeypatch):
+    calls = []
+    monkeypatch.setattr(viz, "project_umap",
+                        lambda m, seed=0: (calls.append(1), _stub_umap(m))[1])
+    params = {"track_id": "b0", "axis": "sounds_like"}
+    client.get("/viz/map", params=params)
+    client.get("/viz/map", params=params)
+    _await_umap()
+    client.get("/viz/map", params=params)
+    assert len(calls) == 1
+
+
+def test_two_subsets_lay_out_one_at_a_time(client, big_corpus, monkeypatch):
+    """Each layout is 2-15 s of single-threaded numba, and the box has two
+    cores it also answers requests with. _UMAP_PENDING only stops a burst
+    against ONE subset from starting several threads; two different subsets
+    are two identities, so without a process-wide lock they run at once and
+    make each other (and the API) slower."""
+    active = []
+    overlap = []
+    runs = []
+
+    def slow_umap(matrix, seed=0):
+        runs.append(id(matrix))
+        active.append(1)
+        if len(active) > 1:
+            overlap.append(len(active))
+        time.sleep(0.15)
+        active.pop()
+        return _stub_umap(matrix)
+
+    monkeypatch.setattr(viz, "project_umap", slow_umap)
+
+    # Two DIFFERENT subset identities: /viz/map's seed-anchored subset for two
+    # seeds far apart on the ring.
+    client.get("/viz/map", params={"track_id": "b0", "axis": "sounds_like"})
+    client.get("/viz/map", params={"track_id": "b30", "axis": "surprise"})
+
+    deadline = time.monotonic() + 10.0
+    while app_module._UMAP_PENDING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not app_module._UMAP_PENDING, "a background layout never finished"
+    # The premise: these really are two separate layouts, not one subset
+    # asked for twice (which _UMAP_PENDING alone would already collapse).
+    assert len(set(runs)) == 2, f"expected two distinct subsets, got {runs}"
+    assert overlap == [], f"{len(overlap)} layouts ran concurrently"
+
+
+def test_a_failed_background_layout_leaves_the_map_on_pca(client, big_corpus,
+                                                          monkeypatch):
+    """A broken layout must not break the endpoint that draws it."""
+    def boom(_matrix, seed=0):
+        raise RuntimeError("numba is unhappy")
+
+    monkeypatch.setattr(viz, "project_umap", boom)
+    body = client.get("/viz/map", params={"track_id": "b0", "axis": "sounds_like"}).json()
+    assert len(body["points"]["x"]) == len(body["points"]["ids"])
+    deadline = time.monotonic() + 5.0
+    while app_module._UMAP_PENDING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not app_module._UMAP_PENDING
+    assert client.get("/viz/map", params={"track_id": "b0",
+                                          "axis": "sounds_like"}).status_code == 200
+
+
+def test_a_small_corpus_still_gets_its_layout_inline(client, seeded_corpus,
+                                                     monkeypatch):
+    """Under UMAP_MIN_ROWS project_umap IS the PCA fallback: nothing to wait
+    for, and no thread worth starting."""
+    monkeypatch.setattr(viz, "project_umap", _stub_umap)
+    body = client.get("/viz/map", params={"track_id": seeded_corpus[0]["track_id"],
+                                          "axis": "sounds_like"}).json()
+    assert body["points"]["x"] == [42.0] * len(body["points"]["ids"])
+    assert not app_module._UMAP_PENDING

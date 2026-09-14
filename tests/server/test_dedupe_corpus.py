@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from music_recommendations.analysis.quantize import to_int8
+from music_recommendations.analysis.schema import FEATURES_VERSION
 from music_recommendations.server import store
 from music_recommendations.server.dedupe import dedupe_key
 
@@ -55,6 +56,7 @@ def corpus(fake_mongo):
             "_id": track_id, "title": title, "artist": artist,
             "analyzed_at": datetime(2026, 9, day), "embedding": data,
             "scale": float(scale), "dedupe_key": dedupe_key(title, artist),
+            "features_version": FEATURES_VERSION,
         })
     return fake_mongo
 

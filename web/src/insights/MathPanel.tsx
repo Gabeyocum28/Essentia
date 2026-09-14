@@ -1,4 +1,29 @@
-import type { VizRec } from "../api/types";
+import type { Rhythm, VizRec } from "../api/types";
+
+// contract/features.py: `key` is 0-11 with 0 = C. Sharps only -- the server
+// sends a pitch class, not a spelling, so there is no enharmonic to choose.
+const NOTES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
+
+/** "F minor", or "—" when key_strength says the estimate means nothing. */
+function keyLabel(r: Rhythm): string {
+  if (!r.key_strength) return "—";
+  return `${NOTES[((r.key % 12) + 12) % 12] ?? "?"} ${r.mode}`;
+}
+
+const bpmLabel = (r: Rhythm) => (r.tempo_bpm > 0 ? `${r.tempo_bpm.toFixed(1)} BPM` : "—");
+const loudnessLabel = (r: Rhythm) =>
+  `${r.loudness_lufs.toFixed(1)} LUFS · LRA ${r.loudness_range.toFixed(1)}`;
+
+/** One "seed / pick" row of the rhythm table. */
+function RhythmRow({ label, seed, rec }: { label: string; seed: string; rec: string }) {
+  return (
+    <div className="rhythm-row">
+      <span className="rhythm-row-label">{label}</span>
+      <span className="mono rhythm-row-seed">{seed}</span>
+      <span className="mono rhythm-row-rec">{rec}</span>
+    </div>
+  );
+}
 
 interface Props {
   rec: VizRec;
@@ -63,6 +88,24 @@ export function MathPanel({ rec, feelKeys }: Props) {
             })}
             {math.feel_dist != null && (
               <p className="mono math-panel-line feel-compare-dist">feel_dist = {math.feel_dist.toFixed(3)}</p>
+            )}
+          </div>
+        </>
+      )}
+      {math.rhythm && (
+        <>
+          <span className="math-panel-key">rhythm</span>
+          <div className="rhythm-compare">
+            <RhythmRow label="tempo" seed={bpmLabel(math.rhythm.seed)}
+                       rec={bpmLabel(math.rhythm.rec)} />
+            <RhythmRow label="key" seed={keyLabel(math.rhythm.seed)}
+                       rec={keyLabel(math.rhythm.rec)} />
+            <RhythmRow label="loudness" seed={loudnessLabel(math.rhythm.seed)}
+                       rec={loudnessLabel(math.rhythm.rec)} />
+            {math.tempo_dist != null && (
+              <p className="mono math-panel-line feel-compare-dist">
+                tempo_dist = {math.tempo_dist.toFixed(3)}
+              </p>
             )}
           </div>
         </>

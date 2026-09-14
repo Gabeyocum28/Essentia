@@ -1,8 +1,16 @@
 """worker.py: embed queued tracks, run attributions, crawl when idle."""
+import json
+from datetime import timedelta
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
+from music_recommendations.analysis.schema import FEATURES_VERSION
 from music_recommendations import worker
+from music_recommendations.corpus import crawl
+from music_recommendations.corpus.sources import deezer as deezer_source
+from music_recommendations.server import deezer as deezer_api
 from music_recommendations.server import store
 
 TRACK = {
@@ -13,7 +21,7 @@ TRACK = {
     "artwork_url": "http://x/a.jpg",
     "preview_url": "http://x/p.mp3",
 }
-FEATURES = {"embedding": [0.1, 0.2]}
+FEATURES = {"embedding": [0.1, 0.2], "_features_version": FEATURES_VERSION}
 
 
 def assert_features_match(track_id: str, expected: dict) -> None:
@@ -32,7 +40,7 @@ def analysis_ok(monkeypatch, tmp_path):
 
 
 def test_process_job_analyzes_stores_and_clears_marker(fake_mongo, analysis_ok, monkeypatch):
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
     store.enqueue_embed("42")
 
     assert worker.process_job("42") is True
@@ -46,7 +54,7 @@ def test_process_job_prefers_fresh_deezer_preview_url(fake_mongo, monkeypatch, t
     re-fetch from Deezer rather than download the URL /seed stored."""
     store.put_track_meta({**TRACK, "preview_url": "http://x/stale.mp3"})
     fresh = {**TRACK, "preview_url": "http://x/fresh.mp3"}
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(fresh))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(fresh))
     monkeypatch.setattr(worker, "analyze_tracks", lambda paths: [dict(FEATURES) for _ in paths])
 
     mp3 = tmp_path / "p.mp3"
@@ -75,7 +83,7 @@ def test_process_job_fails_cleanly_when_deezer_down(fake_mongo, analysis_ok, mon
 
     store.put_track_meta(TRACK)
     store.enqueue_embed("42")
-    monkeypatch.setattr(worker.deezer, "get_track", deezer_down)
+    monkeypatch.setattr(deezer_api, "get_track", deezer_down)
     assert worker.process_job("42") is False
     assert store.get_features("42") is None
     job = fake_mongo.jobs.find_one({"_id": "embed:42"})
@@ -88,7 +96,7 @@ def test_process_job_failure_logs_records_failed_job_never_raises(fake_mongo, mo
 
     store.put_track_meta(TRACK)
     store.enqueue_embed("42")
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
     monkeypatch.setattr(worker, "download_preview", boom)
 
     assert worker.process_job("42") is False
@@ -99,7 +107,7 @@ def test_process_job_failure_logs_records_failed_job_never_raises(fake_mongo, mo
 
 
 def test_process_job_no_metadata_anywhere_fails_cleanly(fake_mongo, monkeypatch):
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: None)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: None)
     assert worker.process_job("42") is False
 
 
@@ -143,43 +151,44 @@ REC = {**TRACK, "track_id": "43", "title": "Flamenco Sketches"}
 
 
 @pytest.fixture
-def embedding_stub(monkeypatch, tmp_path):
-    """Stands in for essentia: 'embeds' audio as its per-band energy, so
-    deleting a band provably changes the vector without loading a model."""
+def clap_stub(monkeypatch, tmp_path):
+    """Stands in for CLAP: 'embeds' a waveform as its per-band energy, so
+    deleting a band provably changes the vector without loading 700 MB of
+    weights. `stub.audio` is what the decoder hands back, so a test can swap
+    in a hot master.
+
+    Attribution runs on the same model the ranking does, which since the
+    cutover is CLAP on 44.1 kHz float waveforms -- no temp wav, no 16 kHz
+    resample, no model-specific file loader.
+    """
     import numpy as np
+
+    from music_recommendations.analysis import clap, v2
 
     mp3 = tmp_path / "seed.mp3"
     mp3.write_bytes(b"mp3")
     monkeypatch.setattr(worker, "download_preview", lambda url: mp3)
 
-    class FakeEmbedding:
-        SAMPLE_RATE = 16000
-
-        @staticmethod
-        def load_audio(path):
-            t = np.arange(16000) / 16000.0
-            return np.sin(2 * np.pi * 200 * t) + np.sin(2 * np.pi * 4000 * t)
-
-        @staticmethod
-        def effnet_frames(path):
-            import wave as wave_mod
-
-            with wave_mod.open(str(path), "rb") as src:
-                raw = src.readframes(src.getnframes())
-            audio = np.frombuffer(raw, dtype="<i2").astype(float)
-            spectrum = np.abs(np.fft.rfft(audio))
-            lows = spectrum[:len(spectrum) // 2].sum()
-            highs = spectrum[len(spectrum) // 2:].sum()
-            return np.array([[lows, highs]])
-
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "music_recommendations.analysis.embedding", FakeEmbedding,
+    sr = v2.SAMPLE_RATE
+    t = np.arange(sr) / float(sr)
+    stub = SimpleNamespace(
+        audio=np.sin(2 * np.pi * 200 * t) + np.sin(2 * np.pi * 4000 * t),
+        embedded=[],
     )
-    monkeypatch.setattr(
-        "music_recommendations.analysis.embedding", FakeEmbedding, raising=False
-    )
-    return FakeEmbedding
+    monkeypatch.setattr(v2, "decode", lambda path: stub.audio)
+
+    def embed_audio(waves, sr=None):
+        out = []
+        for wave in waves:
+            samples = np.asarray(wave, dtype=float)
+            stub.embedded.append(samples)
+            spectrum = np.abs(np.fft.rfft(samples))
+            half = len(spectrum) // 2
+            out.append([spectrum[:half].sum(), spectrum[half:].sum()])
+        return np.asarray(out, dtype=float)
+
+    monkeypatch.setattr(clap, "embed_audio", embed_audio)
+    return stub
 
 
 def test_dequeue_job_gives_embed_work_priority_over_attribution(fake_mongo):
@@ -202,11 +211,11 @@ def test_tick_routes_an_attribution_job(fake_mongo, monkeypatch):
     assert seen == [("42", "43")]
 
 
-def test_process_attribution_writes_one_delta_per_band(fake_mongo, embedding_stub,
+def test_process_attribution_writes_one_delta_per_band(fake_mongo, clap_stub,
                                                        monkeypatch):
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})
-    store.put_track(REC, {"embedding": [1.0, 0.0]})
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track(REC, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
     store.enqueue_attribution("42", "43")
 
     assert worker.process_attribution("42", "43") is True
@@ -227,8 +236,8 @@ def test_process_attribution_writes_one_delta_per_band(fake_mongo, embedding_stu
 
 def test_process_attribution_caches_failure_so_the_phone_stops_polling(fake_mongo,
                                                                        monkeypatch):
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})   # rec never analyzed
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})   # rec never analyzed
 
     assert worker.process_attribution("42", "43") is False
 
@@ -237,39 +246,40 @@ def test_process_attribution_caches_failure_so_the_phone_stops_polling(fake_mong
     assert cached["error"]
 
 
-def test_write_wav_keeps_the_audio_at_its_own_level(tmp_path):
-    """No normalization anywhere: a gain would move the counterfactuals off
+def test_attribution_does_not_normalize_a_quiet_track(fake_mongo, clap_stub,
+                                                      monkeypatch):
+    """No make-up gain anywhere: a gain would move the counterfactuals off
     the level the clean track was analyzed at, and a log-mel front end reads
-    that as a spectral change."""
+    that as a spectral change. A track that already fits stays untouched."""
     import numpy as np
-    import wave as wave_mod
 
-    quiet = 0.25 * np.sin(2 * np.pi * 200 * np.arange(16000) / 16000)
-    path = worker._write_wav(quiet, 16000)
-    try:
-        with wave_mod.open(str(path), "rb") as src:
-            peak = np.abs(np.frombuffer(src.readframes(src.getnframes()),
-                                        dtype="<i2")).max()
-    finally:
-        path.unlink(missing_ok=True)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track(REC, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    clap_stub.audio = clap_stub.audio / np.abs(clap_stub.audio).max() * 0.25
 
-    assert peak == pytest.approx(0.25 * 32767, rel=0.01)
+    assert worker.process_attribution("42", "43") is True
+
+    # The clean reference is the first thing embedded, and it goes in at the
+    # level it was decoded at.
+    assert np.abs(clap_stub.embedded[0]).max() == pytest.approx(0.25, rel=1e-6)
 
 
 def test_attribution_measures_against_an_identically_processed_reference(
-        fake_mongo, embedding_stub, monkeypatch):
-    """Deltas compare wav-vs-wav. Measuring against the stored mp3 embedding
-    would fold the decode difference into all ten bands as a constant."""
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})
-    store.put_track(REC, {"embedding": [1.0, 0.0]})
+        fake_mongo, clap_stub, monkeypatch):
+    """Deltas compare waveform against waveform. Measuring against the stored
+    mp3 embedding would fold the decode difference into all ten bands as a
+    constant."""
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track(REC, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
 
     embeds = []
     original = worker._embed_waveform
 
-    def counting(mod, samples):
+    def counting(samples):
         embeds.append(len(samples))
-        return original(mod, samples)
+        return original(samples)
 
     monkeypatch.setattr(worker, "_embed_waveform", counting)
     assert worker.process_attribution("42", "43") is True
@@ -281,14 +291,14 @@ def test_attribution_measures_against_an_identically_processed_reference(
     assert store.get_attribution("42", "43")["base"] == pytest.approx(1.0)
 
 
-def test_attribution_analyzes_at_the_long_window(fake_mongo, embedding_stub,
+def test_attribution_analyzes_at_the_long_window(fake_mongo, clap_stub,
                                                  monkeypatch):
     """The window is the fix for low-band resolution, so it is pinned here:
     falling back to band_stop's defaults would make neighbouring low bands
     measure the same thing again."""
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})
-    store.put_track(REC, {"embedding": [1.0, 0.0]})
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track(REC, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
 
     seen = []
     original = worker.viz.band_stop
@@ -304,38 +314,475 @@ def test_attribution_analyzes_at_the_long_window(fake_mongo, embedding_stub,
     assert all(k == {"fft_size": 8192, "hop": 4096} for k in seen)
 
 
-def test_attribution_never_clips_a_hot_counterfactual(fake_mongo, embedding_stub,
+def test_attribution_never_clips_a_hot_counterfactual(fake_mongo, clap_stub,
                                                       monkeypatch):
     """Deleting a band that opposed a peak can push the residual above full
     scale. One shared gain keeps every counterfactual inside the rails —
     a clipped sample is broadband distortion charged to that band."""
     import numpy as np
-    import wave as wave_mod
 
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
-    store.put_track(TRACK, {"embedding": [1.0, 0.0]})
-    store.put_track(REC, {"embedding": [1.0, 0.0]})
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
+    store.put_track(TRACK, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    store.put_track(REC, {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
     # A hot master: peaks already at full scale before anything is removed.
-    t = np.arange(16000) / 16000.0
-    hot = np.sin(2 * np.pi * 200 * t) + np.sin(2 * np.pi * 4000 * t)
-    hot = hot / np.abs(hot).max()
-    monkeypatch.setattr(embedding_stub, "load_audio", staticmethod(lambda p: hot))
+    clap_stub.audio = clap_stub.audio / np.abs(clap_stub.audio).max()
 
-    peaks = []
-    original = worker._write_wav
-
-    def spy(samples, sample_rate):
-        path = original(samples, sample_rate)
-        with wave_mod.open(str(path), "rb") as src:
-            raw = src.readframes(src.getnframes())
-        peaks.append(np.abs(np.frombuffer(raw, dtype="<i2")).max())
-        return path
-
-    monkeypatch.setattr(worker, "_write_wav", spy)
     assert worker.process_attribution("42", "43") is True
 
-    assert len(peaks) == 11
-    assert max(peaks) < 32767          # nothing pinned to the rail
+    # One clean reference plus one counterfactual per band, none of them
+    # pinned to the rail.
+    assert len(clap_stub.embedded) == 11
+    assert max(np.abs(s).max() for s in clap_stub.embedded) <= 1.0
+
+
+# ---- the re-analysis arm: bringing a superseded corpus up to version ----
+
+OLD = {"embedding": [0.9, 0.1], "_features_version": FEATURES_VERSION - 1}
+
+
+def _stale(track_id: str, title: str = "Old Take") -> dict:
+    """A row analyzed by the previous stack: live, not retired, out of LIVE."""
+    track = {**TRACK, "track_id": track_id, "title": title}
+    store.put_track(track, dict(OLD))
+    return track
+
+
+@pytest.fixture
+def reanalysis_ok(monkeypatch, tmp_path):
+    """A source that still has every preview, and an analyzer that works."""
+    mp3 = tmp_path / "p.mp3"
+    mp3.write_bytes(b"mp3")
+    monkeypatch.setattr(worker, "download_preview", lambda url: mp3)
+    monkeypatch.setattr(worker, "analyze_tracks",
+                        lambda paths: [dict(FEATURES) for _ in paths])
+    monkeypatch.setattr(deezer_source.DeezerSource, "preview_url",
+                        lambda self, track_id: f"http://x/{track_id}.mp3")
+
+
+def test_stale_rows_are_invisible_until_the_arm_runs(fake_mongo, reanalysis_ok):
+    """The whole reason the arm exists: LIVE demands the current version, so
+    at a bump the corpus a user can be recommended drops to nothing and this
+    is what refills it."""
+    _stale("42")
+    assert list(store.corpus_ids()) == []
+    assert store.stale_count() == 1
+
+    assert worker.reanalyze_step() == 1
+
+    assert list(store.corpus_ids()) == ["42"]
+    assert store.stale_count() == 0
+
+
+def test_reanalyze_step_takes_at_most_one_group(fake_mongo, reanalysis_ok,
+                                                monkeypatch):
+    monkeypatch.setattr(worker, "GROUP_SIZE", 2)
+    for i in range(5):
+        _stale(str(100 + i))
+
+    assert worker.reanalyze_step() == 2
+    assert store.stale_count() == 3
+
+
+def test_reanalyze_keeps_the_metadata_it_already_had(fake_mongo, reanalysis_ok):
+    """A re-analysis is not a re-crawl: only the audio comes back over the
+    network, and the title/artist/attribution written at crawl time stay."""
+    _stale("42")
+    fake_mongo.tracks.update_one(
+        {"_id": "42"},
+        {"$set": {"source": "jamendo",
+                  "attribution": {"source": "jamendo", "url": "http://j/42"}}},
+    )
+
+    assert worker.reanalyze_step() == 1
+
+    row = store.get_track("42")
+    assert row["title"] == "Old Take"
+    assert row["attribution_url"] == "http://j/42"
+    assert_features_match("42", FEATURES)
+
+
+def test_reanalyze_progress_is_logged_with_what_is_left(fake_mongo,
+                                                        reanalysis_ok,
+                                                        monkeypatch, capsys):
+    monkeypatch.setattr(worker, "GROUP_SIZE", 1)
+    _stale("42")
+    _stale("43", "Another")
+
+    worker.reanalyze_step()
+
+    assert "reanalyzed 1, remaining 1" in capsys.readouterr().out
+
+
+def test_a_dead_preview_is_retried_three_times_then_given_up_on(fake_mongo,
+                                                                 monkeypatch):
+    """"No preview URL" is a verdict about this track, so it counts against
+    the row -- but not on the first try: a source having a bad afternoon must
+    not permanently retire a third of the corpus. Three attempts, then out."""
+    _stale("42")
+    monkeypatch.setattr(deezer_source.DeezerSource, "preview_url",
+                        lambda self, track_id: None)
+
+    for attempt in (1, 2):
+        assert worker.reanalyze_step() == 0
+        row = fake_mongo.tracks.find_one({"_id": "42"})
+        assert row["reanalysis_attempts"] == attempt
+        assert "reanalysis_failed_at" not in row    # still in the queue
+        assert store.stale_count() == 1
+
+    assert worker.reanalyze_step() == 0
+    row = fake_mongo.tracks.find_one({"_id": "42"})
+    assert row["reanalysis_attempts"] == store.REANALYSIS_MAX_ATTEMPTS
+    assert "reanalysis_failed_at" in row
+    assert "no preview" in row["reanalysis_error"]
+    assert store.stale_count() == 0               # out of the queue for good
+    assert store.stale_ids(10) == []
+    assert store.reanalysis_failed_count() == 1
+    # ...but the track is still a playable seed with its old vectors.
+    assert store.get_track("42")["title"] == "Old Take"
+    assert store.get_features("42") is not None
+
+
+def test_a_per_track_decode_error_counts_attempts_and_gives_up_at_three(
+        fake_mongo, reanalysis_ok, monkeypatch):
+    """A DecodeError in that path's slot is a verdict about the audio, so it
+    is classifiable -- three attempts, then the row leaves the queue."""
+    from music_recommendations.analysis.v2 import DecodeError
+
+    monkeypatch.setattr(worker, "analyze_tracks",
+                        lambda paths: [DecodeError("not audio") for _ in paths])
+    _stale("42")
+
+    for attempt in (1, 2):
+        assert worker.reanalyze_step() == 0
+        assert fake_mongo.tracks.find_one({"_id": "42"})["reanalysis_attempts"] == attempt
+        assert store.stale_count() == 1
+
+    assert worker.reanalyze_step() == 0
+    assert store.stale_count() == 0
+    assert store.reanalysis_failed_count() == 1
+
+
+def test_an_unclassifiable_per_track_failure_never_gives_up(fake_mongo,
+                                                            reanalysis_ok,
+                                                            monkeypatch):
+    """A download that 500s, or a slot holding some unexpected exception, is
+    not evidence about the TRACK. It counts as an attempt (so the row moves
+    to the back of the queue instead of blocking it) but must never retire
+    the row -- that is how a bad afternoon deletes a corpus."""
+    monkeypatch.setattr(worker, "analyze_tracks",
+                        lambda paths: [OSError("500 from the CDN") for _ in paths])
+    _stale("42")
+
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS + 2):
+        assert worker.reanalyze_step() == 0
+
+    row = fake_mongo.tracks.find_one({"_id": "42"})
+    assert row["reanalysis_attempts"] > store.REANALYSIS_MAX_ATTEMPTS
+    assert "reanalysis_failed_at" not in row
+    assert store.stale_count() == 1
+    assert store.reanalysis_failed_count() == 0
+
+
+def test_a_group_wide_analysis_failure_marks_nothing(fake_mongo, reanalysis_ok,
+                                                     monkeypatch, capsys):
+    """analyze_tracks raising (rather than filling slots) means the MODEL is
+    broken -- a missing checkpoint, an OOM, a bad image. Charging that to the
+    three tracks that happened to be in the group would quietly retire the
+    whole corpus three rows at a time."""
+    def boom(paths):
+        raise RuntimeError("checkpoint missing")
+
+    monkeypatch.setattr(worker, "analyze_tracks", boom)
+    _stale("42")
+    _stale("43", "Another")
+
+    assert worker.reanalyze_step() == 0
+
+    for track_id in ("42", "43"):
+        row = fake_mongo.tracks.find_one({"_id": track_id})
+        assert "reanalysis_failed_at" not in row
+        assert "reanalysis_attempts" not in row
+    assert store.stale_count() == 2
+    assert "checkpoint missing" in capsys.readouterr().out
+
+
+def test_three_group_wide_failures_halt_the_arm_then_it_retries(
+        fake_mongo, reanalysis_ok, monkeypatch, capsys, tmp_path):
+    """A broken model fails every group instantly, so without a breaker the
+    arm spins on the whole corpus at full speed, logging forever."""
+    def boom(paths):
+        raise RuntimeError("checkpoint missing")
+
+    monkeypatch.setattr(worker, "analyze_tracks", boom)
+    _stale("42")
+
+    for _ in range(worker.REANALYZE_MAX_GROUP_FAILURES):
+        assert worker.reanalyze_step() == 0
+    assert "halting the re-analysis arm" in capsys.readouterr().out
+
+    downloaded = []
+    monkeypatch.setattr(worker, "download_preview",
+                        lambda url: downloaded.append(url))
+    assert worker.reanalyze_step() == 0
+    assert downloaded == []                     # nothing even attempted
+    assert "halting" not in capsys.readouterr().out   # said once, not per tick
+
+    # ...and it comes back by itself once the window lapses.
+    worker._halted_until = 0.0
+    monkeypatch.setattr(worker, "analyze_tracks",
+                        lambda paths: [dict(FEATURES) for _ in paths])
+    mp3 = tmp_path / "again.mp3"
+    mp3.write_bytes(b"mp3")
+    monkeypatch.setattr(worker, "download_preview", lambda url: mp3)
+    assert worker.reanalyze_step() == 1
+
+
+def test_one_good_group_resets_the_breaker(fake_mongo, reanalysis_ok,
+                                           monkeypatch):
+    """The count is CONSECUTIVE failures: two blips a day apart are not a
+    broken model, and must not add up to a halt."""
+    calls = {"n": 0}
+
+    def sometimes(paths):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("blip")
+        return [dict(FEATURES) for _ in paths]
+
+    monkeypatch.setattr(worker, "analyze_tracks", sometimes)
+    _stale("42")
+    _stale("43", "Another")
+
+    assert worker.reanalyze_step() == 0
+    assert worker.reanalyze_step() >= 1
+    assert worker._group_failures == 0
+
+
+def test_a_put_track_failure_marks_nothing(fake_mongo, reanalysis_ok,
+                                           monkeypatch, capsys):
+    """The analysis SUCCEEDED; the store is what failed. Marking the row
+    would retire a perfectly good track because Atlas hiccupped."""
+    _stale("42")
+
+    def boom(track, features):
+        raise ConnectionError("atlas down")
+
+    monkeypatch.setattr(store, "put_track", boom)
+
+    assert worker.reanalyze_step() == 0
+    row = fake_mongo.tracks.find_one({"_id": "42"})
+    assert "reanalysis_failed_at" not in row
+    assert "reanalysis_attempts" not in row
+    assert store.stale_count() == 1
+    assert "atlas down" in capsys.readouterr().out
+
+
+def test_a_later_success_clears_the_give_up_mark(fake_mongo, reanalysis_ok):
+    """Otherwise the row would be invisible to the NEXT version bump's
+    backfill as well, forever."""
+    _stale("42")
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS):
+        store.record_reanalysis_failure("42", "DecodeError: not audio",
+                                        classifiable=True)
+    assert store.stale_count() == 0
+
+    store.put_track({**TRACK, "track_id": "42"}, dict(FEATURES))
+
+    assert store.reanalysis_failed_count() == 0
+    assert "42" in store.corpus_ids()
+    assert "reanalysis_attempts" not in fake_mongo.tracks.find_one({"_id": "42"})
+
+
+def test_an_unknown_source_does_not_block_the_queue(fake_mongo, reanalysis_ok):
+    """A namespaced id whose source is no longer in the registry: nothing can
+    ever fetch its audio, so it is classifiable and retires after three."""
+    store.put_track({**TRACK, "track_id": "spotify:9"}, dict(OLD))
+
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS):
+        assert worker.reanalyze_step() == 0
+
+    assert store.stale_count() == 0
+    assert store.reanalysis_failed_count() == 1
+
+
+def test_a_failed_row_goes_to_the_back_of_the_queue(fake_mongo, reanalysis_ok,
+                                                    monkeypatch):
+    """Otherwise a row that fails and is retried keeps the head of an
+    oldest-first queue and the rest of the corpus never gets a turn."""
+    monkeypatch.setattr(worker, "GROUP_SIZE", 1)
+    _stale("42")
+    _stale("43", "Another")
+    monkeypatch.setattr(deezer_source.DeezerSource, "preview_url",
+                        lambda self, track_id: None if track_id == "42" else "http://x/p.mp3")
+
+    assert worker.reanalyze_step() == 0        # took 42, failed
+    assert store.stale_ids(1) == ["43"]        # 42 is now behind it
+    assert worker.reanalyze_step() == 1
+
+
+def test_a_prioritized_row_jumps_the_queue(fake_mongo, reanalysis_ok, monkeypatch):
+    """/seed on a superseded row asks for it by name: a user is waiting on
+    that one track, not on the 19,000 rows in front of it."""
+    monkeypatch.setattr(worker, "GROUP_SIZE", 1)
+    _stale("42")
+    _stale("43", "Another")
+    store.prioritize_reanalysis("43")
+
+    assert store.stale_ids(1) == ["43"]
+    assert worker.reanalyze_step() == 1
+    assert "43" in store.corpus_ids()
+
+
+def test_a_seeded_row_whose_preview_is_dead_does_not_stall_the_backfill(
+        fake_mongo, reanalysis_ok, monkeypatch):
+    """The loop this closes: /seed stamps a priority, the arm takes that row
+    first every tick, the download 404s (unclassifiable, so the row is never
+    retired), and the stamp survives -- so with the budget at 1 during a busy
+    queue the backfill makes ZERO progress, for ever."""
+    monkeypatch.setattr(worker, "GROUP_SIZE", 1)
+    _stale("42")
+    _stale("43", "Another")
+    store.prioritize_reanalysis("42")
+
+    def dead(url):
+        raise OSError("404 from the CDN")
+
+    monkeypatch.setattr(worker, "download_preview", dead)
+    assert store.stale_ids(1) == ["42"]
+
+    assert worker.reanalyze_step() == 0
+
+    # The attempt spent the priority: the next tick moves on, and the row is
+    # still stale work rather than retired.
+    assert store.stale_ids(2)[0] == "43"
+    assert store.stale_count() == 2
+    assert store.reanalysis_failed_count() == 0
+
+
+def test_the_arm_logs_how_many_it_has_given_up_on(fake_mongo, reanalysis_ok,
+                                                  monkeypatch, capsys):
+    """A backfill that is "finishing" only because it retired half the corpus
+    should be visible in the same line that reports progress."""
+    _stale("42")
+    _stale("99", "Given up")
+    for _ in range(store.REANALYSIS_MAX_ATTEMPTS):
+        store.record_reanalysis_failure("99", "DecodeError: not audio",
+                                        classifiable=True)
+
+    worker.reanalyze_step()
+
+    assert "gave up on 1" in capsys.readouterr().out
+
+
+def test_embed_jobs_come_before_the_backfill(fake_mongo, reanalysis_ok,
+                                             monkeypatch):
+    """A cold /seed waits 20 s for the worker. During a day-long backfill it
+    must not spend that wait behind a re-analysis group."""
+    monkeypatch.setattr(worker, "GROUP_SIZE", 3)
+    for i in range(5):
+        _stale(str(200 + i))
+    store.enqueue_embed("42")
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
+
+    worker._tick()
+
+    # The queued embed job was served, and the backfill gave way to it: at
+    # most one stale row was taken this tick, not a full group of three.
+    assert store.get_features("42") is not None
+    assert store.stale_count() >= 4
+
+
+def test_reanalysis_runs_before_the_crawl(fake_mongo, reanalysis_ok, monkeypatch):
+    """A stale row is a track the corpus already paid to discover and cannot
+    currently show; a crawl candidate is one it has not."""
+    _stale("42")
+    crawled = []
+    monkeypatch.setattr(worker, "crawl_step", lambda: crawled.append(1) or 0)
+    monkeypatch.setattr(worker, "_last_crawl", 0.0)
+    # The queue is empty in these tests; don't spend the 5 s poll proving it.
+    monkeypatch.setattr(store, "dequeue_job", lambda timeout=5: None)
+
+    worker._tick()
+
+    assert list(store.corpus_ids()) == ["42"]
+    assert crawled == []
+
+
+def test_a_tick_with_nothing_stale_still_crawls(fake_mongo, monkeypatch):
+    crawled = []
+    monkeypatch.setattr(worker, "crawl_step", lambda: crawled.append(1) or 0)
+    monkeypatch.setattr(worker, "_last_crawl", 0.0)
+    # The queue is empty in these tests; don't spend the 5 s poll proving it.
+    monkeypatch.setattr(store, "dequeue_job", lambda timeout=5: None)
+
+    worker._tick()
+
+    assert crawled == [1]
+
+
+def test_a_tick_whose_reanalysis_group_all_fails_still_does_not_crawl(
+        fake_mongo, monkeypatch):
+    """The bug this guards against: gating the crawl on `reanalyze_step`'s
+    return value (how many rows it FIXED) rather than on whether stale rows
+    still exist meant a group whose downloads all failed looked exactly like
+    "nothing was stale" and reopened the crawl on a corpus that still could
+    not be shown."""
+    _stale("42")
+    monkeypatch.setattr(deezer_source.DeezerSource, "preview_url",
+                        lambda self, track_id: None)   # every download fails
+    crawled = []
+    monkeypatch.setattr(worker, "crawl_step", lambda: crawled.append(1) or 0)
+    monkeypatch.setattr(worker, "_last_crawl", 0.0)
+    monkeypatch.setattr(store, "dequeue_job", lambda timeout=5: None)
+
+    worker._tick()
+
+    assert store.stale_count() == 1     # still stale: the download failed
+    assert crawled == []                # and the crawl must not have opened
+
+
+def test_a_store_blip_in_the_arm_is_not_fatal(fake_mongo, monkeypatch):
+    def boom(limit):
+        raise ConnectionError("atlas blip")
+
+    monkeypatch.setattr(store, "stale_ids", boom)
+    assert worker.reanalyze_step() == 0
+
+
+def test_prioritize_stale_fixture_jumps_stale_fixture_rows_to_the_front(
+        fake_mongo, reanalysis_ok):
+    """Boot-time, after an analysis upgrade: the fixture is what a fresh
+    /seed most often hits, so its stale rows should be re-analyzed before
+    the ordinary backlog (spec Sec8), not wait their turn behind whatever
+    else the corpus already had queued for re-analysis."""
+    fixture_tracks = json.loads(worker.FIXTURE.read_text())["tracks"]
+    fixture_id = fixture_tracks[0]["track_id"]
+    store.put_track({**TRACK, "track_id": fixture_id}, dict(OLD))
+    # A backlog row, analyzed long before the fixture row -- the ordinary
+    # sort would serve this one first.
+    _stale("999", "Backlog Row")
+    fake_mongo.tracks.update_one(
+        {"_id": "999"}, {"$set": {"analyzed_at": store._now() - timedelta(days=1)}})
+
+    n = worker.prioritize_stale_fixture()
+
+    assert n == 1
+    assert store.stale_ids(limit=10)[0] == fixture_id
+
+
+def test_prioritize_stale_fixture_ignores_rows_already_current(fake_mongo):
+    fixture_tracks = json.loads(worker.FIXTURE.read_text())["tracks"]
+    fixture_id = fixture_tracks[0]["track_id"]
+    store.put_track({**TRACK, "track_id": fixture_id}, dict(FEATURES))
+
+    assert worker.prioritize_stale_fixture() == 0
+
+
+def test_prioritize_stale_fixture_ignores_unanalyzed_fixture_rows(fake_mongo):
+    """A fixture id with no row at all (nothing analyzed yet, or freshly
+    queued by seed_fixture_if_empty) is not stale -- there is nothing to
+    prioritize, only something to wait for."""
+    assert worker.prioritize_stale_fixture() == 0
 
 
 # ---- crawl + first-boot seed ----
@@ -371,17 +818,17 @@ def test_seed_fixture_if_empty_enqueues_the_distinct_fixture_tracks_once(fake_mo
 
 
 def test_seed_fixture_skipped_when_corpus_has_tracks(fake_mongo):
-    store.put_track(_tracks(["x"])[0], {"embedding": [1.0]})
+    store.put_track(_tracks(["x"])[0], {"embedding": [1.0], "_features_version": FEATURES_VERSION})
     assert worker.seed_fixture_if_empty() == 0
 
 
 def test_crawl_step_enqueues_unseen_tracks_and_advances_cursor(fake_mongo, monkeypatch):
     calls = []
-    monkeypatch.setattr(worker.crawl, "from_charts",
+    monkeypatch.setattr(crawl, "from_charts",
                         lambda genre_ids, per_genre=100: (calls.append(("charts", genre_ids)), _tracks(["1", "2", "3"]))[1])
-    monkeypatch.setattr(worker.crawl, "snowball",
+    monkeypatch.setattr(crawl, "snowball",
                         lambda root_names, hops=1, per_artist=10: (calls.append(("snowball", root_names)), _tracks(["3", "4"]))[1])
-    store.put_track(_tracks(["2"])[0], {"embedding": [1.0]})      # already analyzed
+    store.put_track(_tracks(["2"])[0], {"embedding": [1.0], "_features_version": FEATURES_VERSION})      # already analyzed
     assert worker.crawl_step() == 2                                 # 1 and 3
     assert store.get_state("crawl") == {"step": 1}
     assert worker.crawl_step() == 1                                 # 4 (3 is queued already)
@@ -394,15 +841,15 @@ def test_crawl_step_rotates_three_arms(fake_mongo, monkeypatch):
     """step % 3 picks the source: charts, snowball, then deep cuts (resolve
     the root's artist id, then album tracks) -- each indexed by step // 3."""
     calls = []
-    monkeypatch.setattr(worker.crawl, "from_charts",
+    monkeypatch.setattr(crawl, "from_charts",
                         lambda genre_ids, per_genre=100:
                             (calls.append(("charts", genre_ids, per_genre)), _tracks(["c1"]))[1])
-    monkeypatch.setattr(worker.crawl, "snowball",
+    monkeypatch.setattr(crawl, "snowball",
                         lambda root_names, hops=1, per_artist=10:
                             (calls.append(("snowball", root_names, hops, per_artist)), _tracks(["s1"]))[1])
-    monkeypatch.setattr(worker.crawl, "resolve_artists",
+    monkeypatch.setattr(crawl, "resolve_artists",
                         lambda names: (calls.append(("resolve", names)), [999])[1])
-    monkeypatch.setattr(worker.crawl, "deep_cuts",
+    monkeypatch.setattr(crawl, "deep_cuts",
                         lambda artist_ids, albums_per_artist=6:
                             (calls.append(("deep_cuts", artist_ids, albums_per_artist)), iter(_tracks(["d1"])))[1])
 
@@ -427,7 +874,7 @@ def test_crawl_roots_grow_from_discovered_artists(fake_mongo, monkeypatch):
     discovered = _tracks(["1", "2", "3", "4", "5", "6"])
     for i, track in enumerate(discovered):
         track["artist"] = f"Artist {i}"
-    monkeypatch.setattr(worker.crawl, "from_charts",
+    monkeypatch.setattr(crawl, "from_charts",
                         lambda genre_ids, per_genre=100: discovered)
 
     worker.crawl_step()
@@ -438,12 +885,12 @@ def test_crawl_roots_grow_from_discovered_artists(fake_mongo, monkeypatch):
 
     # A later snowball arm picks its root from ROOTS + crawl_roots: put the
     # cursor at an index that only exists once the grown name is appended.
-    combined_len = len(worker.crawl.ROOTS) + len(grown["names"])
+    combined_len = len(crawl.ROOTS) + len(grown["names"])
     grown_index = combined_len - 1                    # the newly grown name
     step = grown_index * 3 + 1                         # arm 1 == snowball
     store.put_state("crawl", {"step": step})
     seen_roots = []
-    monkeypatch.setattr(worker.crawl, "snowball",
+    monkeypatch.setattr(crawl, "snowball",
                         lambda root_names, hops=1, per_artist=10:
                             (seen_roots.append(root_names), [])[1] or [])
     worker.crawl_step()
@@ -455,7 +902,7 @@ def test_crawl_roots_cap_at_two_hundred(fake_mongo):
     tracks = _tracks(["1", "2", "3", "4", "5"])
     for i, track in enumerate(tracks):
         track["artist"] = f"New {i}"
-    worker._grow_roots(list(worker.crawl.ROOTS), tracks)
+    deezer_source._grow_roots(list(crawl.ROOTS), tracks)
     assert len(store.get_state("crawl_roots")["names"]) == 200
 
 
@@ -501,7 +948,7 @@ def _edition(track_id, title, artist="Miles Davis"):
 
 
 def test_enqueue_new_skips_a_re_release_of_a_stored_track(fake_mongo):
-    store.put_track(_edition("1", "So What"), {"embedding": [1.0]})
+    store.put_track(_edition("1", "So What"), {"embedding": [1.0], "_features_version": FEATURES_VERSION})
     assert worker._enqueue_new([_edition("2", "So What (2009 Remaster)")]) == 0
     assert store.queued_count() == 0
     assert store.get_track("2") is None          # no metadata written either
@@ -518,7 +965,7 @@ def test_enqueue_new_queues_one_of_two_editions_in_the_same_batch(fake_mongo):
 
 
 def test_enqueue_new_keeps_a_cover_by_another_artist(fake_mongo):
-    store.put_track(_edition("1", "So What"), {"embedding": [1.0]})
+    store.put_track(_edition("1", "So What"), {"embedding": [1.0], "_features_version": FEATURES_VERSION})
     assert worker._enqueue_new([_edition("2", "So What", artist="Ron Carter")]) == 1
 
 
@@ -533,7 +980,7 @@ def test_enqueue_new_reads_existing_keys_in_one_batch(fake_mongo, monkeypatch):
 
 
 def test_crawl_step_logs_duplicates_skipped(fake_mongo, monkeypatch, capsys):
-    monkeypatch.setattr(worker.crawl, "from_charts",
+    monkeypatch.setattr(crawl, "from_charts",
                         lambda genre_ids, per_genre=100: [
                             _edition("1", "So What"),
                             _edition("2", "So What (Remastered)"),
@@ -544,7 +991,7 @@ def test_crawl_step_logs_duplicates_skipped(fake_mongo, monkeypatch, capsys):
 
 def test_crawl_step_respects_corpus_cap_and_queue_depth(fake_mongo, monkeypatch):
     monkeypatch.setattr(worker, "CORPUS_CAP", 1)
-    store.put_track(_tracks(["x"])[0], {"embedding": [1.0]})
+    store.put_track(_tracks(["x"])[0], {"embedding": [1.0], "_features_version": FEATURES_VERSION})
     assert worker.crawl_step() == 0
     monkeypatch.setattr(worker, "CORPUS_CAP", 100000)
     monkeypatch.setattr(worker, "MAX_QUEUED", 1)
@@ -574,7 +1021,7 @@ def test_tick_crawls_only_when_idle_and_rate_limited(fake_mongo, monkeypatch):
 def test_crawl_step_stops_at_the_byte_cap(fake_mongo, monkeypatch):
     monkeypatch.setattr(worker, "CORPUS_BYTES_CAP", 10)
     monkeypatch.setattr(worker.store, "data_size_bytes", lambda: 11)
-    monkeypatch.setattr(worker.crawl, "from_charts", lambda *a, **k: _tracks(["1"]))
+    monkeypatch.setattr(crawl, "from_charts", lambda *a, **k: _tracks(["1"]))
     assert worker.crawl_step() == 0
 
 
@@ -587,7 +1034,7 @@ def group_ok(monkeypatch, tmp_path):
     mp3 = tmp_path / "p.mp3"
     mp3.write_bytes(b"mp3")
     monkeypatch.setattr(worker, "download_preview", lambda url: mp3)
-    monkeypatch.setattr(worker.deezer, "get_track",
+    monkeypatch.setattr(deezer_api, "get_track",
                         lambda t: {**TRACK, "track_id": t})
     calls = []
     monkeypatch.setattr(worker, "analyze_tracks",
@@ -641,7 +1088,7 @@ def test_group_isolates_a_failed_download(fake_mongo, group_ok, monkeypatch,
 
     monkeypatch.setattr(worker, "download_preview", flaky_download)
     monkeypatch.setattr(
-        worker.deezer, "get_track",
+        deezer_api, "get_track",
         lambda t: {**TRACK, "track_id": t, "preview_url": f"http://x/{t}.mp3"},
     )
 
@@ -758,11 +1205,15 @@ def test_download_preview_keeps_the_file_it_returns(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
+    seen = {}
+
     @contextlib.contextmanager
-    def fake_urlopen(url, timeout=None):
+    def fake_urlopen(request, timeout=None):
+        seen["headers"] = dict(getattr(request, "headers", {}))
+
         class Resp:
-            def read(self):
-                return b"mp3 bytes"
+            def read(self, amount=None):
+                return b"mp3 bytes"[:amount]
         yield Resp()
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
@@ -770,6 +1221,34 @@ def test_download_preview_keeps_the_file_it_returns(monkeypatch, tmp_path):
     path = worker.download_preview("http://x/p.mp3")
     assert path.read_bytes() == b"mp3 bytes"
     assert [p.name for p in tmp_path.iterdir()] == [path.name]
+    # Asked for the first megabyte only: a Jamendo "preview" is the whole
+    # track, which can be ten minutes and 20 MB, and analysis reads 30 s.
+    assert seen["headers"]["Range"] == f"bytes=0-{worker.PREVIEW_MAX_BYTES - 1}"
+
+
+def test_download_preview_stops_at_the_cap_when_range_is_ignored(monkeypatch,
+                                                                 tmp_path):
+    """A CDN may answer 200 with the whole file regardless of Range. The read
+    cap, not the header, is what actually bounds the download."""
+    import contextlib
+    import tempfile
+    import urllib.request
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(worker, "PREVIEW_MAX_BYTES", 16)
+
+    @contextlib.contextmanager
+    def fake_urlopen(request, timeout=None):
+        class Resp:
+            def read(self, amount=None):
+                blob = b"x" * 1000
+                return blob if amount is None else blob[:amount]
+        yield Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    path = worker.download_preview("http://x/p.mp3")
+    assert path.read_bytes() == b"x" * 16
 
 
 # ---- feel: the worker scores new tracks as it analyzes them ----
@@ -787,7 +1266,7 @@ def test_process_job_stores_the_feel_vector_analysis_returned(fake_mongo, monkey
     monkeypatch.setattr(worker, "analyze_tracks",
                         lambda paths: [{**FEATURES, "feel": list(FEEL)}
                                        for _ in paths])
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
     store.enqueue_embed("42")
 
     assert worker.process_job("42") is True
@@ -798,8 +1277,77 @@ def test_process_job_survives_analysis_without_feel(fake_mongo, analysis_ok,
                                                     monkeypatch):
     """An older analysis path (or a mocked one) that returns the embedding
     alone must still store the track, just without a feel vector."""
-    monkeypatch.setattr(worker.deezer, "get_track", lambda t: dict(TRACK))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(TRACK))
     store.enqueue_embed("42")
 
     assert worker.process_job("42") is True
     assert "feel" not in store.get_features("42")
+
+
+# ---- crawling round-robins the active sources ----
+
+class _FakeSource:
+    """A source that records the steps it was asked for."""
+
+    def __init__(self, name, tracks=()):
+        self.name = name
+        self.tracks = list(tracks)
+        self.steps = []
+
+    def candidates(self, step):
+        self.steps.append(step)
+        return self.tracks
+
+    def candidate_label(self):
+        return f"{self.name} slice"
+
+
+def test_crawl_step_round_robins_the_active_sources(fake_mongo, monkeypatch):
+    """Each source gets every Nth step, and the cursor it is handed is
+    divided by N -- so a source walks its own rotation one step at a time
+    instead of skipping N-1 arms of it."""
+    a = _FakeSource("a", _tracks(["a1"]))
+    b = _FakeSource("b", _tracks(["b1"]))
+    monkeypatch.setattr(worker.sources, "active", lambda: [a, b])
+
+    for _ in range(4):
+        worker.crawl_step()
+
+    assert a.steps == [0, 1]
+    assert b.steps == [0, 1]
+    assert store.get_state("crawl") == {"step": 4}
+
+
+def test_crawl_step_logs_the_source_label(fake_mongo, monkeypatch, capsys):
+    source = _FakeSource("jamendo", _tracks(["j1"]))
+    source.candidate_label = lambda: "jamendo tag jazz"
+    monkeypatch.setattr(worker.sources, "active", lambda: [source])
+
+    worker.crawl_step()
+
+    out = capsys.readouterr().out
+    assert "crawl jamendo tag jazz: 1 candidates, 1 queued" in out
+
+
+def test_crawl_step_does_nothing_without_an_active_source(fake_mongo, monkeypatch):
+    monkeypatch.setattr(worker.sources, "active", lambda: [])
+    assert worker.crawl_step() == 0
+    assert store.get_state("crawl") is None
+
+
+def test_fresh_track_uses_the_source_that_owns_the_id(monkeypatch):
+    """A jamendo id must never be asked of Deezer."""
+    asked = []
+
+    class Jam:
+        name = "jamendo"
+
+        def track(self, track_id):
+            asked.append(track_id)
+            return {"track_id": track_id, "preview_url": "http://j/full.mp3"}
+
+    monkeypatch.setattr(worker.sources, "for_id",
+                        lambda tid: Jam() if tid.startswith("jamendo:") else None)
+    assert worker._fresh_track("jamendo:168")["preview_url"] == "http://j/full.mp3"
+    assert asked == ["jamendo:168"]
+    assert worker._fresh_track("42") is None

@@ -20,6 +20,12 @@ def clear_matrix_cache():
     app._VIZ_SNAPSHOT = None
     app._ROW_NORMS = None
     app._FEEL_ALIGN_CACHE = None
+    app._RHYTHM_ALIGN_CACHE = None
+    # Grow-only in production (a corpus id is only ever added); a test that
+    # empties the store and re-uses an id would otherwise be served the
+    # previous test's tempo.
+    app._TEMPO_BY_ID.clear()
+    app._UMAP_CACHE.clear()
     viz.clear_geometry_cache()
     yield
     app._MATRIX_CACHE.clear()
@@ -32,7 +38,29 @@ def clear_matrix_cache():
     app._VIZ_SNAPSHOT = None
     app._ROW_NORMS = None
     app._FEEL_ALIGN_CACHE = None
+    app._RHYTHM_ALIGN_CACHE = None
+    # Grow-only in production (a corpus id is only ever added); a test that
+    # empties the store and re-uses an id would otherwise be served the
+    # previous test's tempo.
+    app._TEMPO_BY_ID.clear()
+    app._UMAP_CACHE.clear()
     viz.clear_geometry_cache()
+
+
+@pytest.fixture(autouse=True)
+def clear_worker_state():
+    """The re-analysis circuit breaker is module state and survives a test.
+
+    A test that deliberately breaks the model leaves the arm HALTED, and the
+    next test's perfectly good group silently does nothing. Reset both ends.
+    """
+    from music_recommendations import worker
+
+    worker._group_failures = 0
+    worker._halted_until = 0.0
+    yield
+    worker._group_failures = 0
+    worker._halted_until = 0.0
 
 
 @pytest.fixture

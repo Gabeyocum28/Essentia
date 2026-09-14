@@ -3,19 +3,37 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from statistics import pstdev
+
+from music_recommendations.analysis.schema import FEATURES_VERSION
+from music_recommendations.analysis import clap
 from music_recommendations.server import app as app_module
+from music_recommendations.server import deezer as deezer_api
 from music_recommendations.server import store
-from contract.features import AXES, FEATURE_KEYS, TRACK_FIELDS
+from contract.features import AXES, FEATURE_KEYS, TRACK_FIELDS, TRACK_OPTIONAL_FIELDS
 
 FIXTURE = json.loads(
     (Path(__file__).parents[2] / "contract" / "fixture.json").read_text()
 )["tracks"]
 
 TRACK_KEYS = {"track_id", "title", "artist", "album", "artwork_url", "preview_url"}
+
+
+def _contract_shape(track: dict, scored: bool = False) -> bool:
+    """Exactly the contract Track (plus `score` on a recommendation), and
+    nothing beyond the two optional keys the contract allows.
+
+    Internal fields -- dedupe_key, the full attribution object, feel -- must
+    never reach a response, so this is an exact-set check with a named
+    allowance rather than a subset check."""
+    keys = set(track)
+    required = TRACK_KEYS | ({"score"} if scored else set())
+    return keys >= required and keys - required <= set(TRACK_OPTIONAL_FIELDS)
 
 
 def fake_features(seed_val: float) -> dict:
@@ -29,6 +47,8 @@ def fake_features(seed_val: float) -> dict:
             v[0] = 1.0
             v[1] = seed_val
             out[key] = v
+    # Without it the row is version 0, which store.LIVE no longer serves.
+    out["_features_version"] = FEATURES_VERSION
     return out
 
 
@@ -48,70 +68,100 @@ def seeded_corpus(fake_mongo):
 # ---- /axes ----
 
 def test_axes_serves_contract_list_verbatim(client):
-    assert client.get("/axes").json() == {"axes": AXES}
+    body = client.get("/axes").json()
+    assert body["axes"] == AXES
+    # The axis list is the contract; `text_search` is this host's capability
+    # flag beside it (see get_axes), and is always present as a bool.
+    assert set(body) == {"axes", "text_search"}
+    assert isinstance(body["text_search"], bool)
 
 
 # ---- /search ----
 
 def test_search_proxies_deezer(client, monkeypatch):
     hits = [dict(FIXTURE[0])]
-    monkeypatch.setattr(app_module.deezer, "search", lambda q, limit=10: hits)
+    monkeypatch.setattr(deezer_api, "search", lambda q, limit=10: hits)
     body = client.get("/search", params={"q": "so what"}).json()
     # Deezer's fields pass through untouched except preview_url, which is
     # re-pointed at this server so it does not expire in the client's hands
     # (see _playable); test_search_serves_this_servers_preview_urls covers it.
-    assert [{k: v for k, v in t.items() if k != "preview_url"}
+    assert [{k: v for k, v in t.items() if k not in ("preview_url", "source")}
             for t in body["results"]] == [
         {k: v for k, v in t.items() if k != "preview_url"} for t in hits
     ]
+    # ...plus the source that answered, which the clients use for attribution.
+    assert [t["source"] for t in body["results"]] == ["deezer"]
 
 
 def test_search_falls_back_to_fixture_when_deezer_down(client, monkeypatch):
     def boom(q, limit=10):
         raise OSError("no network")
 
-    monkeypatch.setattr(app_module.deezer, "search", boom)
+    monkeypatch.setattr(deezer_api, "search", boom)
     body = client.get("/search", params={"q": "miles"}).json()
     assert len(body["results"]) > 0
     assert all("miles" in t["artist"].lower() or "miles" in t["title"].lower()
                for t in body["results"])
-    assert all(set(t) == TRACK_KEYS for t in body["results"])
+    assert all(_contract_shape(t) for t in body["results"])
 
 
 # ---- /seed ----
 
-def test_seed_warm_track_is_instant_and_never_analyzes(client, seeded_corpus, monkeypatch):
-    def boom(path):
-        raise AssertionError("analyze_track must not run for a warm seed")
-
-    monkeypatch.setattr(app_module, "analyze_track", boom)
+def test_seed_warm_track_is_instant_and_never_queues(client, seeded_corpus,
+                                                     fake_mongo):
     tid = seeded_corpus[0]["track_id"]
     body = client.post("/seed", json={"track_id": tid}).json()
     assert body == {"track_id": tid, "status": "ready"}
+    assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"}) is None
 
 
-def test_seed_cold_track_downloads_analyzes_and_stores(client, fake_mongo, monkeypatch):
+def test_seed_never_runs_the_model_in_the_api_process(client, fake_mongo,
+                                                      analysis_unavailable,
+                                                      monkeypatch):
+    """The API must not load CLAP. The audio tower is ~700 MB of weights and
+    ~2.5 GB resident, the worker on the same box already holds a copy, and a
+    second one on an unlucky request is an OOM kill -- so a cold seed is
+    handed to the worker instead of analyzed here.
+
+    Guarded structurally, not by stubbing: the module must not even have an
+    analyzer bound to call.
+    """
     track = dict(FIXTURE[7])
     tid = track["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-    monkeypatch.setattr(app_module, "analyze_track", lambda p: fake_features(0.5))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
+
+    assert not hasattr(app_module, "analyze_track")
+    assert not hasattr(app_module, "_fetch_preview_audio")
 
     body = client.post("/seed", json={"track_id": tid}).json()
-    assert body == {"track_id": tid, "status": "ready"}
-    assert store.get_features(tid) is not None
-    # get_track never round-trips preview_url (a signed URL is never stored).
-    assert store.get_track(tid) == {**track, "preview_url": ""}
+    assert body == {"track_id": tid, "status": "unanalyzed"}
+    # The metadata IS stored for the worker to analyze against; get_track
+    # never round-trips preview_url (a signed URL is never stored).
+    assert store.get_track(tid) == {**track, "preview_url": "", "source": "deezer"}
+    assert store.get_features(tid) is None
+    assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"})["state"] == "queued"
+
+
+def test_seed_does_not_fetch_the_preview_either(client, fake_mongo,
+                                                analysis_unavailable,
+                                                monkeypatch):
+    """Downloading the preview was only ever the first half of analyzing it.
+    The worker re-fetches a fresh one anyway (a Deezer signature is a
+    15-minute lease), so a download here is pure duplicated traffic."""
+    def boom(url, *a, **k):
+        raise AssertionError("/seed must not fetch audio")
+
+    monkeypatch.setattr(app_module.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[8]))
+    tid = FIXTURE[8]["track_id"]
+    assert client.post("/seed", json={"track_id": tid}).json() == {
+        "track_id": tid, "status": "unanalyzed"}
 
 
 @pytest.fixture
 def analysis_unavailable(monkeypatch):
-    """The ARM-VM condition: essentia can't import, plus instant poll timing."""
-    def not_implemented(path):
-        raise NotImplementedError
-
-    monkeypatch.setattr(app_module, "analyze_track", not_implemented)
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
+    """Instant poll timing: the worker is not running in these tests, so the
+    wait for it to deliver features should not cost 20 real seconds."""
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
     monkeypatch.setattr(app_module, "_EMBED_POLL_S", 0.0)
 
@@ -120,13 +170,13 @@ def test_seed_enqueues_and_reports_unanalyzed_on_timeout(
         client, fake_mongo, analysis_unavailable, monkeypatch):
     track = dict(FIXTURE[0])
     tid = track["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
 
     body = client.post("/seed", json={"track_id": tid})
     assert body.status_code == 200
     assert body.json() == {"track_id": tid, "status": "unanalyzed"}
     # metadata stored for the worker, job queued, but corpus untouched
-    assert store.get_track(tid) == {**track, "preview_url": ""}
+    assert store.get_track(tid) == {**track, "preview_url": "", "source": "deezer"}
     assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"})["state"] == "queued"
     assert tid not in store.corpus_ids()
 
@@ -135,7 +185,7 @@ def test_seed_ready_when_worker_delivers_features(
         client, fake_mongo, analysis_unavailable, monkeypatch):
     track = dict(FIXTURE[1])
     tid = track["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
     # First get_features call (the warm check) misses and plants the
     # features, as if the worker finished during the wait; later polls hit.
     real_get = store.get_features
@@ -158,7 +208,7 @@ def test_seed_double_tap_enqueues_once(
         client, fake_mongo, analysis_unavailable, monkeypatch):
     track = dict(FIXTURE[2])
     tid = track["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
     client.post("/seed", json={"track_id": tid})
     client.post("/seed", json={"track_id": tid})
     assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"})["state"] == "queued"
@@ -171,27 +221,18 @@ def test_seed_store_down_degrades_to_ready(client, monkeypatch):
 
     monkeypatch.setattr(store, "db", store_down)
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[3]))
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-
-    def not_implemented(path):
-        raise NotImplementedError
-
-    monkeypatch.setattr(app_module, "analyze_track", not_implemented)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[3]))
     tid = FIXTURE[3]["track_id"]
     body = client.post("/seed", json={"track_id": tid}).json()
     assert body == {"track_id": tid, "status": "ready"}
 
 
-def test_seed_download_failure_queues_instead_of_500(client, fake_mongo, monkeypatch):
-    """A Deezer preview fetch failure (timeout, flake) must queue for the
-    embed worker like a missing-essentia host does, not 500."""
-    def boom(url):
-        raise OSError("preview fetch failed")
-
+def test_seed_unplayable_track_queues_instead_of_500(client, fake_mongo, monkeypatch):
+    """Nothing about the audio is known at /seed time any more, so a dead
+    preview is the worker's problem: the response is a 200 saying the track
+    is not analyzed yet, not a 500 and not a 502."""
     tid = FIXTURE[0]["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[0]))
-    monkeypatch.setattr(app_module, "_download_preview", boom)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[0]))
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
     monkeypatch.setattr(app_module, "_EMBED_POLL_S", 0.0)
 
@@ -202,8 +243,70 @@ def test_seed_download_failure_queues_instead_of_500(client, fake_mongo, monkeyp
     assert tid not in store.corpus_ids()
 
 
+def test_seed_on_a_superseded_row_is_not_ready(client, fake_mongo,
+                                               analysis_unavailable, monkeypatch):
+    """A row the PREVIOUS stack analyzed has features, but not ones this
+    server can rank: its vector is in a different space entirely. Answering
+    "ready" sends the client straight to a /recommend that cannot work."""
+    track = dict(FIXTURE[4])
+    tid = track["track_id"]
+    store.put_track(track, {**fake_features(0.5),
+                            "_features_version": FEATURES_VERSION - 1})
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
+
+    body = client.post("/seed", json={"track_id": tid}).json()
+
+    assert body == {"track_id": tid, "status": "unanalyzed"}
+
+
+def test_seed_on_a_superseded_row_jumps_the_reanalysis_queue(
+        client, fake_mongo, analysis_unavailable, monkeypatch):
+    """Somebody is blocked on this one track, and the whole backlog is in
+    front of it. It goes to the front, and it is NOT queued as a cold embed:
+    the row already has its metadata, only its vectors are out of date."""
+    track = dict(FIXTURE[4])
+    tid = track["track_id"]
+    store.put_track(track, {**fake_features(0.5),
+                            "_features_version": FEATURES_VERSION - 1})
+    store.put_track({**FIXTURE[3], "track_id": "older"},
+                    {**fake_features(0.1), "_features_version": FEATURES_VERSION - 1})
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
+
+    client.post("/seed", json={"track_id": tid})
+
+    assert store.stale_ids(2)[0] == tid
+    assert "reanalyze_priority" in fake_mongo.tracks.find_one({"_id": tid})
+    assert fake_mongo.jobs.find_one({"_id": f"embed:{tid}"}) is None
+
+
+def test_seed_is_ready_once_the_row_reaches_the_current_version(
+        client, fake_mongo, monkeypatch):
+    """The wait is version-aware too: a poll that stopped at "there are some
+    features" would return ready on exactly the rows it just rejected."""
+    track = dict(FIXTURE[4])
+    tid = track["track_id"]
+    store.put_track(track, {**fake_features(0.5),
+                            "_features_version": FEATURES_VERSION - 1})
+    monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 1.0)
+    monkeypatch.setattr(app_module, "_EMBED_POLL_S", 0.0)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(track))
+    polled = {"n": 0}
+    real_get = store.get_features
+
+    def get_features_then_upgrade(track_id):
+        polled["n"] += 1
+        if polled["n"] == 2:
+            store.put_track(track, fake_features(0.5))
+        return real_get(track_id)
+
+    monkeypatch.setattr(store, "get_features", get_features_then_upgrade)
+
+    body = client.post("/seed", json={"track_id": tid}).json()
+    assert body == {"track_id": tid, "status": "ready"}
+
+
 def test_seed_unknown_track_404(client, fake_mongo, monkeypatch):
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: None)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: None)
     assert client.post("/seed", json={"track_id": "doesnotexist"}).status_code == 404
 
 
@@ -221,7 +324,7 @@ def _angled(theta: float) -> dict:
     v = [0.0] * FEATURE_KEYS["embedding"]
     v[0] = math.cos(theta)
     v[1] = math.sin(theta)
-    return {"embedding": v}
+    return {"embedding": v, "_features_version": FEATURES_VERSION}
 
 
 # id, title, artist, angle from the seed (radians)
@@ -289,7 +392,7 @@ def test_recommend_results_carry_exactly_the_contract_fields(client, duplicate_c
     # dedupe_key is stored on every track document; it must never reach a
     # response, here or anywhere else.
     for track in body["results"]:
-        assert set(track) == set(TRACK_FIELDS) | {"score"}
+        assert _contract_shape(track, scored=True)
 
 
 # ---- /recommend ----
@@ -303,7 +406,7 @@ def test_recommend_returns_scored_tracks_excluding_seed(client, seeded_corpus):
     assert tid not in ids
     assert len(ids) == 4
     for t in body["results"]:
-        assert set(t) == TRACK_KEYS | {"score"}
+        assert _contract_shape(t, scored=True)
         assert isinstance(t["score"], float)
 
 
@@ -363,12 +466,6 @@ def no_store(monkeypatch):
 def test_seed_works_without_store(no_store, monkeypatch):
     client = TestClient(app_module.app)
     tid = FIXTURE[0]["track_id"]
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-    # This test is about the store being down, not about analysis. Stub the
-    # analyzer out: it used to be a NotImplementedError stub that app.py
-    # swallowed, but now that the lane has landed it raises FileNotFoundError
-    # for a path that does not exist, which app.py should NOT swallow.
-    monkeypatch.setattr(app_module, "analyze_track", lambda path: {})
     body = client.post("/seed", json={"track_id": tid})
     assert body.status_code == 200
     assert body.json()["status"] == "ready"
@@ -460,22 +557,56 @@ def test_seed_is_never_recommended_to_itself(client, seeded_corpus):
         assert len(results) == 4
 
 
-def test_seed_falls_back_when_essentia_unavailable(client, fake_mongo, monkeypatch):
-    """ARM VM: essentia has no aarch64 wheels, so analyze_track raises
-    ImportError there. Seed must queue for the worker, not 500, and reports
-    unanalyzed rather than the old silent-ready fixture fallback."""
-    def no_essentia(path):
-        raise ImportError("No module named 'essentia'")
-
+def test_seed_on_a_host_without_the_analysis_extra(client, fake_mongo, monkeypatch):
+    """The API image need not carry torch at all -- it never analyzes. A cold
+    seed queues for the worker and reports unanalyzed rather than the old
+    silent-ready fixture fallback."""
     tid = FIXTURE[0]["track_id"]
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[0]))
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-    monkeypatch.setattr(app_module, "analyze_track", no_essentia)
+    monkeypatch.setattr(deezer_api, "get_track", lambda t: dict(FIXTURE[0]))
     monkeypatch.setattr(app_module, "_EMBED_WAIT_S", 0.0)
     monkeypatch.setattr(app_module, "_EMBED_POLL_S", 0.0)
     body = client.post("/seed", json={"track_id": tid})
     assert body.status_code == 200
     assert body.json() == {"track_id": tid, "status": "unanalyzed"}
+
+
+def test_recommend_with_a_seed_from_another_feature_space_is_not_a_500(
+        client, seeded_corpus, fake_mongo):
+    """A superseded seed (a 1280-d vector against a 1024-d corpus) used to
+    reach numpy as a shape error and come back as a 500. It is a known,
+    explainable state -- the row is waiting for re-analysis -- so it gets a
+    409 that says so."""
+    store.put_track({**FIXTURE[6], "track_id": "old"},
+                    {"embedding": [0.1] * 3, "feel": [0.5] * 8,
+                     "_features_version": FEATURES_VERSION - 1})
+
+    r = client.get("/recommend", params={"track_id": "old",
+                                         "axis": "sounds_like"})
+
+    assert r.status_code == 409
+    body = r.json()
+    # FLAT, not nested under "detail": FastAPI wraps an HTTPException's detail,
+    # and the web client reads `.detail` as a string -- a dict there reaches
+    # the user as "409: [object Object]".
+    assert body == {"status": "unanalyzed", "track_id": "old",
+                    "reason": body["reason"]}
+    assert "re-analysis" in body["reason"]
+
+
+def test_viz_map_with_a_mismatched_seed_is_not_a_500(client, seeded_corpus,
+                                                     fake_mongo):
+    """Same guard on the insights path: it ranks the same seed against the
+    same matrix, so it fails the same way without it."""
+    store.put_track({**FIXTURE[6], "track_id": "old"},
+                    {"embedding": [0.1] * 3, "feel": [0.5] * 8,
+                     "_features_version": FEATURES_VERSION - 1})
+
+    r = client.get("/viz/map", params={"track_id": "old", "axis": "sounds_like"})
+
+    assert r.status_code == 409
+    assert r.json()["status"] == "unanalyzed"
+    assert isinstance(r.json()["reason"], str)
+    assert "detail" not in r.json()
 
 
 def test_recommend_limit_is_capped(client, seeded_corpus):
@@ -532,7 +663,7 @@ def deezer_previews(monkeypatch):
         calls.append(track_id)
         return f"https://cdnt-preview.dzcdn.net/{track_id}.mp3?hdnea=exp=999"
 
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", fresh)
+    monkeypatch.setattr(deezer_api, "fresh_preview_url", fresh)
     return calls
 
 
@@ -558,7 +689,7 @@ def test_preview_reuses_the_cached_signature(client, deezer_previews):
 
 
 def test_preview_404s_when_deezer_has_no_preview(client, monkeypatch):
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", lambda t: None)
+    monkeypatch.setattr(deezer_api, "fresh_preview_url", lambda t: None)
     assert client.get("/preview/nope", follow_redirects=False).status_code == 404
 
 
@@ -657,8 +788,41 @@ def test_preview_audio_closes_the_upstream_response(client, deezer_previews, mon
     assert upstream.closed
 
 
+def test_preview_audio_asks_for_the_first_megabyte(client, deezer_previews,
+                                                   monkeypatch):
+    """The proxy reads the upstream into this container's memory, so it must
+    bound what it will read. A Jamendo "preview" is the whole track."""
+    import urllib.request
+
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["headers"] = dict(getattr(request, "headers", {}))
+        return _FakeUpstream(b"mp3")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert client.get("/preview/721063/audio").content == b"mp3"
+    assert seen["headers"]["Range"] == f"bytes=0-{app_module.PREVIEW_MAX_BYTES - 1}"
+
+
+def test_preview_audio_truncates_an_upstream_that_ignored_the_range(
+        client, deezer_previews, monkeypatch):
+    """A CDN may answer 200 with the whole file. The byte count in the
+    streamer, not the request header, is what actually holds -- and the
+    Content-Length must not then promise bytes that never arrive."""
+    monkeypatch.setattr(app_module, "PREVIEW_MAX_BYTES", 32)
+    payload = b"ID3" + bytes(5_000)
+    monkeypatch.setattr(app_module, "_open_upstream",
+                        lambda url: _FakeUpstream(payload, length=len(payload)))
+
+    r = client.get("/preview/721063/audio")
+    assert r.content == payload[:32]
+    assert "content-length" not in r.headers
+    assert "accept-ranges" not in r.headers
+
+
 def test_preview_audio_404s_when_deezer_has_no_preview(client, monkeypatch):
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", lambda t: None)
+    monkeypatch.setattr(deezer_api, "fresh_preview_url", lambda t: None)
     assert client.get("/preview/nope/audio").status_code == 404
 
 
@@ -701,7 +865,7 @@ def test_recommend_serves_this_servers_preview_urls(client, seeded_corpus):
 
 
 def test_search_serves_this_servers_preview_urls(client, monkeypatch):
-    monkeypatch.setattr(app_module.deezer, "search", lambda q: [dict(FIXTURE[0])])
+    monkeypatch.setattr(deezer_api, "search", lambda q, limit=25: [dict(FIXTURE[0])])
     body = client.get("/search?q=miles").json()
     assert body["results"][0]["preview_url"] == (
         f"http://testserver/preview/{FIXTURE[0]['track_id']}"
@@ -712,7 +876,7 @@ def test_track_shape_is_unchanged_by_the_rewrite(client, seeded_corpus):
     body = client.get(
         f"/recommend?track_id={seeded_corpus[0]['track_id']}&axis=sounds_like"
     ).json()
-    assert set(body["results"][0]) == TRACK_KEYS | {"score"}
+    assert _contract_shape(body["results"][0], scored=True)
 
 
 def test_public_base_url_overrides_the_request_host(client, seeded_corpus,
@@ -763,48 +927,11 @@ def test_recommend_serves_previews_for_corpus_tracks(client, fake_mongo,
         )
 
 
-def test_seed_resigns_when_the_stored_url_is_expired(client, fake_mongo,
-                                                     monkeypatch):
-    """The 403 on a stored URL is the norm, not a flake -- re-sign, don't punt."""
-    track = dict(FIXTURE[7])
-    downloaded = []
-
-    def download(url):
-        downloaded.append(url)
-        if "hdnea" not in url:          # the stored, expired one
-            raise OSError("403 Forbidden")
-        return Path("/tmp/x.mp3")
-
-    track["preview_url"] = "https://cdnt-preview.dzcdn.net/dead.mp3"
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url",
-                        lambda t: "https://cdnt-preview.dzcdn.net/live.mp3?hdnea=1")
-    monkeypatch.setattr(app_module, "_download_preview", download)
-    monkeypatch.setattr(app_module, "analyze_track", lambda p: fake_features(0.5))
-
-    body = client.post("/seed", json={"track_id": track["track_id"]}).json()
-    assert body == {"track_id": track["track_id"], "status": "ready"}
-    assert len(downloaded) == 2, "should try stored, then the re-signed URL"
-
-
-def test_seed_does_not_resign_when_the_stored_url_works(client, fake_mongo,
-                                                        monkeypatch):
-    """Re-signing costs a Deezer call; a working URL must not trigger one."""
-    track = dict(FIXTURE[7])
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(track))
-    monkeypatch.setattr(app_module, "_download_preview", lambda url: Path("/tmp/x.mp3"))
-    monkeypatch.setattr(app_module, "analyze_track", lambda p: fake_features(0.5))
-    monkeypatch.setattr(app_module.deezer, "fresh_preview_url", lambda t: (_ for _ in ()).throw(
-        AssertionError("must not re-sign when the stored URL downloads")))
-
-    client.post("/seed", json={"track_id": track["track_id"]})
-
-
-# ---- _cold_matrix / 502 on bad previews ----
+# ---- _cold_matrix ----
 
 def test_cold_matrix_uses_base_matrix(fake_mongo, monkeypatch):
     for tid, vec in (("a", [1.0, 0.0]), ("b", [0.0, 1.0])):
-        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec})
+        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec, "_features_version": FEATURES_VERSION})
     calls = []
     real = store.get_many_features
     monkeypatch.setattr(store, "get_many_features",
@@ -821,35 +948,18 @@ def test_corpus_matrix_stays_float32_as_the_corpus_grows(fake_mongo):
     import numpy as np
 
     for tid, vec in (("a", [1.0, 0.0]), ("b", [0.0, 1.0])):
-        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec})
+        store.put_track({**FIXTURE[0], "track_id": tid}, {"embedding": vec, "_features_version": FEATURES_VERSION})
     app_module._corpus_matrix(("a", "b"), "embedding", "cosine", False)
     assert app_module._MATRIX_CACHE["embedding"].matrix.dtype == np.float32
 
     # One more track: the growth path, not a cold rebuild.
-    store.put_track({**FIXTURE[0], "track_id": "c"}, {"embedding": [0.5, 0.5]})
+    store.put_track({**FIXTURE[0], "track_id": "c"}, {"embedding": [0.5, 0.5], "_features_version": FEATURES_VERSION})
     ids, matrix, _ = app_module._corpus_matrix(("a", "b", "c"), "embedding",
                                                "cosine", False)
     assert ids == ["a", "b", "c"]
     assert app_module._MATRIX_CACHE["embedding"].matrix.dtype == np.float32
     assert matrix.dtype == np.float32
     assert np.allclose(matrix[2], [0.5, 0.5], atol=1e-2)
-
-
-def test_seed_returns_502_when_analysis_fails(client, fake_mongo, monkeypatch, tmp_path):
-    from music_recommendations.analysis import frontend
-
-    mp3 = tmp_path / "p.mp3"
-    mp3.write_bytes(b"x")
-    monkeypatch.setattr(app_module, "_fetch_preview_audio", lambda tid, t: mp3)
-    monkeypatch.setattr(app_module.deezer, "get_track", lambda t: dict(FIXTURE[0]))
-
-    def boom(path):
-        raise frontend.DecodeError("ffmpeg: bad file")
-
-    monkeypatch.setattr(app_module, "analyze_track", boom)
-    r = client.post("/seed", json={"track_id": "42"})
-    assert r.status_code == 502
-    assert r.json()["detail"] == "analysis failed"
 
 
 # ---- indexes created at API startup ----
@@ -944,10 +1054,13 @@ def test_absolute_and_double_slash_paths_cannot_escape_web_dist(monkeypatch, tmp
 
 # ---- /recommend: the feel blend ----
 #
-# The embedding ranks by style; the eleven-dimension feel vector carries
+# The embedding ranks by style; the eight-dimension feel vector carries
 # energy, mood and texture. `feel` weights the second against the first:
 #
-#     blended = cos(embedding) - feel * mean|feel_rec - feel_seed|
+#     blended = cos(embedding) - feel * mean|z(feel_rec) - z(feel_seed)|
+#
+# The z-score is per dimension over the corpus, which is what stops the one
+# axis with the widest spread from deciding every ranking on its own.
 #
 # The corpus below is built so the two disagree on purpose. "near" is the
 # closest thing in embedding space but feels nothing like the seed; "feely"
@@ -965,6 +1078,11 @@ def _feeling(theta: float, feel: float | None) -> dict:
         features["feel"] = [feel] * FEEL_DIM
     return features
 
+
+# Feel distances are z-scores over the corpus (app._feel_alignment), and
+# every scored row below carries one value on all eight dimensions, so the
+# divisor is the population std of the three stored values.
+FEEL_SPREAD = pstdev([0.5, 1.0, 0.5])
 
 # id, title, angle from the seed, every feel dimension's value
 FEEL_CORPUS = [
@@ -1015,7 +1133,9 @@ def test_a_row_without_feel_is_never_penalized(client, feel_corpus):
     # atol covers the int8 round trip the embedding makes through the store.
     assert scores["blank"] == pytest.approx(math.cos(0.60), abs=2e-3)
     assert scores["feely"] == pytest.approx(math.cos(0.45), abs=2e-3)
-    assert scores["near"] == pytest.approx(math.cos(0.30) - 2 * 0.5, abs=2e-3)
+    # The penalty is a z-score, not the raw 0.5: see FEEL_SPREAD.
+    assert scores["near"] == pytest.approx(
+        math.cos(0.30) - 2 * (0.5 / FEEL_SPREAD), abs=2e-3)
 
 
 def test_feel_leaves_surprise_alone(client, feel_corpus):
@@ -1040,7 +1160,7 @@ def test_feel_never_leaks_into_a_result_track(client, feel_corpus):
     body = client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
                                             "feel": 1.0}).json()
     for track in body["results"]:
-        assert set(track) == set(TRACK_FIELDS) | {"score"}
+        assert _contract_shape(track, scored=True)
 
 
 def test_feel_weight_is_bounded(client, feel_corpus):
@@ -1074,3 +1194,439 @@ def test_a_seed_without_feel_ranks_on_the_embedding_alone(client, feel_corpus):
     scores = [t["score"] for t in body["results"]]
     assert all(score > 0 for score in scores)
     assert scores == sorted(scores, reverse=True)
+
+
+# ---- pluggable sources: /search fan-out, /preview routing, attribution ----
+
+JAMENDO_TRACK = {
+    "track_id": "jamendo:168",
+    "title": "Sunrise",
+    "artist": "Dee Yan-Key",
+    "album": "Morning",
+    "artwork_url": "http://x/a.jpg",
+    "preview_url": "https://prod.jamendo.com/168.mp3",
+    "source": "jamendo",
+    "attribution": {"source": "jamendo",
+                    "url": "https://www.jamendo.com/track/168/sunrise",
+                    "license": "http://creativecommons.org/licenses/by-sa/3.0/"},
+}
+
+
+class _FakeSource:
+    def __init__(self, name, results=(), preview=None):
+        self.name = name
+        self.results = list(results)
+        self.preview = preview
+        self.asked = []
+
+    def search(self, q, limit=25):
+        self.asked.append(q)
+        return [dict(t) for t in self.results]
+
+    def track(self, track_id):
+        return next((dict(t) for t in self.results
+                     if t["track_id"] == track_id), None)
+
+    def preview_url(self, track_id):
+        self.asked.append(track_id)
+        return self.preview
+
+
+def test_search_concatenates_the_active_sources_in_order(client, monkeypatch):
+    first = _FakeSource("jamendo", [JAMENDO_TRACK])
+    second = _FakeSource("deezer", [{**FIXTURE[0], "source": "deezer"}])
+    monkeypatch.setattr(app_module.sources, "active", lambda: [first, second])
+
+    results = client.get("/search", params={"q": "sun"}).json()["results"]
+
+    assert [t["source"] for t in results] == ["jamendo", "deezer"]
+    assert first.asked == ["sun"] and second.asked == ["sun"]
+
+
+def test_search_carries_the_attribution_backlink(client, monkeypatch):
+    monkeypatch.setattr(app_module.sources, "active",
+                        lambda: [_FakeSource("jamendo", [JAMENDO_TRACK])])
+    [track] = client.get("/search", params={"q": "sun"}).json()["results"]
+    assert _contract_shape(track)
+    assert track["attribution_url"] == JAMENDO_TRACK["attribution"]["url"]
+    # The full attribution object is server-side only.
+    assert "attribution" not in track and "license" not in track
+
+
+def test_search_survives_one_source_being_down(client, monkeypatch):
+    class Broken(_FakeSource):
+        def search(self, q, limit=25):
+            raise OSError("no network")
+
+    monkeypatch.setattr(app_module.sources, "active",
+                        lambda: [Broken("jamendo"),
+                                 _FakeSource("deezer", [dict(FIXTURE[0])])])
+    results = client.get("/search", params={"q": "so what"}).json()["results"]
+    assert [t["track_id"] for t in results] == [FIXTURE[0]["track_id"]]
+
+
+def test_preview_routes_to_the_source_that_owns_the_id(client, fake_mongo,
+                                                       monkeypatch):
+    jam = _FakeSource("jamendo", [JAMENDO_TRACK],
+                      preview="https://prod.jamendo.com/168.mp3")
+    monkeypatch.setattr(app_module.sources, "for_id",
+                        lambda tid: jam if tid.startswith("jamendo:") else None)
+
+    r = client.get("/preview/jamendo:168", follow_redirects=False)
+
+    assert r.status_code == 302
+    assert r.headers["location"] == "https://prod.jamendo.com/168.mp3"
+    assert jam.asked == ["jamendo:168"]
+
+
+def test_preview_404s_for_an_id_from_an_unknown_source(client, fake_mongo,
+                                                       monkeypatch):
+    monkeypatch.setattr(app_module.sources, "for_id", lambda tid: None)
+    assert client.get("/preview/bandcamp:5").status_code == 404
+
+
+def test_recommend_rows_carry_the_source_and_backlink(client, fake_mongo):
+    """The whole point: a CC track's credit survives the store and the
+    ranking and reaches the client."""
+    store.put_track({**FIXTURE[0], "track_id": "s"}, fake_features(0.0))
+    store.put_track(JAMENDO_TRACK, fake_features(0.1))
+
+    body = client.get("/recommend", params={"track_id": "s",
+                                            "axis": "sounds_like"}).json()
+    [rec] = [t for t in body["results"] if t["track_id"] == "jamendo:168"]
+    assert _contract_shape(rec, scored=True)
+    assert rec["source"] == "jamendo"
+    assert rec["attribution_url"] == JAMENDO_TRACK["attribution"]["url"]
+
+
+# ---- /recommend: the tempo term ----
+#
+# CLAP is trained on 7 s windows with a contrastive objective, so it throws
+# tempo away almost completely: a ballad and a double-time burner of the same
+# idiom sit in the same corner of the space. `tempo` weights an octave-folded
+# distance between the two stored BPMs:
+#
+#     d = log2(bpm_seed / bpm_rec);  tempo_dist = clip(min(|d|,|d-1|,|d+1|), 0, .5)
+#
+# Folding, because 90 and 180 BPM are the same groove counted differently and
+# every beat tracker disagrees with every other about which to report.
+
+def _with_tempo(theta: float, bpm: float | None) -> dict:
+    features = _angled(theta)
+    if bpm is not None:
+        features["rhythm"] = {"tempo_bpm": bpm, "beat_strength": 0.9,
+                              "loudness_lufs": -9.0, "loudness_range": 5.0,
+                              "key": 2, "mode": "minor", "key_strength": 0.7}
+    return features
+
+
+# id, angle from the seed, stored BPM
+TEMPO_CORPUS = [
+    ("s",      0.00, 120.0),
+    ("near",   0.30, 160.0),   # closest cosine, a third of an octave out
+    ("octave", 0.45, 240.0),   # further out in style, the same groove doubled
+    ("slow",   0.60, 40.0),    # 1.58 octaves down: past the clip
+    ("blank",  0.75, None),    # no rhythm at all
+]
+
+
+@pytest.fixture
+def tempo_corpus(fake_mongo):
+    for i, (track_id, theta, bpm) in enumerate(TEMPO_CORPUS):
+        store.put_track({"track_id": track_id, "title": f"Track {track_id}",
+                         "artist": f"Artist {i}", "album": "Kind of Blue",
+                         "artwork_url": "u"},
+                        _with_tempo(theta, bpm))
+    return TEMPO_CORPUS
+
+
+def _tempo_scores(client, **params) -> dict[str, float]:
+    body = client.get("/recommend", params={"track_id": "s", "axis": "sounds_like",
+                                            "feel": 0, **params}).json()
+    return {t["track_id"]: t["score"] for t in body["results"]}
+
+
+def test_tempo_zero_is_the_embedding_only_order(client, tempo_corpus):
+    scores = _tempo_scores(client, tempo=0)
+    assert list(scores) == ["near", "octave", "slow", "blank"]
+    assert scores["near"] == pytest.approx(math.cos(0.30), abs=2e-3)
+
+
+def test_an_octave_apart_is_not_a_tempo_difference(client, tempo_corpus):
+    """240 against 120 is the same groove counted in half bars."""
+    scores = _tempo_scores(client, tempo=3)
+    assert scores["octave"] == pytest.approx(math.cos(0.45), abs=2e-3)
+
+
+def test_a_closer_tempo_outranks_a_closer_embedding(client, tempo_corpus):
+    """"near" leads by 0.055 of cosine and is 0.415 octaves out of tempo."""
+    assert list(_tempo_scores(client, tempo=0))[0] == "near"
+    assert list(_tempo_scores(client, tempo=2))[0] == "octave"
+
+
+def test_the_tempo_distance_is_the_folded_log_ratio(client, tempo_corpus):
+    scores = _tempo_scores(client, tempo=1)
+    expected = abs(math.log2(120.0 / 160.0))          # 0.415, inside the clip
+    assert scores["near"] == pytest.approx(math.cos(0.30) - expected, abs=2e-3)
+
+
+def test_the_tempo_distance_is_clipped(client, tempo_corpus):
+    """40 BPM against 120 folds to 0.585 octaves; past half an octave the two
+    tracks are simply at different tempi and the penalty stops growing, so it
+    can never swamp the cosine it is subtracted from."""
+    scores = _tempo_scores(client, tempo=1)
+    assert scores["slow"] == pytest.approx(math.cos(0.60) - 0.5, abs=2e-3)
+
+
+def test_a_row_without_rhythm_is_never_penalized(client, tempo_corpus):
+    scores = _tempo_scores(client, tempo=3)
+    assert scores["blank"] == pytest.approx(math.cos(0.75), abs=2e-3)
+
+
+def test_a_seed_without_rhythm_ranks_on_the_embedding_alone(client, tempo_corpus):
+    body = client.get("/recommend", params={"track_id": "blank", "feel": 0,
+                                            "axis": "sounds_like",
+                                            "tempo": 3}).json()
+    scores = [t["score"] for t in body["results"]]
+    assert scores == sorted(scores, reverse=True)
+    assert all(score > 0 for score in scores)
+
+
+def test_tempo_leaves_surprise_alone(client, tempo_corpus):
+    off = client.get("/recommend", params={"track_id": "s", "axis": "surprise",
+                                           "tempo": 0}).json()["results"]
+    on = client.get("/recommend", params={"track_id": "s", "axis": "surprise",
+                                          "tempo": 3}).json()["results"]
+    assert off == on
+
+
+def test_the_server_owns_the_default_tempo_weight(client, tempo_corpus):
+    """The web client omits `tempo` at its own default so this number can be
+    retuned without shipping a bundle; the two must therefore agree."""
+    assert app_module.TEMPO_DEFAULT == 0.2
+    assert (_tempo_scores(client)
+            == _tempo_scores(client, tempo=app_module.TEMPO_DEFAULT))
+
+
+def test_tempo_weight_is_bounded(client, tempo_corpus):
+    for bad in (-1, 99):
+        assert client.get("/recommend", params={"track_id": "s", "tempo": bad,
+                                                "axis": "sounds_like"}
+                          ).status_code == 422
+
+
+def test_tempo_never_leaks_into_a_result_track(client, tempo_corpus):
+    body = client.get("/recommend", params={"track_id": "s", "tempo": 1,
+                                            "axis": "sounds_like"}).json()
+    for track in body["results"]:
+        assert _contract_shape(track, scored=True)
+
+
+def test_the_rhythm_alignment_is_cached_across_requests(client, tempo_corpus,
+                                                        monkeypatch):
+    """One `rhythm` read for the whole corpus per matrix identity, not one
+    per request: this is on the /recommend path."""
+    reads = []
+    real = store.get_many_rhythm
+    monkeypatch.setattr(store, "get_many_rhythm",
+                        lambda ids: (reads.append(len(ids)), real(ids))[1])
+    params = {"track_id": "s", "axis": "sounds_like", "tempo": 1}
+    client.get("/recommend", params=params)
+    client.get("/recommend", params=params)
+    assert len(reads) == 1
+
+
+# ---- GET /search/text: the corpus, asked in English ----
+
+TEXT_DIM = FEATURE_KEYS["embedding"]
+
+
+def _text_vector(theta: float) -> np.ndarray:
+    """A (1, 1024) unit row, the shape clap.embed_text answers with."""
+    v = np.zeros((1, TEXT_DIM), dtype=np.float32)
+    v[0, 0], v[0, 1] = math.cos(theta), math.sin(theta)
+    return v
+
+
+@pytest.fixture
+def text_corpus(fake_mongo):
+    """Four tracks on a circle, so a text vector at an angle has a known
+    nearest neighbour."""
+    for i, theta in enumerate((0.0, 0.4, 0.8, 1.2)):
+        store.put_track({"track_id": f"t{i}", "title": f"Track {i}",
+                         "artist": "Miles Davis", "album": "Kind of Blue",
+                         "artwork_url": "u"},
+                        _angled(theta))
+    return ["t0", "t1", "t2", "t3"]
+
+
+@pytest.fixture(autouse=True)
+def text_search_on(monkeypatch):
+    """The host default is OFF. Module-wide (autouse), which is harmless
+    everywhere except /axes, whose flag the two tests below assert both ways."""
+    monkeypatch.setenv(app_module.TEXT_SEARCH_ENV, "1")
+
+
+def test_axes_reports_whether_this_host_can_answer_a_text_search(client, monkeypatch):
+    assert client.get("/axes").json()["text_search"] is True
+    monkeypatch.delenv(app_module.TEXT_SEARCH_ENV)
+    assert client.get("/axes").json()["text_search"] is False
+
+
+def test_search_text_is_503_when_the_host_has_it_switched_off(client, text_corpus,
+                                                              monkeypatch):
+    """It is off by default: CLAP in the API process is ~2.5 GB resident, and
+    that is a deployment decision rather than a per-request one."""
+    monkeypatch.delenv(app_module.TEXT_SEARCH_ENV)
+    res = client.get("/search/text", params={"q": "jazz"})
+    assert res.status_code == 503
+    assert "switched off" in res.json()["detail"]
+
+
+def test_search_text_ranks_the_corpus_by_cosine_to_the_phrase(client, text_corpus,
+                                                              monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.8))
+    body = client.get("/search/text", params={"q": "hazy late-night trumpet"}).json()
+    ids = [t["track_id"] for t in body["results"]]
+    assert ids == ["t2", "t1", "t3", "t0"]
+    assert body["results"][0]["score"] == pytest.approx(1.0, abs=2e-3)
+
+
+def test_search_text_passes_the_phrase_to_clap_once(client, text_corpus, monkeypatch):
+    asked = []
+    monkeypatch.setattr(clap, "embed_text",
+                        lambda prompts: (asked.append(prompts), _text_vector(0.0))[1])
+    client.get("/search/text", params={"q": "  solo piano  "})
+    assert asked == [["solo piano"]]
+
+
+def test_search_text_results_are_contract_tracks_with_a_score(client, text_corpus,
+                                                              monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    for track in client.get("/search/text", params={"q": "jazz"}).json()["results"]:
+        assert _contract_shape(track, scored=True)
+
+
+def test_search_text_honours_the_limit(client, text_corpus, monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    body = client.get("/search/text", params={"q": "jazz", "limit": 2}).json()
+    assert len(body["results"]) == 2
+
+
+def test_search_text_rejects_an_empty_query(client, text_corpus, monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    assert client.get("/search/text", params={"q": "   "}).status_code == 400
+
+
+def test_search_text_is_503_when_clap_is_not_installed(client, text_corpus,
+                                                       monkeypatch):
+    """The rest of the API is fine; the client should hide the toggle rather
+    than report the service down."""
+    def missing(_prompts):
+        raise ImportError("No module named 'msclap'")
+
+    monkeypatch.setattr(clap, "embed_text", missing)
+    res = client.get("/search/text", params={"q": "jazz"})
+    assert res.status_code == 503
+    assert "CLAP" in res.json()["detail"]
+
+
+def test_search_text_is_503_when_the_weights_were_never_fetched(client, text_corpus,
+                                                                monkeypatch):
+    def missing(_prompts):
+        raise FileNotFoundError("models/v2/CLAP_weights_2023.pth missing")
+
+    monkeypatch.setattr(clap, "embed_text", missing)
+    assert client.get("/search/text", params={"q": "jazz"}).status_code == 503
+
+
+def test_search_text_is_503_against_a_corpus_that_is_not_clap_space(client,
+                                                                    monkeypatch):
+    """A version-3 (or synthetic) corpus cannot be compared with a text
+    vector at all; numpy would raise that as a 500."""
+    store.put_track({"track_id": "narrow", "title": "t", "artist": "a",
+                     "album": "b", "artwork_url": "u"},
+                    {"embedding": [1.0, 0.0], "_features_version": FEATURES_VERSION})
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    res = client.get("/search/text", params={"q": "jazz"})
+    assert res.status_code == 503
+    assert "CLAP space" in res.json()["detail"]
+
+
+def test_search_text_on_an_empty_corpus_is_empty_not_an_error(client, fake_mongo,
+                                                              monkeypatch):
+    monkeypatch.setattr(clap, "embed_text", lambda prompts: _text_vector(0.0))
+    assert client.get("/search/text", params={"q": "jazz"}).json() == {"results": []}
+
+
+def test_only_new_ids_are_read_when_the_corpus_grows(client, tempo_corpus,
+                                                     monkeypatch):
+    """The alignment is keyed on the matrix, and the matrix is a NEW object
+    every time the corpus grows -- which during a re-analysis backfill is
+    every couple of seconds. Re-reading `rhythm` for the whole corpus on each
+    of those would put an Atlas full-collection read on the /recommend path.
+    """
+    asked = []
+    real = store.get_many_rhythm
+    monkeypatch.setattr(store, "get_many_rhythm",
+                        lambda ids: (asked.append(list(ids)), real(ids))[1])
+    params = {"track_id": "s", "axis": "sounds_like", "tempo": 1}
+    client.get("/recommend", params=params)
+    assert asked and set(asked[0]) == {t[0] for t in TEMPO_CORPUS}
+
+    store.put_track({"track_id": "late", "title": "Late", "artist": "A",
+                     "album": "Kind of Blue", "artwork_url": "u"},
+                    _with_tempo(0.9, 128.0))
+    asked.clear()
+    client.get("/recommend", params=params)
+
+    assert asked == [["late"]], "the whole corpus was re-read for one new row"
+
+
+def test_a_transient_store_failure_is_not_memoized_as_no_tempo(client,
+                                                               tempo_corpus,
+                                                               monkeypatch):
+    """Memoizing 0.0 for a read that never happened would turn one unreachable
+    Atlas into a permanently tempo-less corpus."""
+    real = store.get_many_rhythm
+    down = [True]
+
+    def maybe(ids):
+        if down[0]:
+            raise RuntimeError("connection reset")
+        return real(ids)
+
+    monkeypatch.setattr(store, "get_many_rhythm", maybe)
+    scores = _tempo_scores(client, tempo=3)
+    assert scores["near"] == pytest.approx(math.cos(0.30), abs=2e-3)  # no penalty
+    assert not app_module._TEMPO_BY_ID
+
+    down[0] = False             # Atlas comes back
+    app_module._RHYTHM_ALIGN_CACHE = None
+    assert _tempo_scores(client, tempo=1)["near"] == pytest.approx(
+        math.cos(0.30) - abs(math.log2(120.0 / 160.0)), abs=2e-3)
+
+
+def test_surprise_reads_no_rhythm_at_all(client, tempo_corpus, monkeypatch):
+    """`tempo` defaults to 0.2, and the term is sounds_like-only, so a
+    `surprise` request must not build the column it would then discard."""
+    asked = []
+    monkeypatch.setattr(store, "get_many_rhythm",
+                        lambda ids: (asked.append(list(ids)), [])[1])
+    client.get("/recommend", params={"track_id": "s", "axis": "surprise"})
+    assert asked == []
+
+
+def test_a_seed_with_no_beat_reports_no_tempo_distance(client, fake_mongo):
+    """0.0 BPM is the contract's "no beat could be found", not a tempo: there
+    is no ratio to take, so the panel must say nothing rather than 0."""
+    for track_id, theta, bpm in (("s", 0.0, 0.0), ("other", 0.3, 120.0)):
+        store.put_track({"track_id": track_id, "title": track_id, "artist": "A",
+                         "album": "Kind of Blue", "artwork_url": "u"},
+                        _with_tempo(theta, bpm))
+    body = client.get("/viz/map", params={"track_id": "s", "axis": "sounds_like",
+                                          "tempo": 2}).json()
+    math_ = body["recs"][0]["math"]
+    assert math_["tempo_dist"] is None
+    assert math_["rhythm"] is None
+    assert body["recs"][0]["score"] == pytest.approx(math.cos(0.30), abs=2e-3)

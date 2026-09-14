@@ -2,7 +2,8 @@
 contract/fixture.json until the corpus lands.
 
 Routes:
-  GET  /search      -- query Deezer (or fixture fallback) for tracks
+  GET  /search       -- query the switched-on sources (or fixture fallback)
+  GET  /search/text  -- CLAP text-to-audio search over the corpus (not contract)
   POST /seed         -- mark a track as the seed for recommendations
   GET  /axes         -- list available recommendation axes
   GET  /recommend    -- ranked, scored tracks for a seed + axis
@@ -14,7 +15,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import tempfile
 import threading
 import time
 import urllib.request
@@ -26,16 +26,17 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
+                               StreamingResponse)
 from pydantic import BaseModel
 from starlette.requests import Request
 from typing import Literal, NamedTuple
 
 from contract.features import AXES
-from music_recommendations.analysis import analyze_track, frontend
 from music_recommendations.analysis.feel import FEEL_KEYS
-from music_recommendations.analysis.schema import METRICS
-from music_recommendations.server import deezer, dedupe, store, viz
+from music_recommendations.analysis.schema import FEATURES_VERSION, METRICS
+from music_recommendations.corpus import sources
+from music_recommendations.server import dedupe, store, viz
 from music_recommendations.server.axes import AXIS_FEATURES, BLENDED_AXES
 
 
@@ -121,12 +122,61 @@ def _playable(track: dict | None) -> dict | None:
     return {**track, "preview_url": f"{base}/preview/{track['track_id']}"}
 
 
+def _public_track(track: dict) -> dict:
+    """A source's Track narrowed to what the contract publishes.
+
+    Sources hand back the contract fields plus `source` and the full
+    `attribution` object; only the backlink out of that object is a contract
+    field (`attribution_url`), and a source may carry extra keys of its own.
+    Search results do not go through the store, so this is where that
+    narrowing happens for them.
+    """
+    out = {"track_id": track.get("track_id"),
+           **{k: track.get(k) for k in store.TRACK_FIELDS},
+           "preview_url": track.get("preview_url")}
+    if track.get("source"):
+        out["source"] = track["source"]
+    url = (track.get("attribution") or {}).get("url") or track.get("attribution_url")
+    if url:
+        out["attribution_url"] = url
+    return out
+
+
+def _from_source(track_id: str) -> dict | None:
+    """This track straight from the catalogue that owns its id, or None.
+
+    Used when the store has never seen the id -- a track the user searched
+    up that the crawler has not reached. A source failure is None, not a
+    500: /seed has a fixture fallback behind this.
+    """
+    source = sources.for_id(track_id)
+    if source is None:
+        return None
+    try:
+        found = source.track(track_id)
+    except Exception:
+        return None
+    return _public_track(found) if found else None
+
+
 def _fresh_preview(track_id: str) -> str | None:
-    """A signed, currently-valid preview URL, from cache or from Deezer."""
+    """A currently-playable URL for this track, from cache or from its source.
+
+    The id says which catalogue to ask (sources.for_id): Deezer ids are bare
+    digits and have to be re-signed every few minutes; a `jamendo:...` id
+    resolves to a stable CC-licensed audio URL. An id from a source this
+    build does not know gets None, which the callers turn into a 404.
+    """
     cached = _safe(store.get_cached_preview, track_id)
     if cached:
         return cached
-    url = deezer.fresh_preview_url(track_id)
+    source = sources.for_id(track_id)
+    if source is None:
+        return None
+    try:
+        url = source.preview_url(track_id)
+    except Exception:
+        return None
     if url:
         _safe(store.put_cached_preview, track_id, url)
     return url
@@ -153,9 +203,23 @@ def preview(track_id: str) -> RedirectResponse:
 _AUDIO_CHUNK = 64 * 1024
 
 
+# A preview is 30 s; at 256 kbps that is ~960 KB, so 1 MB covers every real
+# one with room to spare. The cap is a cap, not an estimate: without it a
+# redirect to something enormous (or a source that changes its mind about
+# what "preview" means) streams unbounded bytes through this container.
+PREVIEW_MAX_BYTES = 1024 * 1024
+
+
 def _open_upstream(url: str):
-    """Open the upstream preview URL. Its own function so tests can stub it."""
-    return urllib.request.urlopen(url, timeout=10)
+    """Open the upstream preview URL, asking for the first megabyte only.
+
+    The Range header is the polite half and the read cap below is the half
+    that actually holds: a CDN may ignore Range and answer 200 with the whole
+    file, so the caller counts bytes as well.
+    """
+    request = urllib.request.Request(
+        url, headers={"Range": f"bytes=0-{PREVIEW_MAX_BYTES - 1}"})
+    return urllib.request.urlopen(request, timeout=10)
 
 
 @app.get("/preview/{track_id}/audio")
@@ -184,11 +248,13 @@ def preview_audio(track_id: str) -> StreamingResponse:
         raise HTTPException(502, "upstream preview fetch failed") from exc
 
     def chunks():
+        sent = 0
         try:
-            while True:
-                chunk = upstream.read(_AUDIO_CHUNK)
+            while sent < PREVIEW_MAX_BYTES:
+                chunk = upstream.read(min(_AUDIO_CHUNK, PREVIEW_MAX_BYTES - sent))
                 if not chunk:
                     return
+                sent += len(chunk)
                 yield chunk
         finally:
             upstream.close()
@@ -202,6 +268,13 @@ def preview_audio(track_id: str) -> StreamingResponse:
         "Content-Encoding": "identity",
     }
     length = upstream.headers.get("Content-Length") if hasattr(upstream, "headers") else None
+    if length and not str(length).isdigit():
+        length = None          # a header we cannot trust is a header we drop
+    if length and int(length) > PREVIEW_MAX_BYTES:
+        # A source that ignored the Range header: the body is about to be
+        # truncated at the cap, so promising the full length would leave the
+        # <audio> element waiting for bytes that never come.
+        length = None
     if length:
         # Both of these are what let the element seek inside the preview
         # instead of treating it as an open-ended stream.
@@ -227,13 +300,68 @@ def _fixture_track(track_id: str) -> dict | None:
     )
 
 
-def _download_preview(url: str) -> Path:
-    fd, name = tempfile.mkstemp(suffix=".mp3")
-    os.close(fd)
-    path = Path(name)
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        path.write_bytes(resp.read())
-    return path
+# ---- "this seed is not in the corpus's feature space" ----
+#
+# A row analyzed by a superseded stack HAS features; they are simply in a
+# different vector space (1280-d EffNet against a 1024-d CLAP corpus, or the
+# same width with different meaning). Every path that ranks a seed against
+# the corpus matrix used to reach numpy with those and come back as a 500.
+#
+# It is not a server error and it is not a 404 either -- the track exists,
+# the row exists, it is queued for re-analysis and will work shortly. 409
+# Conflict with an `unanalyzed` body says exactly that, and is the same shape
+# a client already handles from /seed.
+#
+# Its own exception type with its own handler, NOT HTTPException(409, {...}):
+# FastAPI nests an HTTPException's detail under a "detail" key, so a dict
+# detail reaches the web client (which reads `.detail` as a string) as
+# "409: [object Object]". The body has to be FLAT.
+
+class UnanalyzedSeed(Exception):
+    """The seed's vectors are not in the corpus's feature space (yet)."""
+
+    def __init__(self, track_id: str, reason: str):
+        super().__init__(reason)
+        self.track_id = track_id
+        self.reason = reason
+
+
+@app.exception_handler(UnanalyzedSeed)
+async def _unanalyzed_seed_handler(_request: Request,
+                                   exc: UnanalyzedSeed) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"status": "unanalyzed", "track_id": exc.track_id,
+                 "reason": exc.reason},
+    )
+
+
+def _is_current(features: dict) -> bool:
+    """Were these features produced by the stack this server ranks with?"""
+    return int(features.get(store.VERSION_KEY, 0)) == FEATURES_VERSION
+
+
+def _unanalyzed(track_id: str, why: str) -> UnanalyzedSeed:
+    return UnanalyzedSeed(track_id, why)
+
+
+def _require_current(track_id: str, features: dict | None) -> None:
+    """409 when this seed's vectors are not the corpus's vectors.
+
+    Also PRIORITIZES the row: whoever asked is blocked on this one track,
+    and the re-analysis arm works through a backlog that may be the whole
+    corpus. Best-effort -- a store that cannot take the stamp must not turn
+    a readable 409 into a 500.
+    """
+    if features is None or _is_current(features):
+        return
+    _safe(store.prioritize_reanalysis, track_id)
+    raise _unanalyzed(
+        track_id,
+        f"analyzed by feature version {features.get(store.VERSION_KEY, 0)}, "
+        f"this server ranks version {FEATURES_VERSION}; it is queued for "
+        f"re-analysis"
+    )
 
 
 def _safe(fn, *args, default=None):
@@ -279,9 +407,8 @@ def _remember_track(track: dict | None) -> dict | None:
     if not track or not track.get("track_id"):
         return None
     track_id = track["track_id"]
-    entry = {"track_id": track_id,
-             **{key: track.get(key) for key in store.TRACK_FIELDS},
-             "preview_url": ""}
+    entry = _public_track(track)
+    entry["preview_url"] = ""
     with _TRACK_META_LOCK:
         _TRACK_META[track_id] = entry
         _TRACK_META.move_to_end(track_id)
@@ -329,94 +456,186 @@ class SeedRequest(BaseModel):
 
 @app.get("/axes")
 def get_axes() -> dict:
-    return {"axes": AXES}
+    """The contract's axis list, plus one host capability flag.
+
+    `text_search` rides along here rather than on an endpoint of its own
+    because every client already fetches /axes before it can show anything,
+    and the flag is exactly the same kind of thing: what this deployment can
+    do. Clients that predate it ignore an unknown key (the contract has
+    always been "these keys are present", not "only these").
+    """
+    return {"axes": AXES, "text_search": _text_search_enabled()}
 
 
 @app.get("/search")
 def search(q: str) -> dict:
+    """Every switched-on source, concatenated in SOURCES order.
+
+    Per-source failures are tolerated -- one catalogue being down must not
+    empty a search that another could answer -- but a search where every
+    source failed falls back to the fixture, which is what the single-source
+    (Deezer-only) case has always done.
+    """
+    results: list[dict] = []
+    failures = 0
     try:
-        return {"results": [_playable(t) for t in deezer.search(q)]}
+        active = sources.active()
     except Exception:
-        needle = q.lower()
-        hits = [
-            t for t in _fixture_tracks()
-            if needle in t["title"].lower()
-            or needle in t["artist"].lower()
-            or needle in t["album"].lower()
-        ]
-        return {"results": hits}
+        active = []
+    for source in active:
+        try:
+            results.extend(_playable(_public_track(t)) for t in source.search(q))
+        except Exception:
+            failures += 1
+    if results or (active and failures < len(active)):
+        return {"results": results}
+    needle = q.lower()
+    hits = [
+        t for t in _fixture_tracks()
+        if needle in t["title"].lower()
+        or needle in t["artist"].lower()
+        or needle in t["album"].lower()
+    ]
+    return {"results": hits}
 
 
-# TensorFlow inference is CPU- and memory-heavy; endpoints run on FastAPI's
-# threadpool, so an unbounded burst of /seed calls would run that many
-# analyses at once on a 4 GB container. Cap concurrent analyses instead of
-# concurrent requests -- requests beyond the cap just wait their turn.
-_ANALYZE_SEM = threading.Semaphore(2)
+# ---- GET /search/text — not part of contract/contract.md (like /viz/*) ----
+
+# How many results the text search returns by default. Larger than /search's
+# page because the corpus is the whole catalogue rather than one query's
+# page, and a phrase like "late night piano" is a region, not a track.
+TEXT_LIMIT_DEFAULT = 25
+TEXT_LIMIT_MAX = 50
+
+# OFF unless the host says otherwise, because the cost is not the endpoint,
+# it is the PROCESS: the only text tower msclap exposes comes attached to the
+# whole CLAP wrapper, so the first text search leaves ~2.5 GB resident in the
+# API for the lifetime of the container -- beside the worker's own copy, on a
+# 12 GB two-core VM. That is a deployment decision, not a per-request one, so
+# it is an env var that /axes reports and the web toggle follows. There is no
+# text-tower-only load in the msclap API (CLAPWrapper.load_clap builds the
+# audio encoder and loads the full state dict before anything else is
+# reachable); doing it by hand means reimplementing their loader against a
+# private state-dict layout, which is not a thing to write blind.
+TEXT_SEARCH_ENV = "TEXT_SEARCH"
+
+
+def _text_search_enabled() -> bool:
+    """Read per call, not at import, so a test (or a redeploy) can flip it."""
+    return os.environ.get(TEXT_SEARCH_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+@app.get("/search/text")
+def search_text(q: str,
+                limit: int = Query(TEXT_LIMIT_DEFAULT, ge=1,
+                                   le=TEXT_LIMIT_MAX)) -> dict:
+    """Search the CORPUS by description: cosine between the typed phrase and
+    every analyzed track, in CLAP's shared audio/text space.
+
+    This is the one thing the clean-room stack gives us that the stack it
+    replaced could not: that embedding had no text tower, so "hazy
+    late-night trumpet" was not a question the old corpus could be asked at
+    all.
+
+    MEMORY: the first call LOADS CLAP INTO THE API PROCESS -- ~700 MB of
+    weights and roughly **2.5 GB resident** once torch's allocator is warm,
+    and it stays there. That is why the endpoint is OFF by default
+    (TEXT_SEARCH=1 to switch it on, see TEXT_SEARCH_ENV above and
+    deploy/.env.example) and why the import is inside the handler: an API
+    container that never serves a text search never pays it.
+
+    503, not 500, whenever it cannot answer -- switched off, CLAP not
+    installed, weights never fetched: the rest of the API is fine, and the
+    client hides the toggle (GET /axes reports `text_search`) rather than
+    reporting the service down.
+    """
+    if not _text_search_enabled():
+        raise HTTPException(
+            503, "text search is switched off on this host "
+                 f"(set {TEXT_SEARCH_ENV}=1; it costs ~2.5 GB resident in the "
+                 "API process)"
+        )
+    query = q.strip()
+    if not query:
+        raise HTTPException(400, "q must not be empty")
+
+    try:
+        from music_recommendations.analysis import clap
+
+        vector = np.asarray(clap.embed_text([query]), dtype=np.float32).ravel()
+    except (ImportError, FileNotFoundError) as exc:
+        raise HTTPException(
+            503, f"text search unavailable: CLAP could not be loaded ({exc})"
+        ) from exc
+
+    corpus = tuple(_safe(store.corpus_ids, default=[]))
+    ids, matrix, _ = (_corpus_matrix(corpus, "embedding", "cosine",
+                                     want_correction=False)
+                      if corpus else ([], np.empty((0, 1)), None))
+    if not ids:
+        return {"results": []}
+    if matrix.shape[1] != vector.shape[0]:
+        # A corpus of version-3 (or synthetic) vectors cannot be compared
+        # with a CLAP text vector at all. Saying so is the only honest
+        # answer; numpy would otherwise raise a shape error as a 500.
+        raise HTTPException(
+            503, "text search unavailable: the corpus is not in CLAP space "
+                 f"({matrix.shape[1]}-d rows against a {vector.shape[0]}-d "
+                 "text vector)"
+        )
+
+    similarity = _similarity("embedding", matrix, vector, "cosine")
+    order = [int(i) for i in np.argsort(similarity)[::-1][:limit]]
+    _tracks_cached([ids[i] for i in order])   # one metadata read for the page
+    return {"results": [{**_rec_track(ids[i]),
+                         "score": round(float(similarity[i]), 4)}
+                        for i in order]}
 
 
 @app.post("/seed")
 def seed(req: SeedRequest) -> dict:
+    """Make sure this track has features, then say so.
+
+    The API NEVER analyzes. It used to: a cold seed downloaded the preview
+    and ran the model inline, with a semaphore to keep two of them from
+    eating the container. That was affordable when the model was small. CLAP
+    is ~700 MB of weights and roughly 2.5 GB resident once torch's allocator
+    is warm, and the worker on the same box already holds a copy -- an API
+    that loads a second one on an unlucky request is an API that gets OOM
+    killed. So every unknown seed is handed to the worker, which is the one
+    process in the system that owns the audio tower, and /seed waits on the
+    queue instead (_seed_via_worker).
+
+    "Has features" is not the question: a row the PREVIOUS stack analyzed has
+    features in a space this server cannot rank against, so readiness is
+    version-aware and such a row is pushed to the front of the re-analysis
+    queue instead of being re-crawled.
+
+    The only other model load in this process is GET /search/text, which is
+    off unless TEXT_SEARCH=1 -- see that handler.
+    """
     ready = {"track_id": req.track_id, "status": "ready"}
-    if _safe(store.get_features, req.track_id) is not None:
+    features = _safe(store.get_features, req.track_id)
+    if features is not None and _is_current(features):
         return ready
+    if features is not None:
+        # The row is analyzed, but by a stack this server cannot rank
+        # against. It needs no crawl and no embed job -- it is already in the
+        # worker's re-analysis queue, possibly behind the entire corpus. Push
+        # it to the front and wait exactly like a cold seed.
+        _safe(store.prioritize_reanalysis, req.track_id)
+        status = "ready" if _await_features(req.track_id) else "unanalyzed"
+        return {"track_id": req.track_id, "status": status}
 
     track = _safe(store.get_track, req.track_id)
     if track is None:
-        try:
-            track = deezer.get_track(req.track_id)
-        except Exception:
-            track = None
+        track = _from_source(req.track_id)
     if track is None:
         track = _fixture_track(req.track_id)
     if track is None:
         raise HTTPException(404, f"track {req.track_id} not found")
 
-    mp3 = _fetch_preview_audio(req.track_id, track)
-    if mp3 is None:
-        # Deezer preview fetch failed -- flake, timeout, 404, or a signature
-        # that could not be renewed. Don't 500 on a transient failure; hand
-        # the job to the worker.
-        return _seed_via_worker(req.track_id, track)
-
-    try:
-        with _ANALYZE_SEM:
-            features = _to_plain(analyze_track(mp3))
-        _safe(store.put_track, track, features)
-        _remember_track(track)
-    except (NotImplementedError, ImportError):
-        # Analysis can't run on this host (no aarch64 essentia wheels on the
-        # ARM VM). Hand the job to the worker and wait.
-        return _seed_via_worker(req.track_id, track)
-    except (frontend.DecodeError, ValueError) as exc:
-        # The preview itself is bad (undecodable, too short). Not transient,
-        # so do not queue it; tell the client (spec §8).
-        raise HTTPException(502, "analysis failed") from exc
-    finally:
-        mp3.unlink(missing_ok=True)
-    return ready
-
-
-def _fetch_preview_audio(track_id: str, track: dict) -> "Path | None":
-    """The preview mp3 for analysis, or None if no signature could be had.
-
-    Tries the URL already in hand, then re-signs once. A track that came from
-    /search carries a live signature and downloads first try; one read back
-    from the store carries a dead one, so the 403 is expected rather than a
-    flake. corpus/download.py takes the same try-then-re-sign shape for the
-    same reason. urllib raises OSError subclasses (URLError, socket.timeout).
-    """
-    # Lazily: re-signing costs a Deezer call, so it must not happen when the
-    # URL already in hand works.
-    for source in (lambda: track.get("preview_url"),
-                   lambda: _fresh_preview(track_id)):
-        url = source()
-        if not url:
-            continue
-        try:
-            return _download_preview(url)
-        except OSError:
-            continue
-    return None
+    return _seed_via_worker(req.track_id, track)
 
 
 # How long /seed waits for the embed worker before failing loudly. Module
@@ -438,10 +657,16 @@ def _seed_via_worker(track_id: str, track: dict) -> dict:
 
 
 def _await_features(track_id: str) -> bool:
-    """Poll until the worker writes features:{id}, or the wait window closes."""
+    """Poll until the row carries CURRENT features, or the window closes.
+
+    Version-aware on purpose: "has some features" is exactly the state a
+    superseded row is already in, so a poll that stopped there would answer
+    "ready" the instant it was asked about the rows it had just rejected.
+    """
     deadline = time.monotonic() + _EMBED_WAIT_S
     while True:
-        if _safe(store.get_features, track_id) is not None:
+        features = _safe(store.get_features, track_id)
+        if features is not None and _is_current(features):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -455,7 +680,7 @@ class _CorpusMatrix(NamedTuple):
     correction: np.ndarray | None  # centrality, computed only if an axis wants it
     # Every id this key has been LOOKED UP for, whether or not it turned out
     # to have the feature. Sparse keys need it: `feel` is absent on every row
-    # scripts/feel_backfill.py has not reached, so those ids never enter
+    # whose analysis produced none, so those ids never enter
     # `ids` -- and a `fresh` computed from `ids` alone re-queried all of them
     # on every single request, which is the whole cost the cache exists to
     # avoid. An id enters this set once and stays; a row that gains its
@@ -482,8 +707,8 @@ def _rows_for(track_ids: list[str], feature_key: str) -> tuple[list[str], list[n
     """Fetch and vectorize a set of tracks, skipping any without this feature."""
     ids, rows = [], []
     if feature_key == "feel":
-        # Eleven floats per row, so the generic read below was fetching a
-        # 1280-byte int8 embedding and dequantizing it to float32 for every
+        # Eight floats per row, so the generic read below was fetching a
+        # 1024-byte int8 embedding and dequantizing it to float32 for every
         # candidate purely to throw it away. store.get_many_feel projects
         # `feel` alone and does no dequantization at all.
         for track_id, vector in zip(track_ids, store.get_many_feel(track_ids)):
@@ -602,9 +827,21 @@ _UNIT_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
 def _similarity(feature_key: str, matrix: np.ndarray, seed_vec: np.ndarray,
                 metric: str) -> np.ndarray:
-    """Seed against every row, reusing a cached unit matrix where cosine allows."""
+    """Seed against every row, reusing a cached unit matrix where cosine allows.
+
+    The width check is here rather than at each caller because this is the
+    one funnel every seed-vs-corpus comparison goes through: /recommend,
+    /viz/map, /viz/histogram and /search/text all land on it, and numpy's
+    shape error is a 500 with nothing in it a client could act on.
+    """
     from music_recommendations.server import rank as rank_mod
 
+    if len(matrix) and matrix.ndim == 2 and matrix.shape[1] != seed_vec.shape[0]:
+        raise _unanalyzed(
+            "seed",
+            f"the seed is a {seed_vec.shape[0]}-d {feature_key} vector and the "
+            f"corpus is {matrix.shape[1]}-d; the seed is queued for re-analysis"
+        )
     if metric != "cosine" or not len(matrix):
         return rank_mod.scores(seed_vec, matrix, metric)
 
@@ -621,26 +858,46 @@ def _similarity(feature_key: str, matrix: np.ndarray, seed_vec: np.ndarray,
 #
 # Embedding cosine ranks by STYLE. It cannot tell a hushed solo take from a
 # full-band blast of the same idiom, because both sit in the same corner of
-# Discogs space. The feel vector (eleven classifier heads, analysis/feel.py)
+# CLAP space. The feel vector (eight zero-shot axes, analysis/feel.py)
 # carries exactly what the cosine drops: energy, mood, texture. The blend is
 #
-#     blended = cos(embedding) - w * mean|feel_rec - feel_seed|
+#     blended = cos(embedding) - feel * feel_dist - tempo * tempo_dist
 #
 # a straight subtraction rather than a percentile blend (_blended) because
-# both terms are already on the same scale: a cosine in [-1, 1] against a
-# mean absolute difference of probabilities in [0, 1]. w == 0 reproduces the
-# embedding-only order EXACTLY, which is what makes the slider safe to ship.
+# every term is already on the same scale: a cosine in [-1, 1] against two
+# distances that are O(1) by construction. Both weights at 0 reproduce the
+# embedding-only order EXACTLY, which is what makes the sliders safe to ship.
+#
+# feel_dist is a mean absolute difference of Z-SCORES, not of the raw
+# probabilities. The v2 axes are zero-shot softmaxes over a contrastive pair
+# and they are nothing like equally spread: `acoustic` saturates near 0 or 1
+# on almost every track while `density` lives inside a band a few hundredths
+# wide. On raw values the widest axis simply decides the ranking and the
+# narrow ones are rounding error. Dividing each dimension by its own standard
+# deviation over the corpus asks "how unusual is this difference FOR THIS
+# AXIS", which is the question the slider is supposed to be weighting.
 
 FEEL_DEFAULT = 0.3
 FEEL_MAX = 3.0
 
+# Standard deviations are measured, so a corpus where an axis is constant
+# (one track, a synthetic fixture) would divide by zero and turn every
+# distance into an inf or a nan. The floor makes such an axis contribute a
+# difference of ~0 instead, which is the truth: an axis with no spread
+# distinguishes nothing.
+_FEEL_STD_FLOOR = 1e-6
+
 
 class _FeelRows(NamedTuple):
-    """The feel vectors of one ranking's rows, lined up with its matrix."""
-    distance: np.ndarray   # (n,) mean |rec - seed|, 0.0 where feel is missing
-    rows: np.ndarray       # (n, 11) aligned vectors, zeros where missing
+    """The feel vectors of one ranking's rows, lined up with its matrix.
+
+    `rows` and `seed` are the RAW probabilities, because those are what the
+    math panel draws as bars; only `distance` is z-scored.
+    """
+    distance: np.ndarray   # (n,) mean |z(rec) - z(seed)|, 0.0 where missing
+    rows: np.ndarray       # (n, 8) aligned vectors, zeros where missing
     present: np.ndarray    # (n,) bool -- whether that row has a feel vector
-    seed: np.ndarray       # (11,) the seed's own vector
+    seed: np.ndarray       # (8,) the seed's own vector
 
 
 # The alignment between the embedding matrix's rows and the feel matrix's is
@@ -650,23 +907,37 @@ class _FeelRows(NamedTuple):
 # the array it named be freed and a later array at the same address would be
 # served someone else's alignment. Either matrix growing (a crawl, a backfill)
 # hands back a new object and invalidates this for free.
-_FEEL_ALIGN_CACHE: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+# (matrix, feel_matrix, rows, present, std)
+_FEEL_ALIGN_CACHE: tuple[np.ndarray, ...] | None = None
 _FEEL_ALIGN_LOCK = threading.Lock()
-# Rows still waiting on scripts/feel_backfill.py are a deploy-time fact, not a
-# per-request one: say it once per process rather than on every /recommend.
+# Rows with no feel vector are a deploy-time fact, not a per-request one: say
+# it once per process rather than on every /recommend.
 _FEEL_MISSING_LOGGED = False
 
 
 def _feel_alignment(ids: list[str], matrix: np.ndarray, feel_ids: list[str],
-                    feel_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(rows, present) for `ids`, drawn from the feel matrix's own id subset."""
+                    feel_matrix: np.ndarray
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(rows, present, std) for `ids`, drawn from the feel matrix.
+
+    `std` is the per-dimension standard deviation over the WHOLE feel matrix
+    (every scored row in the corpus, not just this request's), which is what
+    makes the z-score a statement about the corpus rather than about the
+    candidate list. It is computed here, once, because this is the one place
+    that already runs exactly when the feel matrix changes identity.
+
+    The matching MEAN is deliberately absent: the distance is a DIFFERENCE of
+    z-scores, |(r - m)/s - (v - m)/s| = |r - v| / s, so the mean cancels
+    exactly and computing it would only invite the reader to believe it does
+    something.
+    """
     global _FEEL_ALIGN_CACHE, _FEEL_MISSING_LOGGED
 
     with _FEEL_ALIGN_LOCK:
         cached = _FEEL_ALIGN_CACHE
         if (cached is not None and cached[0] is matrix
                 and cached[1] is feel_matrix):
-            return cached[2], cached[3]
+            return cached[2], cached[3], cached[4]
 
     at = {track_id: row for row, track_id in enumerate(feel_ids)}
     take = np.array([at.get(track_id, -1) for track_id in ids], dtype=np.int64)
@@ -679,12 +950,18 @@ def _feel_alignment(ids: list[str], matrix: np.ndarray, feel_ids: list[str],
     missing = int(len(ids) - present.sum())
     if missing and not _FEEL_MISSING_LOGGED:
         _FEEL_MISSING_LOGGED = True
-        print(f"feel: {missing} of {len(ids)} corpus rows have no feel vector "
-              f"and rank unpenalized — run scripts/feel_backfill.py")
+        print(f"feel: {missing} of {len(ids)} corpus rows have no feel "
+              f"vector and rank unpenalized")
+
+    scored = np.asarray(feel_matrix, dtype=np.float32)
+    if scored.ndim == 2 and scored.shape[0]:
+        std = np.maximum(scored.std(axis=0), _FEEL_STD_FLOOR)
+    else:
+        std = np.ones(width, dtype=np.float32)
 
     with _FEEL_ALIGN_LOCK:
-        _FEEL_ALIGN_CACHE = (matrix, feel_matrix, rows, present)
-    return rows, present
+        _FEEL_ALIGN_CACHE = (matrix, feel_matrix, rows, present, std)
+    return rows, present, std
 
 
 def _feel_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
@@ -701,18 +978,219 @@ def _feel_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
     # euclidean is nominal here -- no correction is asked for, so the metric
     # only ever reaches rank.centrality, which this never calls. The distance
     # below is a mean ABSOLUTE difference, chosen over L2 so one wildly
-    # different dimension cannot dominate the other ten.
+    # different dimension cannot dominate the other seven.
     feel_ids, feel_matrix, _ = _corpus_matrix(corpus, "feel", "euclidean",
                                               want_correction=False)
     if not feel_ids:
         return None
-    rows, present = _feel_alignment(ids, matrix, feel_ids, feel_matrix)
+    rows, present, std = _feel_alignment(ids, matrix, feel_ids, feel_matrix)
     seed_vec = np.asarray(seed, dtype=np.float32).ravel()
     if rows.shape[1] != seed_vec.shape[0]:
         return None
-    distance = np.abs(rows - seed_vec).mean(axis=1)
+    # The corpus mean cancels out of the difference of z-scores; see
+    # _feel_alignment.
+    distance = (np.abs(rows - seed_vec) / std).mean(axis=1)
     distance[~present] = 0.0
     return _FeelRows(distance.astype(np.float32), rows, present, seed_vec)
+
+
+# ---- tempo: the number a listener can actually name ----
+#
+# Two tracks can sit in the same corner of CLAP space and the same corner of
+# feel space and still be a ballad and a double-time burner. Tempo is the one
+# dimension of that the embedding reliably throws away (it is trained on 7 s
+# windows with a contrastive objective, not a beat tracker), and it is also
+# the dimension a listener can name, so it gets its own term and its own
+# slider.
+#
+# The distance is octave-folded: 90 and 180 BPM are the same groove counted
+# differently, and every beat tracker in existence disagrees with every other
+# about which one to report. Working in log2 of the ratio makes "double" and
+# "half" both exactly 1.0 away, so folding is one min() over three offsets
+# rather than a table of special cases.
+
+TEMPO_DEFAULT = 0.2
+TEMPO_MAX = 3.0
+
+# Past half an octave there is nothing left to say: the two tracks are simply
+# at different tempi, and letting the penalty grow without bound would make
+# one 60-BPM outlier beat the entire cosine ranking. Clipping keeps the term
+# comparable in size with the cosine it is subtracted from.
+TEMPO_MAX_DIST = 0.5
+
+
+class _RhythmRows(NamedTuple):
+    """The rhythm of one ranking's rows, lined up with its matrix."""
+    distance: np.ndarray        # (n,) octave-folded tempo distance, 0 if absent
+    present: np.ndarray         # (n,) bool -- whether that row has a tempo
+    seed: dict                  # the seed's own rhythm dict
+
+
+# The tempo column, aligned to the embedding matrix's rows. Keyed and
+# re-checked on that matrix's identity, exactly like _FEEL_ALIGN_CACHE (and
+# for the same reason: a bare id() can be reused by a later array).
+#
+# Only the TEMPO is kept, not the rhythm dicts it was read out of: a dict per
+# corpus row is tens of megabytes of Python objects at 90k rows, and the only
+# rows whose whole rhythm anyone ever sees are the handful the math panel
+# draws (_fill_rec_rhythm reads those back in one query per request).
+_RHYTHM_ALIGN_CACHE: "tuple[np.ndarray, np.ndarray, np.ndarray] | None" = None
+_RHYTHM_ALIGN_LOCK = threading.Lock()
+
+# id -> tempo_bpm (0.0 meaning "no beat was found", which is how the contract
+# spells absence) for every corpus id ever looked up, INDEPENDENT of any one
+# matrix. The cache above is invalidated by identity, and the matrix is a new
+# object every time the corpus grows -- which during a re-analysis backfill is
+# every couple of seconds. Without this memo each of those invalidations meant
+# a `rhythm` read of the WHOLE corpus on the /recommend path; with it, only
+# ids never seen before are fetched, and the aligned column is rebuilt from
+# memory.
+#
+# Grow-only, like _CorpusMatrix.attempted and for the same reason: a row only
+# enters the corpus once (rows below FEATURES_VERSION are not in it, so a
+# re-analysis lands as a first sighting), and an id that came back without a
+# rhythm has none to gain without a re-analysis. A store that is emptied under
+# a live process (only tests do that) must clear this with the other caches.
+_TEMPO_BY_ID: dict[str, float] = {}
+
+# Distinguishes "the store said no rhythm" from "the store was unreachable":
+# memoizing 0.0 for the second would make a transient Atlas failure a
+# permanent "this track has no tempo".
+_READ_FAILED = object()
+
+
+def _rhythm_alignment(ids: list[str], matrix: np.ndarray
+                      ) -> tuple[np.ndarray, np.ndarray]:
+    """(tempo, present) for `ids`, in matrix row order."""
+    global _RHYTHM_ALIGN_CACHE
+
+    with _RHYTHM_ALIGN_LOCK:
+        cached = _RHYTHM_ALIGN_CACHE
+        if cached is not None and cached[0] is matrix:
+            return cached[1], cached[2]
+        fresh = [i for i in ids if i not in _TEMPO_BY_ID]
+
+    if fresh:
+        rows = _safe(store.get_many_rhythm, fresh, default=_READ_FAILED)
+        if rows is not _READ_FAILED and rows is not None and len(rows) == len(fresh):
+            found = {track_id: (float(row.get("tempo_bpm") or 0.0)
+                                if isinstance(row, dict) else 0.0)
+                     for track_id, row in zip(fresh, rows)}
+            del rows            # the dicts die here, only the tempi survive
+            with _RHYTHM_ALIGN_LOCK:
+                _TEMPO_BY_ID.update(found)
+
+    with _RHYTHM_ALIGN_LOCK:
+        tempo = np.fromiter((_TEMPO_BY_ID.get(i, 0.0) for i in ids),
+                            dtype=np.float32, count=len(ids))
+        # A stored 0.0 means "no beat could be found" (contract/features.py),
+        # so it is an absence, not a tempo of zero; a NaN from a corrupt row
+        # is the same kind of absence and must not reach the log below.
+        present = np.isfinite(tempo) & (tempo > 0.0)
+        _RHYTHM_ALIGN_CACHE = (matrix, tempo, present)
+    return tempo, present
+
+
+def _tempo_distance(seed_bpm: float, tempo: np.ndarray,
+                    present: np.ndarray) -> np.ndarray:
+    """min(|d|, |d-1|, |d+1|) for d = log2(seed / candidate), clipped.
+
+    0 wherever the candidate has no tempo: a missing number must never be a
+    penalty, or a partial backfill would quietly hide half the corpus.
+    """
+    distance = np.zeros(tempo.shape, dtype=np.float32)
+    if not np.isfinite(seed_bpm) or seed_bpm <= 0.0 or not present.any():
+        return distance
+    ratio = np.log2(seed_bpm / np.where(present, tempo, 1.0))
+    folded = np.minimum(np.abs(ratio),
+                        np.minimum(np.abs(ratio - 1.0), np.abs(ratio + 1.0)))
+    distance = np.clip(folded, 0.0, TEMPO_MAX_DIST).astype(np.float32)
+    distance[~present] = 0.0
+    return distance
+
+
+def _rhythm_rows(corpus: tuple[str, ...], ids: list[str], matrix: np.ndarray,
+                 seed_features: dict) -> _RhythmRows | None:
+    """The tempo penalty for every row of `matrix`, or None if it cannot apply.
+
+    None when the seed has no rhythm at all -- same rule as the feel term:
+    absence means "no penalty", never "rank last".
+    """
+    seed = seed_features.get("rhythm")
+    if not isinstance(seed, dict) or not ids:
+        return None
+    try:
+        seed_bpm = float(seed.get("tempo_bpm") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    # A seed with no beat (0.0, or a NaN off a corrupt row) is a seed with no
+    # rhythm: there is no ratio to take, so the term cannot apply and the math
+    # panel must say `tempo_dist: null` rather than a confident 0.
+    if not np.isfinite(seed_bpm) or seed_bpm <= 0.0:
+        return None
+    tempo, present = _rhythm_alignment(ids, matrix)
+    distance = _tempo_distance(seed_bpm, tempo, present)
+    return _RhythmRows(distance, present, seed)
+
+
+def _tempo_blend(axis: str, weight: float, similarity: np.ndarray,
+                 rhythm: _RhythmRows | None) -> np.ndarray:
+    """`similarity` minus the tempo penalty, on sounds_like only.
+
+    surprise is untouched for the same reason the feel term leaves it alone:
+    "nothing like this" is already a request to leave the neighbourhood.
+    """
+    if axis != "sounds_like" or rhythm is None or not weight:
+        return similarity
+    return similarity - weight * rhythm.distance
+
+
+# What the math panel shows for a row with no rhythm on either side. Spelled
+# once so the keys are always present in the response, which is what lets the
+# client test `math.rhythm != null` instead of probing for the key.
+_NO_RHYTHM_MATH = {"tempo_dist": None, "rhythm": None}
+
+
+def _rhythm_math(rhythm: _RhythmRows | None, index: int) -> dict:
+    """The math-panel half: both rhythm dicts and the distance between them."""
+    if rhythm is None or not rhythm.present[index]:
+        return dict(_NO_RHYTHM_MATH)
+    # "rec" is filled in by _fill_rec_rhythm once the page is chosen: the
+    # corpus-wide cache holds only tempi, so the pick's own numbers (key,
+    # loudness) are read for the handful of rows actually shown.
+    return {
+        "tempo_dist": round(float(rhythm.distance[index]), 4),
+        "rhythm": {"seed": dict(rhythm.seed), "rec": {}},
+    }
+
+
+def _fill_rec_rhythm(recs: list[dict]) -> None:
+    """One query for the whole page's rhythm dicts, written into the math.
+
+    The alternative -- keeping every corpus row's rhythm dict beside the
+    tempo column -- costs memory proportional to the corpus for numbers only
+    ~10 rows per request ever display.
+    """
+    wanted = [rec["track_id"] for rec in recs
+              if isinstance(rec.get("math", {}).get("rhythm"), dict)]
+    if not wanted:
+        return
+    rows = _safe(store.get_many_rhythm, wanted, default=None)
+    if rows is None or len(rows) != len(wanted):
+        # get_many_rhythm promises one slot per requested id, in order. A
+        # different length means that contract broke (or the store is down),
+        # and silently serving a panel with every "rec" column blank is the
+        # kind of bug that gets diagnosed as "the UI is wrong".
+        if rows is not None:
+            print(f"rhythm: asked for {len(wanted)} rows and got {len(rows)}; "
+                  f"the math panel will show no rec rhythm")
+        return
+    found = {track_id: row for track_id, row in zip(wanted, rows)
+             if isinstance(row, dict)}
+    for rec in recs:
+        rhythm = rec.get("math", {}).get("rhythm")
+        if isinstance(rhythm, dict):
+            rhythm["rec"] = dict(found.get(rec["track_id"]) or {})
 
 
 def _feel_blend(axis: str, weight: float, similarity: np.ndarray,
@@ -917,20 +1395,25 @@ def _rec_track(track_id: str) -> dict:
 @app.get("/recommend")
 def recommend(track_id: str, axis: str,
               limit: int = Query(10, ge=1, le=50),
-              feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX)) -> dict:
-    """`feel` weights the eleven-dimension feel penalty on sounds_like.
-    0 is the embedding-only order this endpoint served before the heads
-    shipped; it is ignored on every other axis.
+              feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX),
+              tempo: float = Query(TEMPO_DEFAULT, ge=0, le=TEMPO_MAX)) -> dict:
+    """`feel` weights the eight-dimension feel penalty on sounds_like and
+    `tempo` the octave-folded tempo penalty. Both are ignored on every other
+    axis, and both at 0 give the embedding-only order.
 
-    `score` is the number the list was RANKED by, so on sounds_like with
-    feel > 0 it is the blended value -- cosine minus `feel` times the mean
-    absolute feel difference -- and can therefore sit below the raw cosine,
-    and below zero. At feel == 0 (and on every other axis) it is exactly the
-    raw similarity, unchanged from before the heads shipped."""
+    `score` is the number the list was RANKED by, so on sounds_like it is
+    the blended value
+
+        cos - feel * feel_dist - tempo * tempo_dist
+
+    and can therefore sit below the raw cosine, and below zero. With both
+    weights at 0 (and on every other axis) it is exactly the raw
+    similarity."""
     if axis not in AXIS_FEATURES and axis not in BLENDED_AXES:
         raise HTTPException(400, f"unknown axis {axis!r}")
 
     seed_features = _safe(store.get_features, track_id)
+    _require_current(track_id, seed_features)
     corpus = tuple(_safe(store.corpus_ids, default=[]))
     ranked_against = [i for i in corpus if i != track_id]
 
@@ -966,10 +1449,18 @@ def recommend(track_id: str, axis: str,
         # The blend is what is RANKED and what is REPORTED: a result whose
         # score was not the number it was sorted by would read as an
         # out-of-order list in the client.
+        # Both terms are sounds_like-only (see _feel_blend / _tempo_blend),
+        # so the matrices behind them are built only there: `tempo`'s nonzero
+        # default otherwise put a corpus-wide `rhythm` read on every
+        # `surprise` request for a number that was then discarded.
+        blend = axis == "sounds_like"
         blended = _feel_blend(
-            axis, feel,
-            similarity,
-            _feel_rows(corpus, ids, matrix, seed_features) if feel else None,
+            axis, feel, similarity,
+            _feel_rows(corpus, ids, matrix, seed_features) if blend and feel else None,
+        )
+        blended = _tempo_blend(
+            axis, tempo, blended,
+            _rhythm_rows(corpus, ids, matrix, seed_features) if blend and tempo else None,
         )
         order = rank_mod.rank(
             seed_vec, matrix, direction=direction, limit=_scan_width(limit),
@@ -1041,11 +1532,107 @@ def _top8(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return coords8, variance
 
 
+# The UMAP layout of a subset matrix, keyed exactly like _TOP8_CACHE: UMAP
+# is seconds of work at VIZ_MAX rows (single-threaded, because a fixed
+# random_state disables its parallelism), so recomputing it per request is
+# not an option. Same identity discipline -- matrix in the value, re-checked
+# with `is` -- and purged with the others when its subset is superseded.
+_UMAP_CACHE: "OrderedDict[int, tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+# Matrix identities a background layout is already running or queued for, so a
+# burst of requests against one cold subset starts ONE thread, not one per
+# request.
+_UMAP_PENDING: set[int] = set()
+
+# ONE layout computes at a time, process-wide. _UMAP_PENDING already stops a
+# burst against a SINGLE subset from starting several threads, but distinct
+# subsets (a second seed, a corpus that grew, /viz/walk beside /viz/map) are
+# distinct identities and would each start their own. Each is 2-15 s of
+# single-threaded numba on a box with two cores that also has to answer
+# requests and run the analysis worker, so running several at once makes
+# every one of them slower and starves the API.
+#
+# Serializing costs nothing a caller can see: the request never waits for a
+# layout either way -- it is answered with PCA and upgraded once the layout
+# lands -- so a queued subset simply stays on PCA for a few seconds longer.
+_UMAP_WORK_LOCK = threading.Lock()
+
+
+def _remember_umap(matrix: np.ndarray, xy: np.ndarray) -> None:
+    with _VIZ_CACHE_LOCK:
+        _UMAP_CACHE[id(matrix)] = (matrix, xy)
+        _UMAP_CACHE.move_to_end(id(matrix))
+        while len(_UMAP_CACHE) > _CACHE_KEEP:
+            _UMAP_CACHE.popitem(last=False)
+
+
+def _start_umap(matrix: np.ndarray) -> None:
+    """Compute this subset's UMAP layout in the background, once."""
+    key = id(matrix)
+    with _VIZ_CACHE_LOCK:
+        if key in _UMAP_PENDING:
+            return
+        _UMAP_PENDING.add(key)
+
+    def work() -> None:
+        try:
+            # Held for the whole layout: a second subset's thread waits here
+            # rather than competing for the same two cores. Its own request
+            # has already been answered with PCA, so nothing is blocked on
+            # this lock except the upgrade.
+            with _UMAP_WORK_LOCK:
+                _remember_umap(matrix, viz.project_umap(matrix))
+        except Exception as exc:  # noqa: BLE001 - a failed layout is not a failed request
+            print(f"viz: UMAP layout failed ({exc!r}); staying on PCA")
+        finally:
+            with _VIZ_CACHE_LOCK:
+                _UMAP_PENDING.discard(key)
+
+    # Daemon: a half-finished picture must never hold up a shutdown. The
+    # thread holds a reference to the subset matrix (a few tens of MB at
+    # VIZ_MAX) for as long as it runs, and there is at most one per subset.
+    threading.Thread(target=work, name=f"umap-{key:x}", daemon=True).start()
+
+
 def _projection(matrix: np.ndarray) -> np.ndarray:
-    """First two PC columns — numerically identical to viz.project_2d's
-    output, since /viz/map's xy must not change when this cache was added."""
-    coords8, _ = _top8(matrix)
-    return coords8[:, :2]
+    """The (n, 2) galaxy coordinates: UMAP when it is ready, PCA until then.
+
+    /viz/map and /viz/walk only. /viz/tour and /viz/extremes stay on _top8
+    because they are ABOUT the principal components -- a UMAP axis has no
+    variance fraction to report and no "most extreme on PC3" to rank by.
+
+    UMAP IS NOT COMPUTED IN THE REQUEST. Measured at the VIZ_MAX shape,
+    8000 x 1024 float32 on this laptop: 14.5 s seeded (a fixed random_state
+    forces it single-threaded, which it warns about), 2.2 s unseeded -- and
+    the deploy target is a 2-core ARM VM, so both numbers are worse there.
+    Either is far too long to hold a request, and the subset matrix changes
+    identity every time the corpus grows, which during a re-analysis backfill
+    is every couple of seconds.
+
+    So the first request for a cold subset starts the layout on a background
+    thread and answers with the top-2 PCA columns -- the picture this
+    endpoint served before UMAP existed. Once the thread lands, every later
+    request for that same subset gets the UMAP layout from memory. The seed
+    stays fixed (determinism is what stops points jumping between redraws);
+    the price is paid off the request path instead.
+
+    Under viz.UMAP_MIN_ROWS rows project_umap IS the PCA fallback, so it is
+    computed inline: there is nothing to wait for and no thread worth
+    starting.
+    """
+    key = id(matrix)
+    with _VIZ_CACHE_LOCK:
+        cached = _UMAP_CACHE.get(key)
+        if cached is not None and cached[0] is matrix:
+            _UMAP_CACHE.move_to_end(key)
+            return cached[1]
+
+    if len(matrix) < viz.UMAP_MIN_ROWS:
+        xy = viz.project_umap(matrix)
+        _remember_umap(matrix, xy)
+        return xy
+
+    _start_umap(matrix)
+    return _top8(matrix)[0][:, :2]
 
 
 def _mst(matrix: np.ndarray) -> list[tuple[int, int, float]]:
@@ -1115,7 +1702,8 @@ def viz_map(track_id: str, axis: str,
             limit: int = Query(10, ge=1, le=50),
             correction: Literal["on", "off"] = "on",
             points: Literal["full", "compact"] = "full",
-            feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX)) -> dict:
+            feel: float = Query(FEEL_DEFAULT, ge=0, le=FEEL_MAX),
+            tempo: float = Query(TEMPO_DEFAULT, ge=0, le=TEMPO_MAX)) -> dict:
     """Everything the wow screen needs in one payload: the whole corpus as 2D
     points, the seed, and the recs with the actual numbers behind each score.
 
@@ -1137,6 +1725,10 @@ def viz_map(track_id: str, axis: str,
         raise HTTPException(400, f"unknown axis {axis!r}")
 
     seed_features = _safe(store.get_features, track_id)
+    # Before the 404 below: a superseded row IS analyzed, it is just not
+    # analyzed by this stack, and "not in corpus" would send the client
+    # looking for a track that is sitting in the re-analysis queue.
+    _require_current(track_id, seed_features)
     corpus = tuple(_safe(store.corpus_ids, default=[]))
     if seed_features is None or not corpus:
         raise HTTPException(404, f"track {track_id} not analyzed")
@@ -1179,7 +1771,7 @@ def viz_map(track_id: str, axis: str,
         # percentile so the blend can be shown as the sum it is.
         emb_at = {tid: i for i, tid in enumerate(emb_ids)}
         metric, matrix, correction = "cosine", emb_matrix, None
-        feel_rows = None
+        feel_rows = rhythm_rows = None
     else:
         feature_key, direction = AXIS_FEATURES[axis]
         metric = METRICS.get(feature_key, "cosine")
@@ -1196,7 +1788,10 @@ def viz_map(track_id: str, axis: str,
         # `surprise` map was pure cost.
         feel_rows = (_feel_rows(corpus, ids, matrix, seed_features)
                      if axis == "sounds_like" else None)
+        rhythm_rows = (_rhythm_rows(corpus, ids, matrix, seed_features)
+                       if axis == "sounds_like" else None)
         similarity = _feel_blend(axis, feel, similarity, feel_rows)
+        similarity = _tempo_blend(axis, tempo, similarity, rhythm_rows)
         order = rank_mod.rank(seed_vec, matrix, direction=direction,
                               limit=_scan_width(limit) + skippable, metric=metric,
                               correction=correction, similarity=similarity)
@@ -1235,17 +1830,20 @@ def viz_map(track_id: str, axis: str,
                 for key, values in parts.items()
             }
             math.update(_feel_math(None, idx))
+            math.update(_rhythm_math(None, idx))
         else:
             score = float(similarity[idx])
             math = viz.score_math(
                 seed_vec, matrix[idx], metric,
                 float(correction[idx]) if correction is not None else None,
             )
-            # feel_rows is already None off sounds_like (see above).
+            # feel_rows/rhythm_rows are already None off sounds_like.
             math.update(_feel_math(feel_rows, idx))
+            math.update(_rhythm_math(rhythm_rows, idx))
         recs.append({"track_id": rec_id, "score": score, "math": math})
         if len(recs) == limit:
             break
+    _fill_rec_rhythm(recs)
 
     # The points/projection are seed-anchored, not the whole corpus: recs
     # (e.g. `surprise`'s far neighbours) are drawn even when they fall
@@ -1304,8 +1902,9 @@ def viz_map(track_id: str, axis: str,
         "recs": recs,
         "axis": axis_info,
         # Sent rather than hardcoded in the client: the dimension order is
-        # analysis/registry.HEADS' insertion order, and a client with its own
-        # copy of the list would mislabel every bar the day a head moves.
+        # analysis/feel.PROMPT_BANK's insertion order, and a client with
+        # its own copy of the list would mislabel every bar the day an axis
+        # moves.
         "feel_keys": list(FEEL_KEYS),
     }
 
@@ -1342,13 +1941,13 @@ def _purge_viz_caches(matrix_all: np.ndarray) -> None:
     a whole ~450 MB corpus matrix that _MATRIX_CACHE has already replaced.
     LRU eviction alone does not do this: the stale entry can stay inside the
     keep window indefinitely if it is never looked up again. _TOP8_CACHE,
-    _MST_CACHE and _HUBS_CACHE pin subset matrices the same way, so they are
-    purged down to whatever subsets are still cached.
+    _MST_CACHE, _HUBS_CACHE and _UMAP_CACHE pin subset matrices the same
+    way, so they are purged down to whatever subsets are still cached.
     """
     for key in [k for k, v in _SUBSET_CACHE.items() if v[0] is not matrix_all]:
         _SUBSET_CACHE.pop(key, None)
     live = [value[2] for value in _SUBSET_CACHE.values()]
-    for cache in (_TOP8_CACHE, _MST_CACHE, _HUBS_CACHE):
+    for cache in (_TOP8_CACHE, _MST_CACHE, _HUBS_CACHE, _UMAP_CACHE):
         for key in [k for k, v in cache.items()
                     if not any(v[0] is subset for subset in live)]:
             cache.pop(key, None)
@@ -1510,7 +2109,7 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
     it (/viz/map ranks on it), so the growth check does not repeat that
     caller's corpus_ids read.
     """
-    global _VIZ_SNAPSHOT, _ROW_NORMS, _FEEL_ALIGN_CACHE
+    global _VIZ_SNAPSHOT, _ROW_NORMS, _FEEL_ALIGN_CACHE, _RHYTHM_ALIGN_CACHE
 
     # Read live first: this is also the call that appends newly analyzed rows
     # to _MATRIX_CACHE, and it is the cheap part (only new ids are parsed).
@@ -1540,11 +2139,12 @@ def _viz_snapshot(require: "str | list[str] | tuple[str, ...] | None" = None,
         _VIZ_SNAPSHOT = (time.monotonic(), ids, matrix)
         # The derived caches belong to the superseded matrix; drop them now
         # rather than letting them pin it until the LRU happens to evict.
-        # _ROW_NORMS and _FEEL_ALIGN_CACHE hold strong references to the old
-        # matrix too (the alignment holds the embedding matrix AND the feel
-        # matrix, so a stale entry pins both).
+        # _ROW_NORMS, _FEEL_ALIGN_CACHE and _RHYTHM_ALIGN_CACHE hold strong
+        # references to the old matrix too (the feel alignment holds the
+        # embedding matrix AND the feel matrix, so a stale entry pins both).
         _ROW_NORMS = None
         _FEEL_ALIGN_CACHE = None
+        _RHYTHM_ALIGN_CACHE = None
         _purge_viz_caches(matrix)
     return ids, matrix
 
@@ -1635,6 +2235,7 @@ def viz_walk(from_: str = Query(alias="from"), to: str = Query(),
 @app.get("/viz/histogram")
 def viz_histogram(track_id: str) -> dict:
     seed_features = _safe(store.get_features, track_id)
+    _require_current(track_id, seed_features)
     if not seed_features or "embedding" not in seed_features:
         raise HTTPException(404, f"track {track_id} not analyzed")
     ids, matrix = _viz_embedding_corpus()
@@ -1812,13 +2413,6 @@ def _fixture_fallback(track_id: str, limit: int) -> list[dict]:
 def _vector(features: dict, key: str) -> np.ndarray:
     value = features[key]
     return np.atleast_1d(np.asarray(value, dtype=float))
-
-
-def _to_plain(features: dict) -> dict:
-    """np arrays/scalars -> JSON-serializable lists/floats."""
-    return {
-        k: v.tolist() if hasattr(v, "tolist") else v for k, v in features.items()
-    }
 
 
 # ---- the web app: web/dist built into the image, served at / ----
